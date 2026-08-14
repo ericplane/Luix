@@ -163,17 +163,13 @@ function detectFromCalls(text: string): FrameworkId | undefined {
   const aliases = getAliasPartition();
   const calls = findAllCreateElementCalls(text, aliases);
   for (const call of calls) {
-    // `aliasStart` indexes the start of the alias identifier in `text`.
-    // Re-read it from a small window because `CreateElementCall` doesn't
-    // store the alias string verbatim; the slice + regex is O(1) and
-    // findAllCreateElementCalls's own cache amortises the heavy scan.
-    const window = text.slice(
-      call.aliasStart,
-      Math.min(text.length, call.aliasStart + 40)
-    );
-    const m = /^([A-Za-z_][A-Za-z0-9_.]*)/.exec(window);
-    if (!m) continue;
-    const fw = findFrameworkForAlias(m[1]);
+    // The parser hands us the resolved alias. Reading it back out of
+    // the text at `aliasStart` no longer works: that offset points at
+    // the receiver for Fusion 0.3's `scope:New "Frame" { … }`, and
+    // `scope` owns no framework.
+    const alias = call.alias;
+    if (!alias) continue;
+    const fw = findFrameworkForAlias(alias);
     if (fw) return fw.id;
   }
   return undefined;

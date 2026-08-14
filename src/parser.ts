@@ -58,6 +58,25 @@ export interface CreateElementCall {
   className: string;
   isStringLiteralName: boolean;
   nameProp?: string;
+  /**
+   * The factory alias that matched (`e`, `New`, `Vide.create`, …),
+   * without any receiver. Look the framework up with this rather than
+   * re-reading the text at `aliasStart` — that offset may point at a
+   * receiver (`scope:New`), which resolves to nothing.
+   */
+  alias?: string;
+  /**
+   * The receiver in front of the alias, verbatim and including its
+   * separator — `"scope:"` for Fusion 0.3's `scope:New "Frame" { … }`,
+   * `""` when the alias stands alone. Code generation has to re-emit
+   * it or the rewritten call loses the scope it constructs into.
+   */
+  receiver?: string;
+  /**
+   * Offset where the whole call begins — the receiver when there is
+   * one, the alias otherwise. `[aliasStart, fullEnd)` is always the
+   * call's complete text range.
+   */
   aliasStart: number;
   fullEnd: number;
   classNameStart: number;
@@ -307,13 +326,62 @@ function escapeRegex(s: string): string {
   return s.replace(/[.+*?^$()[\]{}|\\]/g, "\\$&");
 }
 
-// Compiled-RegExp caches for the two shapes findEnclosingPropsCall
-// uses. Keyed by the alias-alternation string — same key the
-// alternation cache uses, so a hit there means a hit here too once
-// the patterns are warmed. Eliminates `new RegExp(...)` allocation
-// on every keystroke per provider.
+// ---- Curried-form syntax variants -----------------------------------------
+//
+// Fusion and Vide are "curried": a class-name stage followed by a props
+// table. Real-world code writes that in four interchangeable ways, and
+// Luix has to recognise all of them:
+//
+//   New "Frame" { … }              Fusion 0.2 / Vide, Lua call sugar
+//   scope:New "Frame" { … }        Fusion 0.3 `scoped()` receiver sugar
+//   New(scope, "Frame") { … }      Fusion 0.3 explicit-scope constructor
+//   New("Frame")({ … })            StyLua `call_parentheses = "Always"`,
+//                                  which the Roblox Lua Style Guide
+//                                  mandates — it rewrites *every* sugar
+//                                  call into an explicit parens call.
+//
+// StyLua composes with the others, so `scope:New("Frame")({ … })` and
+// `New(scope, "Frame")({ … })` are both live shapes too. The two
+// degrees of freedom are therefore independent:
+//
+//   name stage  → `"Frame"`      or `( [args ,] "Frame" )`
+//   props stage → `{ … }`        or `( { … } )`
+//
+// A receiver in front of the alias is a third, orthogonal degree of
+// freedom, handled by `RECEIVER_PREFIX` below — which also picks up a
+// `require` bound to a local name other than `Fusion`
+// (`MyFusion.New "Frame" { … }`).
+
+/**
+ * Optional `scope:` / `Fusion.` receiver in front of a curried alias.
+ * Non-capturing and lazy where it matters, so a configured dotted alias
+ * (`Fusion.New`) still matches whole rather than being split.
+ */
+const RECEIVER_PREFIX = `(?:[A-Za-z_][A-Za-z0-9_]*\\s*[.:]\\s*)??`;
+
+/** Class-name token: `"Frame"`, `'Frame'`, or a dotted identifier. */
+const CLASS_NAME_ALT =
+  `(?:"([A-Za-z_][A-Za-z0-9_]*)"|'([A-Za-z_][A-Za-z0-9_]*)'|` +
+  `([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*))`;
+
+/**
+ * Arguments preceding the class name inside a parenthesised name stage
+ * — Fusion 0.3's `New(scope, "Frame")`. Deliberately excludes nested
+ * parens and newlines: the leading argument is always a plain scope
+ * variable, and staying single-line keeps the pattern linear.
+ */
+const LEADING_ARGS = `(?:[^()\\n]*?,\\s*)?`;
+
+// Compiled-RegExp caches for the shapes findEnclosingPropsCall uses.
+// Keyed by the alias-alternation string — same key the alternation
+// cache uses, so a hit there means a hit here too once the patterns
+// are warmed. Eliminates `new RegExp(...)` allocation on every
+// keystroke per provider.
 const parensPatternCache = new Map<string, RegExp>();
 const curriedPatternCache = new Map<string, RegExp>();
+const curriedNameParensPatternCache = new Map<string, RegExp>();
+const curriedPropsParensPatternCache = new Map<string, RegExp>();
+const factoryNameStageParensCache = new Map<string, RegExp>();
 
 function parensPatternFor(aliasPattern: string): RegExp {
   const hit = parensPatternCache.get(aliasPattern);
@@ -332,12 +400,58 @@ function curriedPatternFor(aliasPattern: string): RegExp {
   const hit = curriedPatternCache.get(aliasPattern);
   if (hit) return hit;
   const re = new RegExp(
-    `(?:^|[^A-Za-z0-9_.])(${aliasPattern})\\s+` +
-      `(?:"([A-Za-z_][A-Za-z0-9_]*)"|'([A-Za-z_][A-Za-z0-9_]*)'|` +
-      `([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*))` +
-      `\\s*$`
+    `(?:^|[^A-Za-z0-9_.])${RECEIVER_PREFIX}(${aliasPattern})` +
+      `\\s+${CLASS_NAME_ALT}\\s*$`
   );
   curriedPatternCache.set(aliasPattern, re);
+  return re;
+}
+
+/**
+ * Parenthesised name stage: `ALIAS("Frame")` / `ALIAS(scope, "Frame")`,
+ * optionally followed by StyLua's props-stage `(`. Anchored so the
+ * match ends exactly where the props `{` begins.
+ */
+function curriedNameParensPatternFor(aliasPattern: string): RegExp {
+  const hit = curriedNameParensPatternCache.get(aliasPattern);
+  if (hit) return hit;
+  const re = new RegExp(
+    `(?:^|[^A-Za-z0-9_.])${RECEIVER_PREFIX}(${aliasPattern})` +
+      `\\s*\\(\\s*${LEADING_ARGS}${CLASS_NAME_ALT}\\s*\\)\\s*(?:\\(\\s*)?$`
+  );
+  curriedNameParensPatternCache.set(aliasPattern, re);
+  return re;
+}
+
+/**
+ * Sugar name stage but parenthesised props stage: `ALIAS "Frame" ({ … })`.
+ * StyLua never emits this on its own, but hand-written and
+ * partially-formatted code does.
+ */
+function curriedPropsParensPatternFor(aliasPattern: string): RegExp {
+  const hit = curriedPropsParensPatternCache.get(aliasPattern);
+  if (hit) return hit;
+  const re = new RegExp(
+    `(?:^|[^A-Za-z0-9_.])${RECEIVER_PREFIX}(${aliasPattern})` +
+      `\\s+${CLASS_NAME_ALT}\\s*\\(\\s*$`
+  );
+  curriedPropsParensPatternCache.set(aliasPattern, re);
+  return re;
+}
+
+/**
+ * Cursor-inside-the-class-name variant: matches the text immediately
+ * before the opening quote of a parenthesised name stage, i.e.
+ * `ALIAS(` or `ALIAS(scope,`.
+ */
+function factoryNameStageParensPatternFor(aliasPattern: string): RegExp {
+  const hit = factoryNameStageParensCache.get(aliasPattern);
+  if (hit) return hit;
+  const re = new RegExp(
+    `(?:^|[^A-Za-z0-9_.])${RECEIVER_PREFIX}(${aliasPattern})` +
+      `\\s*\\(\\s*${LEADING_ARGS}$`
+  );
+  factoryNameStageParensCache.set(aliasPattern, re);
   return re;
 }
 
@@ -346,6 +460,12 @@ const DIRECT_PARENS_PATTERN =
   /(?:^|[^A-Za-z0-9_.:])([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*$/;
 const DIRECT_CURRIED_PATTERN =
   /(?:^|[^A-Za-z0-9_.:])([A-Za-z_][A-Za-z0-9_]*)\s*$/;
+// Fusion 0.3 passes the scope to a component before its props table:
+// `MyButton(scope, { … })`. Same `directComponents` gate as the other
+// direct shapes; the leading-arg class excludes parens and newlines so
+// this can't run away across a multi-line argument list.
+const DIRECT_PARENS_SCOPED_PATTERN =
+  /(?:^|[^A-Za-z0-9_.:])([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*[^()\n{}]*?,\s*$/;
 
 /**
  * Maximum bytes the backward brace-walk in `findEnclosingPropsCall`
@@ -467,6 +587,37 @@ export function findEnclosingPropsCall(
     }
   }
 
+  // 2b) Curried form with explicit parentheses. Covers the shapes
+  //     StyLua's `call_parentheses = "Always"` produces (which the
+  //     Roblox Lua Style Guide mandates) and Fusion 0.3's
+  //     explicit-scope constructor:
+  //       New("Frame") {          New("Frame")({
+  //       New(scope, "Frame") {   New(scope, "Frame")({
+  //       scope:New("Frame")({    New "Frame" ({
+  //     Runs after the sugar form so the cheap pattern still wins on
+  //     the common case.
+  if (partition.curried.length > 0) {
+    const aliasPattern = buildAliasAlternation(partition.curried);
+    for (const pattern of [
+      curriedNameParensPatternFor(aliasPattern),
+      curriedPropsParensPatternFor(aliasPattern),
+    ]) {
+      const match = pattern.exec(before);
+      if (!match) {
+        continue;
+      }
+      const name = match[2] || match[3] || match[4];
+      if (name) {
+        return {
+          className: name,
+          isStringLiteralName: !!(match[2] || match[3]),
+          alias: match[1],
+          callShape: "curried",
+        };
+      }
+    }
+  }
+
   // 3) Direct component-call shapes — Vide / Fusion idiom for custom
   //    components. Only run when the caller handed us a set of names
   //    Luix's workspace index already knows about; without that gate the
@@ -478,8 +629,12 @@ export function findEnclosingPropsCall(
   //    (`Module.Sub({…})`) don't trip the regex — the user's component
   //    table is almost always a bare local from a `require`.
   if (directComponents && directComponents.size > 0) {
-    // 3a) Direct parens:  IDENT(  $
-    const parensMatch = DIRECT_PARENS_PATTERN.exec(before);
+    // 3a) Direct parens:  IDENT(  $   — and Fusion 0.3's scope-passing
+    //     convention `IDENT(scope,  $`, where the props table is the
+    //     second argument.
+    const parensMatch =
+      DIRECT_PARENS_PATTERN.exec(before) ??
+      DIRECT_PARENS_SCOPED_PATTERN.exec(before);
     if (parensMatch && directComponents.has(parensMatch[1])) {
       const name = parensMatch[1];
       return {
@@ -514,6 +669,14 @@ export function findEnclosingPropsCall(
 export interface EnclosingStringArg {
   alias: string;
   callShape: "parens" | "curried";
+  /**
+   * Curried form only: the class name sits inside a parenthesised name
+   * stage — `New("Fr|")` / `New(scope, "Fr|")` — rather than Lua's call
+   * sugar `New "Fr|"`. Callers completing the rest of the call have to
+   * close that paren before opening the props table, so the accepted
+   * snippet tail is `")({ … })"` instead of `" { … }"`.
+   */
+  nameStageParens?: boolean;
   quote: '"' | "'" | "`";
   /** Offset of the opening quote in the document. */
   stringStart: number;
@@ -617,6 +780,7 @@ export function findEnclosingFactoryStringArg(
 
   let alias: string | undefined;
   let callShape: "parens" | "curried" | undefined;
+  let nameStageParens = false;
 
   if (partition.parens.length > 0) {
     const aliasPattern = buildAliasAlternation(partition.parens);
@@ -632,12 +796,24 @@ export function findEnclosingFactoryStringArg(
   if (!alias && partition.curried.length > 0) {
     const aliasPattern = buildAliasAlternation(partition.curried);
     const pattern = new RegExp(
-      `(?:^|[^A-Za-z0-9_.])(${aliasPattern})\\s+$`
+      `(?:^|[^A-Za-z0-9_.])${RECEIVER_PREFIX}(${aliasPattern})\\s+$`
     );
     const m = pattern.exec(before);
     if (m) {
       alias = m[1];
       callShape = "curried";
+    }
+  }
+  if (!alias && partition.curried.length > 0) {
+    // Parenthesised name stage — `New("Fr|")`, `New(scope, "Fr|")`,
+    // `scope:New("Fr|")`. Same curried semantics, different syntax.
+    const aliasPattern = buildAliasAlternation(partition.curried);
+    const pattern = factoryNameStageParensPatternFor(aliasPattern);
+    const m = pattern.exec(before);
+    if (m) {
+      alias = m[1];
+      callShape = "curried";
+      nameStageParens = true;
     }
   }
   if (!alias || !callShape) {
@@ -665,6 +841,26 @@ export function findEnclosingFactoryStringArg(
       } else if (text[i] === ")") {
         closeParen = i;
       }
+    } else if (nameStageParens) {
+      // `New("Fr|")` — the name stage's own `)` comes first, then the
+      // props stage in either shape: `) { … }` or `)({ … })`.
+      if (text[i] === ")") {
+        let j = i + 1;
+        while (j < text.length && /[ \t]/.test(text[j])) {
+          j++;
+        }
+        if (text[j] === "(") {
+          j++;
+          while (j < text.length && /[ \t]/.test(text[j])) {
+            j++;
+          }
+        }
+        if (text[j] === "{") {
+          hasPropsAfter = true;
+        } else {
+          closeParen = i;
+        }
+      }
     } else {
       // curried
       if (text[i] === "{") {
@@ -676,6 +872,7 @@ export function findEnclosingFactoryStringArg(
   return {
     alias,
     callShape,
+    nameStageParens,
     quote,
     stringStart,
     stringEnd,
@@ -1011,14 +1208,16 @@ export function detectReturnedClass(
   const parts: string[] = [];
   if (partition.parens.length > 0) {
     const a = buildAliasAlternation(partition.parens);
-    parts.push(
-      `(?:${a})\\s*\\(\\s*(?:"([A-Za-z_][A-Za-z0-9_]*)"|'([A-Za-z_][A-Za-z0-9_]*)'|([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*))`
-    );
+    parts.push(`(?:${a})\\s*\\(\\s*${CLASS_NAME_ALT}`);
   }
   if (partition.curried.length > 0) {
     const a = buildAliasAlternation(partition.curried);
+    // Sugar name stage: `return New "Frame" { … }`.
+    parts.push(`${RECEIVER_PREFIX}(?:${a})\\s+${CLASS_NAME_ALT}`);
+    // Parenthesised name stage: `return New("Frame") { … }`,
+    // `return New(scope, "Frame")({ … })`, `return scope:New("Frame")({ … })`.
     parts.push(
-      `(?:${a})\\s+(?:"([A-Za-z_][A-Za-z0-9_]*)"|'([A-Za-z_][A-Za-z0-9_]*)'|([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*))`
+      `${RECEIVER_PREFIX}(?:${a})\\s*\\(\\s*${LEADING_ARGS}${CLASS_NAME_ALT}\\s*\\)`
     );
   }
   if (parts.length === 0) {
@@ -1052,10 +1251,10 @@ export function detectReturnedClass(
         const after = originalText.slice(m.index + word.length, bodyEnd);
         const r = returnAliasPattern.exec(after);
         if (r) {
-          // Two alternation branches may contribute capture groups
-          // (parens form: 1-3, curried form: 4-6). Take whichever
-          // branch matched.
-          const name = r[1] || r[2] || r[3] || r[4] || r[5] || r[6];
+          // Each alternation branch contributes its own class-name
+          // capture triple (parens 1-3, curried sugar 4-6, curried
+          // parens 7-9). Take whichever branch matched.
+          const name = r.slice(1).find(Boolean);
           if (name) {
             return name;
           }
@@ -1165,13 +1364,17 @@ function findReturnedRootCall(
         continue;
       }
       // The next call whose alias starts after `return` (skipping
-      // whitespace and an optional `(`) is the returned root element.
+      // whitespace, an optional `(`, and an optional `scope:` /
+      // `Fusion.` receiver — `aliasStart` points at the alias itself,
+      // not at the receiver) is the returned root element.
       const after = m.index + word.length;
       const matched = allCalls.find(
         (c) =>
           c.aliasStart >= after &&
           c.aliasStart < bodyEnd &&
-          /^\s*\(?\s*$/.test(originalText.slice(after, c.aliasStart))
+          /^\s*\(?\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*[.:]\s*)?$/.test(
+            originalText.slice(after, c.aliasStart)
+          )
       );
       if (matched) {
         return matched;
@@ -1221,28 +1424,60 @@ interface ParameterListInfo {
   paramListEnd: number;
 }
 
+interface ParsedParameter {
+  name: string;
+  type?: string;
+  typeStart?: number;
+  typeEnd?: number;
+}
+
+/**
+ * A Fusion 0.3 component takes the scope *first* and its props second:
+ *
+ *   local function Button(scope: Scope<typeof(Fusion)>, props: ButtonProps)
+ *
+ * Treating `scope` as the props table would hand the prop-completion
+ * and hardcoded-prop machinery the wrong parameter, so recognise it and
+ * skip past. Deliberately narrow — name or annotated type has to
+ * actually say "scope" — so a React/Vide component whose props
+ * parameter happens to be first is never misread.
+ */
+function looksLikeFusionScopeParam(param: ParsedParameter): boolean {
+  if (/^_?scope$/i.test(param.name)) {
+    return true;
+  }
+  return !!param.type && /\bScope\b/.test(param.type);
+}
+
 function parseParameterList(
   maskedText: string,
   openParenIdx: number
 ): ParameterListInfo | undefined {
+  const params: ParsedParameter[] = [];
   let i = openParenIdx + 1;
-  let firstParamType: string | undefined;
-  let typeRange: { start: number; end: number } | undefined;
+  let depth = 1;
 
-  while (i < maskedText.length && /\s/.test(maskedText[i])) {
-    i++;
-  }
+  while (i < maskedText.length) {
+    while (i < maskedText.length && /[\s,]/.test(maskedText[i])) {
+      i++;
+    }
+    if (maskedText[i] === ")") {
+      break;
+    }
 
-  const nameStart = i;
-  while (i < maskedText.length && /\w/.test(maskedText[i])) {
-    i++;
-  }
-  let firstParamName: string | undefined;
-  if (i > nameStart) {
-    firstParamName = maskedText.slice(nameStart, i);
-  }
+    const nameStart = i;
+    while (i < maskedText.length && /\w/.test(maskedText[i])) {
+      i++;
+    }
+    if (i === nameStart) {
+      // Not an identifier (`...`, or something unparseable) — stop
+      // collecting parameters and just find the closing paren.
+      break;
+    }
+    const param: ParsedParameter = {
+      name: maskedText.slice(nameStart, i),
+    };
 
-  if (i > nameStart) {
     let j = i;
     while (j < maskedText.length && /\s/.test(maskedText[j])) {
       j++;
@@ -1284,13 +1519,26 @@ function parseParameterList(
         }
         typeEnd++;
       }
-      firstParamType = maskedText.slice(typeStart, typeEnd).trim();
+      param.type = maskedText.slice(typeStart, typeEnd).trim();
+      param.typeStart = typeStart;
+      param.typeEnd = typeEnd;
       i = typeEnd;
-      typeRange = { start: typeStart, end: typeEnd };
+    }
+
+    params.push(param);
+    // Two parameters is all any caller needs (props, or scope + props).
+    if (params.length === 2) {
+      break;
     }
   }
 
-  let depth = 1;
+  // The props table is the first parameter, unless that slot is taken
+  // by a Fusion 0.3 scope and a second parameter exists to hold it.
+  const propsParam =
+    params.length > 1 && looksLikeFusionScopeParam(params[0])
+      ? params[1]
+      : params[0];
+
   while (i < maskedText.length) {
     const c = maskedText[i];
     if (c === "(") {
@@ -1299,10 +1547,10 @@ function parseParameterList(
       depth--;
       if (depth === 0) {
         return {
-          firstParamType,
-          firstParamName,
-          firstParamTypeStart: typeRange?.start,
-          firstParamTypeEnd: typeRange?.end,
+          firstParamType: propsParam?.type,
+          firstParamName: propsParam?.name,
+          firstParamTypeStart: propsParam?.typeStart,
+          firstParamTypeEnd: propsParam?.typeEnd,
           paramListEnd: i,
         };
       }
@@ -1523,6 +1771,19 @@ function findAllCreateElementCallsImpl(
         continue;
       }
 
+      // For aliases registered in *both* buckets (Vide's `create`), a
+      // props stage after the closing paren means this is really the
+      // curried form with a parenthesised name stage —
+      // `create(scope, "Frame")({ … })` — which pass 2 parses
+      // correctly. Bail so the two passes can't both emit a call at
+      // this offset with different class names.
+      if (
+        partition.curried.includes(alias) &&
+        curriedPropsStageFollows(text, closeParen + 1)
+      ) {
+        continue;
+      }
+
       const classNameInfo = parseFirstArgClassName(
         text,
         argRanges[0].start,
@@ -1592,6 +1853,7 @@ function findAllCreateElementCallsImpl(
         className: classNameInfo.name,
         isStringLiteralName: classNameInfo.isString,
         nameProp,
+        alias,
         aliasStart,
         fullEnd: closeParen + 1,
         classNameStart: classNameInfo.start,
@@ -1604,98 +1866,221 @@ function findAllCreateElementCallsImpl(
     }
   }
 
-  // Pass 2: curried form — `ALIAS "ARG" { … }`.
+  // Pass 2: curried form. Both stages independently accept Lua's call
+  // sugar or explicit parentheses (see the "Curried-form syntax
+  // variants" note above), so all of these land here:
+  //
+  //   ALIAS "Frame" { … }          ALIAS("Frame") { … }
+  //   ALIAS "Frame" ({ … })        ALIAS(scope, "Frame")({ … })
+  //
   // We anchor only on the alias keyword (which is in code position, so the
   // masked text is safe), then walk forward in the *original* text to read
   // the class-name token (string contents would be blanked in the masked
-  // version) and locate the opening `{`.
+  // version) and locate the props table.
   if (partition.curried.length > 0) {
     const aliasPattern = buildAliasAlternation(partition.curried);
+    // Lookahead was `(?=\s)` — that only ever admitted the sugar form.
+    // A plain word boundary lets `ALIAS(` through too; the forward walk
+    // below is what actually validates the shape.
+    //
+    // The leading group absorbs a receiver so `scope:New` (Fusion 0.3
+    // `scoped()`) and `MyFusion.New` (a `require` bound to any local
+    // name) resolve to the `New` alias. It is *lazy* so a configured
+    // dotted alias still wins outright: at `Fusion.New` the empty
+    // branch is tried first and the longest-first alternation matches
+    // `Fusion.New` whole, exactly as before.
     const aliasRe = new RegExp(
-      `(?<![A-Za-z0-9_.])(?:${aliasPattern})(?=\\s)`,
+      `(?<![A-Za-z0-9_.])((?:[A-Za-z_][A-Za-z0-9_]*\\s*[.:]\\s*)??)` +
+        `(?:${aliasPattern})(?![A-Za-z0-9_])`,
       "g"
     );
     let m: RegExpExecArray | null;
     while ((m = aliasRe.exec(masked)) !== null) {
-      const aliasStart = m.index;
-      const aliasEnd = m.index + m[0].length;
-
-      let i = aliasEnd;
-      // Skip whitespace after the alias keyword.
-      while (i < text.length && /\s/.test(text[i])) {
-        i++;
-      }
-
-      let name: string | undefined;
-      let classNameStart = -1;
-      let classNameEnd = -1;
-      let isString = false;
-
-      if (text[i] === '"' || text[i] === "'") {
-        const quote = text[i];
-        const close = text.indexOf(quote, i + 1);
-        if (close === -1) {
-          continue;
-        }
-        const candidate = text.slice(i + 1, close);
-        if (!/^[A-Za-z_]\w*$/.test(candidate)) {
-          continue;
-        }
-        name = candidate;
-        classNameStart = i + 1;
-        classNameEnd = close;
-        isString = true;
-        i = close + 1;
-      } else if (/[A-Za-z_]/.test(text[i] ?? "")) {
-        const start = i;
-        while (i < text.length && /[A-Za-z0-9_.]/.test(text[i])) {
-          i++;
-        }
-        name = text.slice(start, i);
-        if (!/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(name)) {
-          continue;
-        }
-        classNameStart = start;
-        classNameEnd = i;
-        isString = false;
-      } else {
+      const parsed = parseCurriedCall(text, masked, m.index + m[0].length);
+      if (!parsed) {
         continue;
       }
+      // `aliasStart` covers the receiver too, so the call's text range
+      // is complete; the alias and receiver travel separately.
+      const receiver = m[1];
+      const alias = m[0].slice(receiver.length);
 
-      // Skip whitespace before the props `{`.
-      while (i < text.length && /\s/.test(text[i])) {
-        i++;
-      }
-      if (text[i] !== "{") {
-        continue;
-      }
-      const openBrace = i;
-      const closeBrace = findMatchingBrace(masked, openBrace);
-      if (closeBrace === -1) {
-        continue;
-      }
-
-      const propsText = text.slice(openBrace + 1, closeBrace);
+      const propsText = text.slice(parsed.openBrace + 1, parsed.closeBrace);
       const nameMatch = /\bName\s*=\s*"([^"\n]*)"/.exec(propsText);
       const nameProp = nameMatch ? nameMatch[1] : undefined;
 
       results.push({
-        className: name,
-        isStringLiteralName: isString,
+        className: parsed.name,
+        isStringLiteralName: parsed.isString,
         nameProp,
-        aliasStart,
-        fullEnd: closeBrace + 1,
-        classNameStart,
-        classNameEnd,
-        childrenStart: openBrace + 1,
-        childrenEnd: closeBrace,
-        propsBraceStart: openBrace,
-        propsBraceEnd: closeBrace,
+        alias,
+        receiver,
+        aliasStart: m.index,
+        fullEnd: parsed.fullEnd,
+        classNameStart: parsed.classNameStart,
+        classNameEnd: parsed.classNameEnd,
+        childrenStart: parsed.openBrace + 1,
+        childrenEnd: parsed.closeBrace,
+        propsBraceStart: parsed.openBrace,
+        propsBraceEnd: parsed.closeBrace,
       });
     }
   }
 
   return results;
+}
+
+/**
+ * True when a curried props stage (`{ … }` or `({ … })`) begins at or
+ * after `from`, skipping whitespace.
+ */
+function curriedPropsStageFollows(text: string, from: number): boolean {
+  let i = from;
+  while (i < text.length && /\s/.test(text[i])) {
+    i++;
+  }
+  if (text[i] === "{") {
+    return true;
+  }
+  if (text[i] !== "(") {
+    return false;
+  }
+  i++;
+  while (i < text.length && /\s/.test(text[i])) {
+    i++;
+  }
+  return text[i] === "{";
+}
+
+interface ParsedCurriedCall {
+  name: string;
+  isString: boolean;
+  classNameStart: number;
+  classNameEnd: number;
+  /** Offset of the props table's `{`. */
+  openBrace: number;
+  /** Offset of the props table's matching `}`. */
+  closeBrace: number;
+  /** Offset just past the whole call (past `)` when the props stage is
+   *  parenthesised, past `}` otherwise). */
+  fullEnd: number;
+}
+
+/**
+ * Parse the two stages of a curried factory call starting at
+ * `afterAlias` (the offset just past the alias identifier). Returns
+ * undefined when what follows isn't a complete `<name><props>` pair —
+ * that rejection is what keeps the widened alias anchor from matching
+ * unrelated uses of the same identifier, and what separates Vide's
+ * two-argument parens form `create("Frame", { … })` (handled by pass 1)
+ * from a parenthesised name stage.
+ */
+function parseCurriedCall(
+  text: string,
+  masked: string,
+  afterAlias: number
+): ParsedCurriedCall | undefined {
+  const skipSpace = (from: number): number => {
+    let i = from;
+    while (i < text.length && /\s/.test(text[i])) {
+      i++;
+    }
+    return i;
+  };
+
+  let i = skipSpace(afterAlias);
+
+  let name: string | undefined;
+  let classNameStart = -1;
+  let classNameEnd = -1;
+  let isString = false;
+
+  if (text[i] === "(") {
+    // Parenthesised name stage: `("Frame")` or `(scope, "Frame")`.
+    // The class name is the last argument; anything before it is the
+    // scope Fusion 0.3 threads through.
+    const closeParen = findMatchingParen(masked, i);
+    if (closeParen === -1) {
+      return undefined;
+    }
+    const args = splitTopLevelArgs(masked, i + 1, closeParen);
+    if (args.length === 0) {
+      return undefined;
+    }
+    const last = args[args.length - 1];
+    const parsed = parseFirstArgClassName(text, last.start, last.end);
+    if (!parsed) {
+      return undefined;
+    }
+    name = parsed.name;
+    isString = parsed.isString;
+    classNameStart = parsed.start;
+    classNameEnd = parsed.end;
+    i = closeParen + 1;
+  } else if (text[i] === '"' || text[i] === "'") {
+    const quote = text[i];
+    const close = text.indexOf(quote, i + 1);
+    if (close === -1) {
+      return undefined;
+    }
+    const candidate = text.slice(i + 1, close);
+    if (!/^[A-Za-z_]\w*$/.test(candidate)) {
+      return undefined;
+    }
+    name = candidate;
+    classNameStart = i + 1;
+    classNameEnd = close;
+    isString = true;
+    i = close + 1;
+  } else if (/[A-Za-z_]/.test(text[i] ?? "")) {
+    const start = i;
+    while (i < text.length && /[A-Za-z0-9_.]/.test(text[i])) {
+      i++;
+    }
+    name = text.slice(start, i);
+    if (!/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(name)) {
+      return undefined;
+    }
+    classNameStart = start;
+    classNameEnd = i;
+  } else {
+    return undefined;
+  }
+
+  // Props stage: `{ … }`, or StyLua's `({ … })`.
+  i = skipSpace(i);
+  let propsParen = -1;
+  if (text[i] === "(") {
+    propsParen = i;
+    i = skipSpace(i + 1);
+  }
+  if (text[i] !== "{") {
+    return undefined;
+  }
+  const openBrace = i;
+  const closeBrace = findMatchingBrace(masked, openBrace);
+  if (closeBrace === -1) {
+    return undefined;
+  }
+
+  let fullEnd = closeBrace + 1;
+  if (propsParen !== -1) {
+    const closeProps = findMatchingParen(masked, propsParen);
+    if (closeProps === -1) {
+      return undefined;
+    }
+    fullEnd = closeProps + 1;
+  }
+
+  return {
+    name,
+    isString,
+    classNameStart,
+    classNameEnd,
+    openBrace,
+    closeBrace,
+    fullEnd,
+  };
 }
 
 export function buildCallTree(calls: CreateElementCall[]): CallTreeNode[] {

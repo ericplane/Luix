@@ -2,7 +2,7 @@
   "name": "luix-roblox",
   "displayName": "Luix Roblox",
   "description": "All-in-one Roblox UI authoring helper for React-Luau, Fusion, Vide, and Roact — prop completions, hover docs, inlay hints, color preview, deprecation diagnostics, and more.",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "publisher": "ericplane",
   "icon": "assets/icon.png",
   "author": {
@@ -264,7 +264,7 @@
             "fusion",
             "vide"
           ],
-          "markdownDescription": "Which Roblox UI frameworks Luix recognizes. Disable the ones you don't use to keep completions tight. Each framework has its own call syntax — Luix picks up `e(...)` / `Roact.createElement(...)` (parens form) and `New \"X\" {...}` / `create \"X\" {...}` (curried form) accordingly.\n\nNot to be confused with `#luix.activeFramework#`: that's the *single* framework Luix targets for snippets / scaffold suggestions per file (auto-detected by default); this is the *set* of frameworks the parser is willing to recognise at all."
+          "markdownDescription": "Which Roblox UI frameworks Luix recognizes. Disable the ones you don't use to keep completions tight. Each framework has its own call syntax — Luix picks up `e(...)` / `Roact.createElement(...)` (parens form) and `New \"X\" {...}` / `create \"X\" {...}` (curried form) accordingly. The curried form is recognised however it's written: with a scope (`New(scope, \"X\") {...}`, `scope:New \"X\" {...}`) and with the explicit parentheses StyLua and the Roblox Lua Style Guide require (`New(\"X\")({...})`).\n\nNot to be confused with `#luix.activeFramework#`: that's the *single* framework Luix targets for snippets / scaffold suggestions per file (auto-detected by default); this is the *set* of frameworks the parser is willing to recognise at all."
         },
         "luix.activeFramework": {
           "type": "string",
@@ -307,7 +307,7 @@
             "type": "string"
           },
           "default": [],
-          "markdownDescription": "Override the Fusion factory aliases (`New`, `Fusion.New`). Leave empty to use the defaults."
+          "markdownDescription": "Override the Fusion factory aliases (`New`, `Fusion.New`). Leave empty to use the defaults. A `scope:` or `Module.` receiver in front of an alias is always recognised, so Fusion 0.3's `scope:New \"X\" {...}` needs no entry here."
         },
         "luix.vide.aliases": {
           "type": "array",

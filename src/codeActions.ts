@@ -754,13 +754,13 @@ export class WrapInCodeActionProvider
 
     // Framework detection uses the first target's alias — siblings in
     // the same children list always share an alias anyway.
-    const aliasText = text
-      .slice(first.aliasStart, first.classNameStart)
-      .replace(/[\s("]+$/g, "")
-      .trim();
+    const aliasText = first.alias ?? "";
     const spec = findFrameworkForAlias(aliasText);
     const curried = spec?.callShape === "curried";
-    const aliasName = aliasText;
+    // The wrapper this action emits has to re-state any receiver the
+    // wrapped call used, or a Fusion 0.3 `scope:New` becomes a bare
+    // `New` with no scope to construct into.
+    const aliasName = (first.receiver ?? "") + aliasText;
 
     const innerText = text.slice(first.aliasStart, last.fullEnd);
     const replaceRange = new vscode.Range(

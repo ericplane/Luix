@@ -67,11 +67,11 @@ export async function extractToComponentCommand(): Promise<void> {
     return;
   }
 
-  // Identify the framework (alias) for the new call site.
-  const aliasText = text
-    .slice(target.aliasStart, target.classNameStart)
-    .replace(/[\s(]+$/g, "")
-    .trim();
+  // Identify the framework (alias) for the new call site. The parser
+  // hands the alias over directly — slicing `[aliasStart, classNameStart)`
+  // instead dragged in the call's punctuation (`e("`, `New "`,
+  // `New(scope, "`), which never resolved to a framework.
+  const aliasText = target.alias ?? "";
   const spec = findFrameworkForAlias(aliasText);
   if (!spec) {
     vscode.window.showWarningMessage(

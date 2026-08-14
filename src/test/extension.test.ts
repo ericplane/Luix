@@ -1154,6 +1154,220 @@ suite("Curried return-statement detection", () => {
 });
 
 // ============================================================================
+// Issue #3: curried calls written with explicit parentheses.
+//
+// The class-name stage and the props stage each independently accept
+// Lua's call sugar or explicit parens, and Fusion 0.3 adds a scope —
+// either threaded as a leading argument or bound to a `scope:` receiver
+// by `scoped()`. StyLua's `call_parentheses = "Always"` (which the
+// Roblox Lua Style Guide mandates) rewrites every sugar call into the
+// parenthesised form, so a formatted codebase hits these shapes on
+// every element.
+// ============================================================================
+
+/** Every way `New "Frame" { … }` can legally be spelled. */
+const CURRIED_HEADS = [
+  ['sugar', 'New "Frame" '],
+  ['scoped sugar', 'scope:New "Frame" '],
+  ['dotted receiver', 'MyFusion.New "Frame" '],
+  ['configured dotted alias', 'Fusion.New "Frame" '],
+  ['paren name stage', 'New("Frame")'],
+  ['fusion 0.3 explicit scope', 'New(scope, "Frame")'],
+  ['scoped paren name stage', 'scope:New("Frame")'],
+] as const;
+
+suite("Curried calls with explicit parentheses (issue #3)", () => {
+  for (const [label, head] of CURRIED_HEADS) {
+    for (const [propsLabel, open, close] of [
+      ["sugar props", "{", "}"],
+      ["paren props", "({", "})"],
+    ] as const) {
+      test(`findAllCreateElementCalls: ${label} + ${propsLabel}`, () => {
+        const text = `local x = ${head}${open} Name = "Outer" ${close}`;
+        const calls = findAllCreateElementCalls(text, FUSION_PARTITION);
+        assert.strictEqual(calls.length, 1);
+        assert.strictEqual(calls[0].className, "Frame");
+        assert.strictEqual(calls[0].isStringLiteralName, true);
+        assert.strictEqual(calls[0].nameProp, "Outer");
+        // The reported range has to cover the whole call — receiver and
+        // trailing `)` included — or refactors rewrite a partial call.
+        assert.strictEqual(
+          text.slice(calls[0].aliasStart, calls[0].fullEnd),
+          `${head}${open} Name = "Outer" ${close}`
+        );
+      });
+
+      test(`findEnclosingPropsCall: ${label} + ${propsLabel}`, () => {
+        const text = `local x = ${head}${open}\n  `;
+        const result = findEnclosingPropsCall(
+          text,
+          text.length,
+          FUSION_PARTITION
+        );
+        assert.strictEqual(result?.className, "Frame");
+        assert.strictEqual(result?.callShape, "curried");
+      });
+    }
+  }
+
+  test("alias resolves past a `scope:` receiver", () => {
+    const text = 'local x = scope:New "Frame" { Size = 1 }';
+    const [call] = findAllCreateElementCalls(text, FUSION_PARTITION);
+    assert.strictEqual(call.alias, "New");
+    assert.strictEqual(call.receiver, "scope:");
+  });
+
+  test("a configured dotted alias still matches whole", () => {
+    const text = 'local x = Fusion.New "Frame" { Size = 1 }';
+    const [call] = findAllCreateElementCalls(text, FUSION_PARTITION);
+    assert.strictEqual(call.alias, "Fusion.New");
+    assert.strictEqual(call.receiver, "");
+    assert.strictEqual(call.aliasStart, text.indexOf("Fusion"));
+  });
+
+  test("nested StyLua-formatted children build a call tree", () => {
+    const text = [
+      'local b = scope:New("Frame")({',
+      '  [Children] = {',
+      '    scope:New("TextLabel")({ Text = "Hi" }),',
+      "  },",
+      "})",
+    ].join("\n");
+    const tree = buildCallTree(
+      findAllCreateElementCalls(text, FUSION_PARTITION)
+    );
+    assert.strictEqual(tree.length, 1);
+    assert.strictEqual(tree[0].call.className, "Frame");
+    assert.strictEqual(tree[0].children.length, 1);
+    assert.strictEqual(tree[0].children[0].call.className, "TextLabel");
+  });
+
+  test("Vide's StyLua form parses without colliding with its parens form", () => {
+    const text = 'local x = create("Frame")({ Size = 1 })';
+    const calls = findAllCreateElementCalls(text, VIDE_PARTITION);
+    assert.strictEqual(calls.length, 1, "must not be reported twice");
+    assert.strictEqual(calls[0].className, "Frame");
+  });
+
+  test("Vide's two-argument parens form is untouched", () => {
+    const text = 'local x = create("Frame", { Size = 1 })';
+    const calls = findAllCreateElementCalls(text, VIDE_PARTITION);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].className, "Frame");
+  });
+
+  test("a bare alias reference is not an element call", () => {
+    for (const text of [
+      "local New = Fusion.New",
+      "local t = { New = 1 }",
+      'local ctor = New(scope, "Frame")',
+    ]) {
+      assert.deepStrictEqual(
+        findAllCreateElementCalls(text, FUSION_PARTITION).map(
+          (c) => c.className
+        ),
+        [],
+        text
+      );
+    }
+  });
+
+  test("detectedBase follows a parenthesised return", () => {
+    for (const returned of [
+      'New("Frame")({ Name = "Card" })',
+      'New(scope, "Frame") { Name = "Card" }',
+      'scope:New("Frame")({ Name = "Card" })',
+      'scope:New "Frame" { Name = "Card" }',
+    ]) {
+      const text = [
+        "local function MyCard(scope, props)",
+        `  return ${returned}`,
+        "end",
+      ].join("\n");
+      const info = scanDocument(text, FUSION_PARTITION).get("MyCard");
+      assert.strictEqual(info?.detectedBase, "Frame", returned);
+    }
+  });
+
+  test("class-name completion context inside a parenthesised name stage", () => {
+    for (const text of [
+      'local x = New("Fr',
+      'local x = New(scope, "Fr',
+      'local x = scope:New("Fr',
+    ]) {
+      const ctx = findEnclosingFactoryStringArg(
+        text,
+        text.length,
+        FUSION_PARTITION
+      );
+      assert.strictEqual(ctx?.alias, "New", text);
+      assert.strictEqual(ctx?.callShape, "curried", text);
+      assert.strictEqual(ctx?.nameStageParens, true, text);
+    }
+  });
+
+  test("class-name completion sees an existing props table", () => {
+    for (const [text, expected] of [
+      ['local x = New("Fr")', false],
+      ['local x = New("Fr") { }', true],
+      ['local x = New("Fr")({ })', true],
+    ] as const) {
+      const ctx = findEnclosingFactoryStringArg(
+        text,
+        text.indexOf("Fr") + 2,
+        FUSION_PARTITION
+      );
+      assert.strictEqual(ctx?.hasPropsAfter, expected, text);
+    }
+  });
+});
+
+suite("Fusion 0.3 scope parameter (issue #3)", () => {
+  test("props come from the second parameter when the first is a scope", () => {
+    const text = [
+      "type CardProps = { Title: string }",
+      "local function Card(scope: Scope<typeof(Fusion)>, props: CardProps)",
+      '  return scope:New("Frame")({ Name = props.Title })',
+      "end",
+    ].join("\n");
+    const info = scanDocument(text, FUSION_PARTITION).get("Card");
+    assert.strictEqual(info?.paramName, "props");
+    assert.deepStrictEqual(info?.paramTypeFields, ["Title"]);
+  });
+
+  test("an untyped `scope` first parameter is skipped too", () => {
+    const text = [
+      "local function Card(scope, props: { Title: string })",
+      '  return scope:New "Frame" { Name = props.Title }',
+      "end",
+    ].join("\n");
+    const info = scanDocument(text, FUSION_PARTITION).get("Card");
+    assert.strictEqual(info?.paramName, "props");
+  });
+
+  test("a lone parameter is always the props table, whatever it's called", () => {
+    const text = [
+      "local function Card(scope)",
+      '  return New "Frame" { Name = "x" }',
+      "end",
+    ].join("\n");
+    const info = scanDocument(text, FUSION_PARTITION).get("Card");
+    assert.strictEqual(info?.paramName, "scope");
+  });
+
+  test("a props-first component is unaffected", () => {
+    const text = [
+      "local function Card(props: { Title: string }, extra)",
+      '  return New "Frame" { Name = props.Title }',
+      "end",
+    ].join("\n");
+    const info = scanDocument(text, FUSION_PARTITION).get("Card");
+    assert.strictEqual(info?.paramName, "props");
+    assert.deepStrictEqual(info?.paramTypeFields, ["Title"]);
+  });
+});
+
+// ============================================================================
 // Sidebar plumbing: palette completion + scaffold templates
 // ============================================================================
 

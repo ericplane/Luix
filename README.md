@@ -157,6 +157,46 @@ locally, e.g. `local r = React.createElement` or `local n = Fusion.New`.
 The first argument can be a string (`"TextLabel"`) or an identifier
 (`MyButton`, `Components.Button`) — Luix handles both.
 
+### Curried calls: every spelling works
+
+The table shows each framework's canonical shape, but the curried
+frameworks (Fusion, Vide) are recognized however the call is actually
+written. Both stages are independent, and Luix accepts all four
+combinations:
+
+| | Sugar props | Parenthesized props |
+| --- | --- | --- |
+| **Sugar name** | `New "Frame" { … }` | `New "Frame" ({ … })` |
+| **Parenthesized name** | `New("Frame") { … }` | `New("Frame")({ … })` |
+
+That matters if you run **StyLua**: its default `call_parentheses =
+"Always"` (which the [Roblox Lua Style
+Guide](https://roblox.github.io/lua-style-guide/) requires) rewrites
+every sugar call into `New("Frame")({ … })`, so a formatted codebase
+contains only the bottom-right cell.
+
+**Fusion 0.3 scopes** work in both places the scope can appear — as a
+leading argument, or as a receiver from `scoped()`:
+
+```lua
+New(scope, "Frame") { … }
+scope:New "Frame" { … }
+scope:New("Frame")({ … })     -- …and StyLua'd
+```
+
+A receiver is accepted in front of any curried alias, so a `require`
+bound to a local name other than `Fusion` (`MyFusion.New "Frame" { … }`)
+resolves without adding it to `luix.fusion.aliases`.
+
+Components follow the same rule: `MyButton { … }`, `MyButton({ … })`,
+and Fusion 0.3's `MyButton(scope, { … })` are all detected. A component
+whose first parameter is the scope has its props read from the second
+parameter, so `props`' type still drives call-site completions:
+
+```lua
+local function Card(scope: Scope<typeof(Fusion)>, props: CardProps)
+```
+
 ---
 
 ## Feature tour

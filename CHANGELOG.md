@@ -4,6 +4,75 @@ All notable changes to **Luix** will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.5.2]
+
+### Fusion 0.3 and StyLua-formatted calls are recognised ([#3](https://github.com/ericplane/Luix/issues/3))
+
+Luix only understood curried element calls written with Lua's call
+sugar — `New "Frame" { … }`. Two very common ways of writing the exact
+same call went completely undetected, taking prop completions, hover
+docs, inlay hints, colour previews, diagnostics and every refactor with
+them.
+
+**Fusion 0.3 scopes.** The constructor now takes a scope, either
+threaded as a leading argument or bound to a receiver by `scoped()`:
+
+```lua
+New(scope, "Frame") { … }     -- explicit scope
+scope:New "Frame" { … }       -- scoped() receiver
+```
+
+**Parenthesised calls.** The Roblox Lua Style Guide requires
+parentheses when calling a function, and StyLua's default
+`call_parentheses = "Always"` rewrites every sugar call to match. So a
+formatted codebase never contains the sugar form at all:
+
+```lua
+New("Frame")({ … })
+scope:New("Frame")({ … })
+```
+
+The two are independent, and every combination now parses. The
+class-name stage accepts `"Frame"` or `(… , "Frame")`; the props stage
+accepts `{ … }` or `({ … })`; and a `scope:` / `MyFusion.` receiver is
+accepted in front of any alias, so a `require` bound to a local name
+other than `Fusion` works too. The same widening applies to Vide's
+`create("Frame")({ … })`.
+
+Accepting a class-name completion inside a parenthesised call now
+closes it the same way — `New("Frame")({ … })`, not the sugar form.
+
+### Fusion 0.3 components read props from the right parameter
+
+A Fusion 0.3 component takes its scope first and its props second:
+
+```lua
+local function Card(scope: Scope<typeof(Fusion)>, props: CardProps)
+```
+
+Luix treated the first parameter as the props table, so `CardProps`
+never reached prop completions at call sites and the hardcoded-prop
+diagnostic compared against the wrong identifier. The scope parameter is
+now skipped when the second parameter exists. Detection is deliberately
+narrow — the parameter's name or annotated type has to actually say
+`scope` — so a component whose props parameter comes first is unaffected.
+
+Fusion 0.3's component call convention `MyButton(scope, { … })` is
+detected too, alongside the existing `MyButton { … }` and
+`MyButton({ … })`.
+
+### Fixed
+
+- **Extract to component** and **wrap in container** failed to identify
+  the framework whenever the class name was a string literal — the alias
+  was derived by slicing up to the class name, which left the call's
+  punctuation attached (`e("`, `New "`). Both now read the alias the
+  parser already resolved.
+- **Wrap in container** dropped the `scope:` receiver when rebuilding a
+  Fusion 0.3 call, producing a `New` with no scope to construct into.
+- A call's reported range now spans the receiver, so refactors that
+  rewrite a call no longer leave a stray `scope:` behind.
+
 ## [1.5.1]
 
 Two of Roblox's content URL schemes are painful to type by hand and

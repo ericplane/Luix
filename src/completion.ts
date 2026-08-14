@@ -398,11 +398,10 @@ export class ClassNameCompletionProvider
     let replaceEnd = cursorOffset;
     if (ctx.stringEnd !== -1) {
       replaceEnd = ctx.stringEnd + 1;
-      if (
-        ctx.callShape === "parens" &&
-        ctx.closeParen !== -1 &&
-        !ctx.hasPropsAfter
-      ) {
+      // `closeParen` is only ever set when the paren is ours to
+      // rewrite — the call's own `)` for the parens form, the name
+      // stage's `)` for `New("Fr|")`.
+      if (ctx.closeParen !== -1 && !ctx.hasPropsAfter) {
         replaceEnd = ctx.closeParen + 1;
       }
     }
@@ -420,8 +419,11 @@ export class ClassNameCompletionProvider
     // a following sibling element doesn't need the user to manually add
     // the separator. Skipped in top-level / assignment / function-arg
     // contexts where a trailing comma would be a Lua syntax error.
+    const openParenBeforeString =
+      ctx.callShape === "parens" || !!ctx.nameStageParens;
     const tailComma =
-      !ctx.hasPropsAfter && isInListElementContext(text, ctx.stringStart, ctx.callShape)
+      !ctx.hasPropsAfter &&
+      isInListElementContext(text, ctx.stringStart, openParenBeforeString)
         ? ",$0"
         : "";
     const trailing = (() => {
@@ -432,7 +434,13 @@ export class ClassNameCompletionProvider
       if (ctx.callShape === "parens") {
         return `${q}, {\n\t$1,\n})${tailComma}`;
       }
-      // Curried form (Fusion / Vide).
+      if (ctx.nameStageParens) {
+        // Curried, but the class name sits in a parenthesised name
+        // stage — close it, then open the props stage the same way
+        // StyLua would: `New("Frame")({ … })`.
+        return `${q})({\n\t$1,\n})${tailComma}`;
+      }
+      // Curried form, Lua call sugar (Fusion / Vide).
       return `${q} {\n\t$1,\n}${tailComma}`;
     })();
 
@@ -485,17 +493,35 @@ function findCallAliasOffset(
   let i = ctx.stringStart - 1;
   // Skip whitespace between the alias's punctuation and the string.
   while (i >= 0 && /[ \t]/.test(text[i])) i--;
-  if (ctx.callShape === "parens") {
-    // For parens form, the `(` sits between alias and string.
+  if (ctx.callShape === "parens" || ctx.nameStageParens) {
+    // The `(` sits between alias and string — and for Fusion 0.3's
+    // `New(scope, "Fr|")` there are leading arguments to step over too.
+    i = skipBackOverLeadingArgs(text, i);
     if (text[i] !== "(") return undefined;
     i--;
     while (i >= 0 && /[ \t]/.test(text[i])) i--;
   }
-  // Walk back across the alias identifier (allow dotted forms like
-  // `React.createElement` / `Fusion.New`).
-  while (i >= 0 && /[A-Za-z0-9_.]/.test(text[i])) i--;
+  // Walk back across the alias identifier — dotted forms like
+  // `React.createElement` / `Fusion.New`, plus any `scope:` receiver.
+  while (i >= 0 && /[A-Za-z0-9_.:]/.test(text[i])) i--;
   const aliasStart = i + 1;
   return aliasStart < ctx.stringStart ? aliasStart : undefined;
+}
+
+/**
+ * From just left of the class-name string, step back over any
+ * preceding arguments in the same call (`New(scope, "Fr|")`) so `i`
+ * lands on the call's `(`. Single-line and paren-free by design — the
+ * only real-world leading argument is a plain scope variable. Returns
+ * `i` unchanged when there's nothing to skip.
+ */
+function skipBackOverLeadingArgs(text: string, from: number): number {
+  if (text[from] !== ",") return from;
+  let i = from;
+  while (i >= 0 && text[i] !== "(" && text[i] !== "\n" && text[i] !== ")") {
+    i--;
+  }
+  return i >= 0 && text[i] === "(" ? i : from;
 }
 
 /**
@@ -527,26 +553,29 @@ function isPrecededByListElementSeparator(
 
 /**
  * Variant for the string-literal class-name path: walks back from the
- * opening quote, across the call's punctuation (`(` for parens, just
- * whitespace for curried) and the alias identifier, then defers to
+ * opening quote, across the call's punctuation (an opening `(` when the
+ * class name sits in a parenthesised argument list, just whitespace for
+ * the curried sugar form) and the alias identifier, then defers to
  * `isPrecededByListElementSeparator` for the actual decision.
  */
 function isInListElementContext(
   text: string,
   stringStart: number,
-  callShape: "parens" | "curried"
+  openParenBeforeString: boolean
 ): boolean {
   let i = stringStart - 1;
   // Skip whitespace between the alias punctuation and the opening quote.
   while (i >= 0 && /[ \t]/.test(text[i])) i--;
-  // For parens, also skip the `(`.
-  if (callShape === "parens") {
+  // Step over the `(` (and any leading `scope,` argument) when present.
+  if (openParenBeforeString) {
+    i = skipBackOverLeadingArgs(text, i);
     if (text[i] !== "(") return false;
     i--;
     while (i >= 0 && /[ \t]/.test(text[i])) i--;
   }
-  // Skip the alias identifier (allow dotted forms like React.createElement).
-  while (i >= 0 && /[A-Za-z0-9_.]/.test(text[i])) i--;
+  // Skip the alias identifier — dotted forms like `React.createElement`,
+  // and any `scope:` receiver Fusion 0.3 puts in front of it.
+  while (i >= 0 && /[A-Za-z0-9_.:]/.test(text[i])) i--;
   // `i` now points just before the alias's first char.
   return isPrecededByListElementSeparator(text, i + 1);
 }
