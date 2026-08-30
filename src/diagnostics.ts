@@ -3,6 +3,7 @@ import {
   getPropType,
   defaultPropsMap,
   flattenClassProps,
+  flattenClassEvents,
   isDeprecatedValidProp,
   cornerRadiusConflicts,
 } from "./data";
@@ -22,7 +23,7 @@ import {
 } from "./parser";
 import { getAutoImportConfig } from "./config";
 import { configChangeAffects, getConfig } from "./configCompat";
-import { getAliasPartition } from "./frameworks";
+import { findFrameworkForAlias, getAliasPartition } from "./frameworks";
 import { WorkspaceIndex } from "./workspaceIndex";
 import { planUICornerRefactor } from "./uiCorner";
 
@@ -549,6 +550,20 @@ function computePropValidationDiagnostics(
     // ---- Unknown / wrong-enum (Roblox host class only) ----
     if (call.isStringLiteralName && defaultPropsMap[call.className]) {
       const known = new Set(flattenClassProps(call.className));
+      // Frameworks that take events as plain table keys (Vide:
+      // `Activated = function() … end`) put event names in the same
+      // props table. Completion already merges them (see
+      // `completion.ts`); mirror that here so they aren't flagged
+      // "Unknown property" (issue #4). React/Roact/Fusion spell events
+      // as computed keys, which the entry scanner never yields.
+      const framework = call.alias
+        ? findFrameworkForAlias(call.alias)
+        : undefined;
+      if (framework?.eventsAsProps) {
+        for (const event of flattenClassEvents(call.className)) {
+          known.add(event);
+        }
+      }
       for (const entry of entries) {
         if (known.has(entry.key)) {
           // Check enum type, if we know one. Use class-aware lookup so
