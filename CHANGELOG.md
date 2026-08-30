@@ -4,6 +4,19 @@ All notable changes to **Luix** will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Vide events are no longer flagged as unknown props ([#4](https://github.com/ericplane/Luix/issues/4))
+
+Vide passes events as plain table keys — `Activated = function() … end`,
+`MouseEnter = …`, `MouseButton1Down = …`. Completion already merged the
+class's events into the prop list for frameworks with `eventsAsProps`,
+but the unknown-prop diagnostic only consulted `flattenClassProps`, so
+every Vide event handler on a host class was warned about as
+`Unknown property`. The diagnostic now unions `flattenClassEvents` into
+its known set when the call's alias belongs to an `eventsAsProps`
+framework. React, Roact and Fusion spell events as computed keys and
+are unaffected.
 ## [1.5.2]
 
 ### Fusion 0.3 and StyLua-formatted calls are recognised ([#3](https://github.com/ericplane/Luix/issues/3))
