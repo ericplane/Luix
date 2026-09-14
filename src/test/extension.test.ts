@@ -2884,3 +2884,282 @@ suite("UICorner preview path — roundedRectPath (1.5.1)", () => {
     assert.strictEqual((path.match(/A /g) ?? []).length, 4);
   });
 });
+
+// ============================================================================
+// 1.5.3 — event data coverage, most-specific-first ordering, Parent key
+// ============================================================================
+
+import { sortPropsBody, DEFAULT_CATEGORY_ORDER, SortTarget } from "../sortProps";
+import { FRAMEWORKS } from "../frameworks";
+
+suite("Event coverage — Instance / VideoFrame / UIPageLayout (1.5.3)", () => {
+  const INSTANCE_EVENTS = [
+    "AncestryChanged",
+    "AttributeChanged",
+    "Changed",
+    "ChildAdded",
+    "ChildRemoved",
+    "DescendantAdded",
+    "DescendantRemoving",
+    "Destroying",
+    "StyledPropertiesChanged",
+  ];
+
+  test("Instance-level signals reach every host class", () => {
+    for (const cls of ["Frame", "TextButton", "UIStroke", "ScreenGui", "UIPageLayout"]) {
+      const events = _testing.flattenClassEvents(cls);
+      for (const e of INSTANCE_EVENTS) {
+        assert.ok(events.includes(e), `${cls} should have ${e}`);
+      }
+    }
+  });
+
+  test("GuiButton has SecondaryActivated next to Activated; non-buttons don't", () => {
+    const events = _testing.flattenClassEvents("ImageButton");
+    assert.ok(events.includes("SecondaryActivated"));
+    assert.strictEqual(events.indexOf("SecondaryActivated"), events.indexOf("Activated") + 1);
+    assert.ok(!_testing.flattenClassEvents("TextLabel").includes("SecondaryActivated"));
+  });
+
+  test("VideoFrame has its playback events on top of GuiObject's", () => {
+    const events = _testing.flattenClassEvents("VideoFrame");
+    for (const e of ["DidLoop", "Ended", "Loaded", "Paused", "Played"]) {
+      assert.ok(events.includes(e), `missing ${e}`);
+    }
+    assert.ok(events.includes("MouseEnter"));
+  });
+
+  test("UIPageLayout has PageEnter / PageLeave / Stopped; sibling layouts don't", () => {
+    const page = _testing.flattenClassEvents("UIPageLayout");
+    for (const e of ["PageEnter", "PageLeave", "Stopped"]) {
+      assert.ok(page.includes(e), `missing ${e}`);
+    }
+    assert.ok(!_testing.flattenClassEvents("UIListLayout").includes("PageEnter"));
+  });
+
+  test("no event name collides with a prop name on the same class", () => {
+    for (const cls of Object.keys(_testing.classHierarchy)) {
+      const props = new Set(_testing.flattenClassProps(cls));
+      for (const e of _testing.flattenClassEvents(cls)) {
+        assert.ok(!props.has(e), `${cls}: ${e} is both a prop and an event`);
+      }
+    }
+  });
+
+  test("events are ordered most-specific first (own → parent → … → Instance)", () => {
+    const events = _testing.flattenClassEvents("TextButton");
+    const idx = (name: string) => events.indexOf(name);
+    assert.strictEqual(idx("Activated"), 0, "GuiButton's own events lead");
+    assert.ok(idx("MouseButton1Click") < idx("MouseEnter"), "GuiButton before GuiObject");
+    assert.ok(idx("MouseEnter") < idx("SelectionChanged"), "GuiObject before GuiBase2d");
+    assert.ok(idx("SelectionChanged") < idx("Destroying"), "GuiBase2d before Instance");
+    assert.strictEqual(events.length, new Set(events).size, "no duplicates");
+  });
+
+  test("findIntroducingEventClass walks the hierarchy like findIntroducingClass", () => {
+    assert.strictEqual(_testing.findIntroducingEventClass("TextButton", "Activated"), "GuiButton");
+    assert.strictEqual(_testing.findIntroducingEventClass("TextButton", "MouseEnter"), "GuiObject");
+    assert.strictEqual(_testing.findIntroducingEventClass("Frame", "Destroying"), "Instance");
+    assert.strictEqual(_testing.findIntroducingEventClass("TextBox", "FocusLost"), "TextBox");
+    assert.strictEqual(_testing.findIntroducingEventClass("Frame", "Activated"), undefined);
+    assert.strictEqual(_testing.findIntroducingEventClass("NotAClass", "Changed"), undefined);
+  });
+});
+
+suite("sortProps — event keys come from the class hierarchy (1.5.3)", () => {
+  // `[Children]` sorts into the Children category, which follows Events
+  // in the default order. Any plain key recognised as an event must
+  // therefore land BEFORE it; an unrecognised key ("Other") lands after.
+  const host = (className: string) => ({ className, isStringLiteralName: true });
+  function sorted(target: SortTarget | undefined, ...keys: string[]): string[] {
+    const body = "\n" + keys.map((k) => `  ${k},`).join("\n") + "\n";
+    const out = sortPropsBody(body, DEFAULT_CATEGORY_ORDER, target) ?? body;
+    return out
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0)
+      .map((l) => l.replace(/,$/, ""));
+  }
+
+  test("Events precede Children in the default order (the premise of this suite)", () => {
+    assert.ok(
+      DEFAULT_CATEGORY_ORDER.indexOf("Events") < DEFAULT_CATEGORY_ORDER.indexOf("Children")
+    );
+    assert.ok(
+      DEFAULT_CATEGORY_ORDER.indexOf("Children") < DEFAULT_CATEGORY_ORDER.indexOf("Other")
+    );
+  });
+
+  test("GuiObject events the old regex missed are now recognised", () => {
+    for (const key of ["MouseWheelForward", "TouchSwipe", "TouchLongPress", "SelectionChanged"]) {
+      const out = sorted(host("Frame"), "[Children] = {}", `${key} = fn`);
+      assert.deepStrictEqual(out, [`${key} = fn`, "[Children] = {}"], key);
+    }
+  });
+
+  test("a host class uses its exact event list (Instance / TextBox / VideoFrame)", () => {
+    const cases: Array<[string, string]> = [
+      ["Frame", "Destroying"],
+      ["TextBox", "ReturnPressedFromOnScreenKeyboard"],
+      ["VideoFrame", "Ended"],
+      ["UIPageLayout", "PageEnter"],
+    ];
+    for (const [cls, key] of cases) {
+      const out = sorted(host(cls), "[Children] = {}", `${key} = fn`);
+      assert.deepStrictEqual(out, [`${key} = fn`, "[Children] = {}"], `${cls}.${key}`);
+    }
+    // …and an event another class has is NOT an event here.
+    const out = sorted(host("Frame"), "[Children] = {}", "Ended = fn");
+    assert.deepStrictEqual(out, ["[Children] = {}", "Ended = fn"]);
+  });
+
+  test("custom components get the UI-only fallback: GUI events yes, generic names no", () => {
+    for (const key of ["Activated", "MouseEnter", "FocusLost", "TouchSwipe"]) {
+      const out = sorted(undefined, "[Children] = {}", `${key} = fn`);
+      assert.deepStrictEqual(out, [`${key} = fn`, "[Children] = {}"], key);
+    }
+    // `Ended` / `Loaded` / `Changed` are ordinary prop names on a
+    // component, so they must stay in Other (after Children).
+    for (const key of ["Ended", "Loaded", "Changed", "Destroying"]) {
+      const out = sorted(undefined, `${key} = 1`, "[Children] = {}");
+      assert.deepStrictEqual(out, ["[Children] = {}", `${key} = 1`], key);
+    }
+    const component = { className: "Card", isStringLiteralName: false };
+    assert.deepStrictEqual(
+      sorted(component, "Paused = true", "[Children] = {}"),
+      ["[Children] = {}", "Paused = true"]
+    );
+  });
+
+  test("a non-event key falls through to Other (real reorder, not a no-op)", () => {
+    const out = sorted(host("Frame"), "Whatever = 1", "[Children] = {}");
+    assert.deepStrictEqual(out, ["[Children] = {}", "Whatever = 1"]);
+    // Already in order → sortPropsBody reports "nothing to do".
+    assert.strictEqual(
+      sortPropsBody("\n  [Children] = {},\n  Whatever = 1,\n", DEFAULT_CATEGORY_ORDER, host("Frame")),
+      undefined
+    );
+  });
+});
+
+suite("Framework spec — parentAsProp (1.5.3)", () => {
+  test("Fusion and Vide take Parent as a table key; React and Roact do not", () => {
+    assert.strictEqual(FRAMEWORKS.fusion.parentAsProp, true);
+    assert.strictEqual(FRAMEWORKS.vide.parentAsProp, true);
+    assert.ok(!FRAMEWORKS.react.parentAsProp);
+    assert.ok(!FRAMEWORKS.roact.parentAsProp);
+  });
+
+  test("Parent stays out of the class hierarchy (it is framework-gated, not a prop)", () => {
+    for (const cls of Object.keys(_testing.classHierarchy)) {
+      assert.ok(!_testing.flattenClassProps(cls).includes("Parent"), cls);
+    }
+  });
+});
+
+import { _internal as sortPropsInternal } from "../sortProps";
+import { _internal as apiDumpInternal } from "../apiDump";
+import { getAliasPartition } from "../frameworks";
+import { rebuildDerivedClassData } from "../data";
+
+suite("sortProps — positional entries are kept, not dropped (1.5.3)", () => {
+  const T: SortTarget = { className: "TextButton", isStringLiteralName: true };
+
+  test("a Vide inline child between props survives the sort and lands after the props", () => {
+    const body =
+      '\n  Size = x,\n  Name = "a",\n  create "TextLabel" {\n    Text = "t",\n  },\n  Activated = fn,\n';
+    assert.strictEqual(
+      sortPropsBody(body, DEFAULT_CATEGORY_ORDER, T),
+      '\n  Name = "a",\n  Size = x,\n  Activated = fn,\n  create "TextLabel" {\n    Text = "t",\n  },\n'
+    );
+  });
+
+  test("component calls and Vide actions keep their relative order in the Children slot", () => {
+    const body =
+      '\n  create "TextLabel" {},\n  Child(props),\n  action(function(b) end),\n  Size = x,\n';
+    assert.strictEqual(
+      sortPropsBody(body, DEFAULT_CATEGORY_ORDER, T),
+      '\n  Size = x,\n  create "TextLabel" {},\n  Child(props),\n  action(function(b) end),\n'
+    );
+  });
+
+  test("props-then-children is already sorted (no-op), and a string positional is kept", () => {
+    assert.strictEqual(
+      sortPropsBody('\n  Name = "a",\n  Size = x,\n  create "TextLabel" {},\n', DEFAULT_CATEGORY_ORDER, T),
+      undefined
+    );
+    assert.strictEqual(
+      sortPropsBody('\n  "text",\n  Name = "a",\n', DEFAULT_CATEGORY_ORDER, T),
+      '\n  Name = "a",\n  "text",\n'
+    );
+  });
+});
+
+suite("sortProps — SortTarget threading through nested calls (1.5.3)", () => {
+  test("sortBodyRecursive sorts each nested call with that call's own event list", () => {
+    // `Ended` is an event on VideoFrame but an ordinary key on Frame, so
+    // the inner table must move it before `[Children]` while the outer
+    // table leaves it after.
+    const text = [
+      'local f = create "Frame" {',
+      "  [Children] = {},",
+      "  Ended = fn,",
+      '  create "VideoFrame" {',
+      "    [Children] = {},",
+      "    Ended = fn,",
+      "  },",
+      "}",
+    ].join("\n");
+    const calls = findAllCreateElementCalls(text, getAliasPartition()).filter(
+      (c): c is typeof c & { propsBraceStart: number; propsBraceEnd: number } =>
+        c.propsBraceStart !== undefined && c.propsBraceEnd !== undefined
+    );
+    assert.strictEqual(calls.length, 2);
+    const outer = calls.find((c) => c.className === "Frame")!;
+    const sorted = sortPropsInternal.sortBodyRecursive(
+      text,
+      outer.propsBraceStart + 1,
+      outer.propsBraceEnd,
+      calls,
+      DEFAULT_CATEGORY_ORDER,
+      outer
+    );
+    assert.ok(sorted, "expected a change");
+    const lines = sorted!.split("\n").map((l) => l.trim()).filter(Boolean);
+    // Inner: Ended (event on VideoFrame) before [Children].
+    const innerEnded = lines.indexOf("Ended = fn,", lines.indexOf('create "VideoFrame" {'));
+    const innerChildren = lines.indexOf("[Children] = {},", lines.indexOf('create "VideoFrame" {'));
+    assert.ok(innerEnded !== -1 && innerChildren !== -1 && innerEnded < innerChildren, sorted);
+    // Outer: Ended is Other on a Frame → stays after [Children]; the
+    // positional child call moves to the Children slot before it.
+    const outerChildren = lines.indexOf("[Children] = {},");
+    const outerEnded = lines.indexOf("Ended = fn,");
+    assert.ok(outerChildren < outerEnded, sorted);
+  });
+});
+
+suite("API-dump merge never re-admits Parent (1.5.3)", () => {
+  test("Parent is skipped while other dump properties still merge", () => {
+    const own = _testing.classHierarchy.Instance.own;
+    const before = own.length;
+    apiDumpInternal.mergeIntoBuiltins({
+      Classes: [
+        {
+          Name: "Instance",
+          Members: [
+            { MemberType: "Property", Name: "Parent" },
+            { MemberType: "Property", Name: "ZzzSentinelProp" },
+          ],
+        },
+      ],
+    });
+    try {
+      assert.ok(!_testing.flattenClassProps("Frame").includes("Parent"));
+      assert.ok(_testing.flattenClassProps("Frame").includes("ZzzSentinelProp"));
+    } finally {
+      own.splice(before);
+      rebuildDerivedClassData();
+    }
+    assert.ok(!_testing.flattenClassProps("Frame").includes("ZzzSentinelProp"));
+  });
+});

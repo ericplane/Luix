@@ -56,6 +56,14 @@ export interface FrameworkSpec {
    * rather than the `[React.Event.X]` bracket form.
    */
   eventsAsProps: boolean;
+  /**
+   * Whether `Parent = …` is an accepted table key. Fusion and Vide
+   * construct real instances and mount them by setting `Parent` in the
+   * same table (`New "ScreenGui" { Parent = playerGui }`); React and
+   * Roact mount through a root / portal instead, so a bare `Parent`
+   * there is a mistake worth flagging. Defaults to false.
+   */
+  parentAsProp?: boolean;
 }
 
 export const FRAMEWORKS: Record<FrameworkId, FrameworkSpec> = {
@@ -78,6 +86,7 @@ export const FRAMEWORKS: Record<FrameworkId, FrameworkSpec> = {
     childrenLayout: "table-key",
     childrenKey: "Children",
     eventsAsProps: false,
+    parentAsProp: true,
   },
   vide: {
     id: "vide",
@@ -91,6 +100,7 @@ export const FRAMEWORKS: Record<FrameworkId, FrameworkSpec> = {
     recognizedCallShapes: ["parens", "curried"],
     childrenLayout: "inline",
     eventsAsProps: true,
+    parentAsProp: true,
   },
 };
 

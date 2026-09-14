@@ -31,7 +31,7 @@ New "TextLabel" {
 create "TextLabel" {
     Text = "Hello",
     -- same suggestions, plus event names (Activated, MouseEnter, …)
-    -- appear as regular props
+    -- offered as plain keys that insert a handler body
 }
 ```
 
@@ -533,7 +533,14 @@ Behavior → Events → Refs → Children → Other
   order; ties keep their original order (stable sort).
 - Computed-key aware: `[React.Event.Activated]`, `[OnEvent "…"]`,
   `[Children]` are recognised. Vide-style plain identifier events
-  (`Activated = function() … end`) are mapped to **Events** too.
+  (`Activated = function() … end`) are mapped to **Events** too — which
+  keys count as events comes from the class hierarchy and is scoped to
+  the element being sorted (`Ended` is an event on a `VideoFrame`, an
+  ordinary prop elsewhere); custom components only get the unambiguous
+  GUI signals (`Activated`, `MouseEnter`, `FocusLost`, …).
+- Keyless entries — Vide inline children (`create "TextLabel" { … }`,
+  `Child(props)`) and action calls — are kept and moved to the
+  **Children** slot in their original order.
 - Tables containing `--` comments are skipped to avoid detaching
   comments from their props.
 - **Idempotent** — re-sorting a sorted table is a no-op (no
@@ -607,12 +614,19 @@ Hover any prop name inside an element table to see its type, the class
 it was introduced on (walking the Roblox hierarchy), and a deep link to
 the Roblox reference docs.
 
+Event keys get the same treatment — the event name inside
+`[React.Event.Activated]`, `[Roact.Event.X]` or `[OnEvent "X"]`, and a
+Vide plain key like `Activated = …` — showing which class introduces
+the event and linking to its docs. Fusion and Vide's `Parent = …` key
+hovers as `Instance` with a note on how the two frameworks apply it.
+
 Hover a **custom-component name** (`e(MyButton, …)` → hover `MyButton`)
 to see what Luix has inferred about it: its declared props
 (`@prop`/typed param/auto-detected), the base class it extends, and a
 list of forwardable props. Hovering a prop key inside `e(MyButton, …)`
 shows whether the prop is component-defined or inherited from the base
-class.
+class; an event key on a component with a known base is reported as
+forwarded from that base class.
 
 ### RichText support
 
@@ -698,8 +712,15 @@ Typing `:gbp:` then expands to `£`. Built-in slugs can't be shadowed.
 - **Fusion** — typing `[OnEvent "M` suggests events as plain strings.
   *(Curried call detection is in place; richer in-bracket completion
   ships alongside it.)*
-- **Vide** — events are plain table keys; Luix already merges the
-  class's events into the prop suggestion list for you.
+- **Vide** — events are plain table keys; Luix merges the class's
+  events into the prop suggestion list as *Event* items that insert a
+  handler body (`Activated = function() … end,`), and hovering one
+  shows the same docs as a prop.
+
+Event lists are ordered most-specific first — a `TextButton` offers
+`Activated` and `MouseButton1Click` before the `GuiObject` mouse/touch
+events, with the generic `Instance` signals (`Destroying`,
+`AncestryChanged`, `ChildAdded`, …) last.
 
 ### Workspace-wide component inference
 
@@ -756,6 +777,10 @@ Yellow squigglies, one-click fixes:
   `e("Frame", { ScrollingDirection = … })` warns *"Unknown property
   `ScrollingDirection` on `Frame`. Did you mean `Position`?"* with a
   *Rename to `Position`* quick-fix (Levenshtein-based suggestion).
+  Framework-aware: Vide's plain-key events (`Activated = fn`) and
+  Fusion/Vide's `Parent = …` are known keys there, while a bare
+  `Activated` in a React/Roact/Fusion table, or `Parent` in a
+  React/Roact table, is still flagged.
 - **Duplicate key** in the same props table — `Size = …, Size = …`
   flags the second assignment as silently overwriting the first.
 - **Wrong enum type** — `BorderMode = Enum.Font.X` warns because

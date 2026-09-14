@@ -23,7 +23,28 @@ export interface ClassDef {
 //     `HorizontalAlignment`, etc. via a `UILayout` base.
 export const classHierarchy: Record<string, ClassDef> = {
   // ---- roots ----
-  Instance: { own: ["Archivable", "Name"] },
+  Instance: {
+    own: ["Archivable", "Name"],
+    // Signals every Instance exposes. Vide connects any signal-valued
+    // key (`Destroying = function() … end`), so these must be known
+    // for the unknown-prop diagnostic and the events-as-props
+    // completion; React/Roact/Fusion reach them via `[React.Event.X]`
+    // / `[OnEvent "X"]`. `Changed` is really declared on `Object`, the
+    // engine's root above `Instance`; it lives here because every
+    // Instance inherits it and nothing else in this hierarchy needs
+    // that extra level.
+    events: [
+      "AncestryChanged",
+      "AttributeChanged",
+      "Changed",
+      "ChildAdded",
+      "ChildRemoved",
+      "DescendantAdded",
+      "DescendantRemoving",
+      "Destroying",
+      "StyledPropertiesChanged",
+    ],
+  },
 
   GuiBase2d: {
     inherits: "Instance",
@@ -102,6 +123,7 @@ export const classHierarchy: Record<string, ClassDef> = {
     ],
     events: [
       "Activated",
+      "SecondaryActivated",
       "MouseButton1Click",
       "MouseButton1Down",
       "MouseButton1Up",
@@ -160,6 +182,7 @@ export const classHierarchy: Record<string, ClassDef> = {
       "Video",
       "Volume",
     ],
+    events: ["DidLoop", "Ended", "Loaded", "Paused", "Played"],
   },
 
   CanvasGroup: {
@@ -452,6 +475,7 @@ export const classHierarchy: Record<string, ClassDef> = {
       "ScrollWheelInputEnabled",
       "TouchInputEnabled",
     ],
+    events: ["PageEnter", "PageLeave", "Stopped"],
   },
 
   UITableLayout: {
@@ -600,6 +624,15 @@ export function cornerRadiusConflicts(keys: Iterable<string>): string[] {
 
 const eventsCache = new Map<string, string[]>();
 
+/**
+ * Every event a class can fire, most-specific first: the class's own
+ * events, then its parent's, up to `Instance`. Unlike
+ * `flattenClassProps` (base-first) this is ordered so the events users
+ * actually reach for on a button (`Activated`, `MouseButton1Click`)
+ * lead the `[React.Event.|` / `[OnEvent "|` / Vide suggestion lists and
+ * the generic `Instance` signals (`AncestryChanged`, `Destroying`, …)
+ * bring up the rear.
+ */
 export function flattenClassEvents(
   className: string,
   seen: Set<string> = new Set(),
@@ -626,13 +659,13 @@ export function flattenClassEvents(
   const inherited = def.inherits ? flattenClassEvents(def.inherits, seen) : [];
   const out: string[] = [];
   const known = new Set<string>();
-  for (const e of inherited) {
+  for (const e of def.events ?? []) {
     if (!known.has(e)) {
       known.add(e);
       out.push(e);
     }
   }
-  for (const e of def.events ?? []) {
+  for (const e of inherited) {
     if (!known.has(e)) {
       known.add(e);
       out.push(e);
@@ -652,13 +685,33 @@ export function findIntroducingClass(
   className: string,
   propName: string,
 ): string | undefined {
+  return findIntroducing(className, propName, (def) => def.own);
+}
+
+/**
+ * Event counterpart of `findIntroducingClass`: the class whose `events`
+ * array first declares `eventName` (e.g. `Activated` on `TextButton` →
+ * `GuiButton`).
+ */
+export function findIntroducingEventClass(
+  className: string,
+  eventName: string,
+): string | undefined {
+  return findIntroducing(className, eventName, (def) => def.events ?? []);
+}
+
+function findIntroducing(
+  className: string,
+  member: string,
+  membersOf: (def: ClassDef) => string[],
+): string | undefined {
   let current: string | undefined = className;
   while (current) {
     const def: ClassDef | undefined = classHierarchy[current];
     if (!def) {
       return undefined;
     }
-    if (def.own.includes(propName)) {
+    if (membersOf(def).includes(member)) {
       return current;
     }
     current = def.inherits;

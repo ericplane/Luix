@@ -135,6 +135,13 @@ function mergeIntoBuiltins(dump: ApiDump): void {
       if (m.MemberType !== "Property") continue;
       if (!m.Name) continue;
       if (existing.has(m.Name)) continue;
+      // `Parent` is a real Instance property in the dump, but Luix
+      // admits it per framework (`FrameworkSpec.parentAsProp`) rather
+      // than as a class prop — merging it here would offer it to
+      // React/Roact and silence the diagnostic there.
+      if (m.Name === "Parent") {
+        continue;
+      }
       const tags = m.Tags ?? [];
       if (
         tags.includes("Deprecated") ||
@@ -158,3 +165,7 @@ function mergeIntoBuiltins(dump: ApiDump): void {
     rebuildDerivedClassData();
   }
 }
+
+export const _internal = {
+  mergeIntoBuiltins,
+};

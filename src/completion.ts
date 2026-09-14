@@ -235,6 +235,10 @@ export class ReactLuauPropsCompletionProvider
     ) {
       framework = FRAMEWORKS.vide;
     }
+    // Track which merged names are events so their completion items can
+    // carry the Event kind and a handler-body snippet instead of the
+    // generic `= $1,` value template.
+    const eventNames = new Set<string>();
     if (framework && framework.eventsAsProps) {
       const baseClass = await resolveEffectiveClass(
         detected.className,
@@ -247,9 +251,25 @@ export class ReactLuauPropsCompletionProvider
           const merged: string[] = [];
           pushUnique(merged, props);
           pushUnique(merged, events);
+          for (const event of events) {
+            if (!props.includes(event)) {
+              eventNames.add(event);
+            }
+          }
           props = merged;
         }
       }
+    }
+    // Fusion / Vide mount via `Parent = …` in the same table. Only host
+    // classes take it — a custom component's props are whatever its
+    // author declared.
+    if (
+      framework &&
+      framework.parentAsProp &&
+      classHierarchy[detected.className] &&
+      !props.includes("Parent")
+    ) {
+      props = [...props, "Parent"];
     }
 
     const wordRange = document.getWordRangeAtPosition(
@@ -280,7 +300,8 @@ export class ReactLuauPropsCompletionProvider
       detected.className,
       props,
       effectiveRange,
-      hasExistingValue
+      hasExistingValue,
+      eventNames
     );
   }
 }
@@ -1315,7 +1336,8 @@ function buildItemsForProps(
   className: string,
   props: string[],
   range: vscode.Range | undefined,
-  hasExistingValue: boolean
+  hasExistingValue: boolean,
+  eventNames: ReadonlySet<string> = new Set()
 ): vscode.CompletionItem[] {
   // When the user is renaming an existing entry (`Pad| = UDim.new(...)`),
   // override the configured snippet mode and emit just the prop name —
@@ -1326,11 +1348,36 @@ function buildItemsForProps(
   const typeAware = getConfig<boolean>("typeAwareValues", true);
 
   return props.map((name, index) => {
+    // Events merged in for `eventsAsProps` frameworks (Vide) get the
+    // Event kind and a handler-body snippet.
+    if (eventNames.has(name)) {
+      const item = new vscode.CompletionItem(
+        name,
+        vscode.CompletionItemKind.Event
+      );
+      item.insertText = buildEventHandlerSnippet(name, snippetMode);
+      item.detail = `${className} event`;
+      item.documentation = new vscode.MarkdownString(
+        `\`${className}.${name}\` — event handler — suggested by Luix.`
+      );
+      item.filterText = name;
+      item.sortText = String(index).padStart(4, "0");
+      if (range) {
+        item.range = range;
+      }
+      return item;
+    }
     const item = new vscode.CompletionItem(
       name,
       vscode.CompletionItemKind.Property
     );
-    const propType = typeAware ? getPropType(className, name) : undefined;
+    // `Parent` isn't in the class hierarchy (it's admitted per framework
+    // via `parentAsProp`), so give it its type by hand.
+    const propType = !typeAware
+      ? undefined
+      : name === "Parent"
+        ? "Instance"
+        : getPropType(className, name);
     item.insertText = buildSnippet(name, snippetMode, propType);
     item.detail = propType
       ? `${className} property — ${propType}`
@@ -1436,6 +1483,30 @@ function buildSnippet(
         return new vscode.SnippetString(`${name} = ${valueTemplate},$0`);
       }
       return new vscode.SnippetString(`${name} = $1,$0`);
+  }
+}
+
+/**
+ * Snippet for an event key accepted as a plain prop (Vide):
+ * `Activated = function()\n\t$1\nend,`. Honours the same
+ * `luix.snippetMode` values as `buildSnippet`.
+ */
+function buildEventHandlerSnippet(
+  name: string,
+  mode: string
+): vscode.SnippetString {
+  switch (mode) {
+    case "name-only":
+      return new vscode.SnippetString(name);
+    case "value":
+      return new vscode.SnippetString(
+        `${name} = function()\n\t$1\nend$0`
+      );
+    case "value-with-comma":
+    default:
+      return new vscode.SnippetString(
+        `${name} = function()\n\t$1\nend,$0`
+      );
   }
 }
 

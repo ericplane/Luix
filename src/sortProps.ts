@@ -4,6 +4,7 @@ import {
   buildCodeMask,
   findAllCreateElementCalls,
 } from "./parser";
+import { classHierarchy, flattenClassEvents } from "./data";
 import { getAliasPartition } from "./frameworks";
 import { getConfig } from "./configCompat";
 
@@ -266,7 +267,7 @@ interface Category {
   position: number;
 }
 
-function categorize(key: string): Category {
+function categorize(key: string, eventNames: ReadonlySet<string>): Category {
   // Built-in explicit-prop categories
   for (const [name, props] of Object.entries(PROP_CATEGORIES)) {
     const idx = props.indexOf(key);
@@ -285,10 +286,42 @@ function categorize(key: string): Category {
     return { name: "Events", position: 0 };
   }
   // Vide-style: event names as plain identifiers (Activated, MouseEnter, …)
-  if (/^(Activated|MouseButton[12](Click|Down|Up)|MouseEnter|MouseLeave|MouseMoved|InputBegan|InputChanged|InputEnded|FocusLost|Focused|TouchTap|TouchPan|TouchPinch|SelectionGained|SelectionLost)$/.test(key)) {
+  if (eventNames.has(key)) {
     return { name: "Events", position: 0 };
   }
   return { name: "Other", position: 0 };
+}
+
+/** The call whose props table is being sorted — enough to pick the
+ *  right event list. Callers pass the parser's `CreateElementCall`. */
+export interface SortTarget {
+  className: string;
+  isStringLiteralName: boolean;
+}
+
+// Classes whose events are unambiguously UI signals. Their union is the
+// fallback event list for custom components (whose base class we don't
+// resolve here): it covers everything the old hand-written regex did
+// without pulling in generic names like `Changed`, `Ended` or `Loaded`
+// that a component could legitimately take as an ordinary prop.
+const UI_EVENT_CLASSES = ["GuiBase2d", "GuiObject", "GuiButton", "TextBox"];
+let _uiEventNames: Set<string> | undefined;
+
+/**
+ * Plain-identifier keys that count as events for `target`. A host class
+ * gets its exact event list (so `Ended` is an event on a `VideoFrame`
+ * and a plain prop elsewhere); anything else gets the UI-only fallback.
+ */
+export function eventNamesForTarget(target?: SortTarget): ReadonlySet<string> {
+  if (target && target.isStringLiteralName && classHierarchy[target.className]) {
+    return new Set(flattenClassEvents(target.className));
+  }
+  if (!_uiEventNames) {
+    _uiEventNames = new Set(
+      UI_EVENT_CLASSES.flatMap((cls) => classHierarchy[cls]?.events ?? [])
+    );
+  }
+  return _uiEventNames;
 }
 
 // ============================================================================
@@ -297,8 +330,14 @@ function categorize(key: string): Category {
 // skips computed keys, so we duplicate the small bit of parsing here.
 // ============================================================================
 interface SortableEntry {
+  /** The key text, or `""` for a positional entry. */
   key: string;
-  start: number; // offset of the key in the body
+  /** A keyless entry — Vide's inline children (`create "X" { … }`,
+   *  `Child(props)`) and action calls (`action(fn)`, `changed(…)`).
+   *  They travel with the sort so nothing is dropped, and land in the
+   *  Children slot in their original order. */
+  positional: boolean;
+  start: number; // offset of the key (or the expression) in the body
   end: number;   // offset just after the value
 }
 
@@ -306,6 +345,16 @@ function extractSortableEntries(body: string): SortableEntry[] {
   const masked = applyMask(body, buildCodeMask(body));
   const entries: SortableEntry[] = [];
   let i = 0;
+  const pushPositional = (start: number) => {
+    let end = skipValueExpression(masked, start);
+    if (end === start) {
+      // Nothing consumable here (a stray closer) — step over it.
+      end = start + 1;
+    } else if (body.slice(start, end).trim().length > 0) {
+      entries.push({ key: "", positional: true, start, end });
+    }
+    return end;
+  };
   while (i < masked.length) {
     // Skip whitespace + separators.
     while (i < masked.length && /[\s,;]/.test(masked[i])) {
@@ -334,8 +383,8 @@ function extractSortableEntries(body: string): SortableEntry[] {
       }
       key = body.slice(ks, i);
     } else {
-      // Positional value or junk — skip past it.
-      i = skipValueExpression(masked, i);
+      // Positional value (a string / table / call expression).
+      i = pushPositional(start);
       continue;
     }
     // Require '=' next.
@@ -343,7 +392,9 @@ function extractSortableEntries(body: string): SortableEntry[] {
       i++;
     }
     if (masked[i] !== "=") {
-      // No assignment — abandon this entry; skip whatever it was.
+      // No assignment — the identifier starts a positional expression
+      // (`create "Frame" { … }`, `action(fn)`, `Child`).
+      i = pushPositional(start);
       continue;
     }
     i++;
@@ -351,7 +402,7 @@ function extractSortableEntries(body: string): SortableEntry[] {
       i++;
     }
     i = skipValueExpression(masked, i);
-    entries.push({ key, start, end: i });
+    entries.push({ key, positional: false, start, end: i });
   }
   return entries;
 }
@@ -428,11 +479,13 @@ function bodyHasComments(body: string): boolean {
 // ============================================================================
 export function sortPropsBody(
   body: string,
-  categoryOrder: string[]
+  categoryOrder: string[],
+  target?: SortTarget
 ): string | undefined {
   if (bodyHasComments(body)) {
     return undefined;
   }
+  const eventNames = eventNamesForTarget(target);
   const entries = extractSortableEntries(body);
   if (entries.length < 2) {
     return undefined;
@@ -462,7 +515,11 @@ export function sortPropsBody(
   const fallbackOrder = catIndex.get("Other") ?? 999;
 
   const decorated = entries.map((e, originalIdx) => {
-    const cat = categorize(e.key);
+    // Positional entries (inline children, action calls) sort as
+    // Children, keeping their relative order.
+    const cat = e.positional
+      ? { name: "Children", position: 0 }
+      : categorize(e.key, eventNames);
     const order = catIndex.get(cat.name) ?? fallbackOrder;
     return { ...e, originalIdx, catName: cat.name, catPos: cat.position, order };
   });
@@ -495,15 +552,18 @@ export function sortPropsBody(
  * the offsets of children we haven't visited yet — same trick the rest
  * of the codebase uses for in-place body edits.
  */
+interface SortableCall extends SortTarget {
+  propsBraceStart: number;
+  propsBraceEnd: number;
+}
+
 function sortBodyRecursive(
   text: string,
   bodyStart: number,
   bodyEnd: number,
-  allCalls: Array<{
-    propsBraceStart: number;
-    propsBraceEnd: number;
-  }>,
-  categoryOrder: string[]
+  allCalls: SortableCall[],
+  categoryOrder: string[],
+  target: SortTarget
 ): string | undefined {
   let body = text.slice(bodyStart, bodyEnd);
   let changed = false;
@@ -533,7 +593,8 @@ function sortBodyRecursive(
       child.propsBraceStart + 1,
       child.propsBraceEnd,
       allCalls,
-      categoryOrder
+      categoryOrder,
+      child
     );
     if (innerSorted !== undefined) {
       const localStart = child.propsBraceStart + 1 - bodyStart;
@@ -543,7 +604,7 @@ function sortBodyRecursive(
     }
   }
 
-  const sortedSelf = sortPropsBody(body, categoryOrder);
+  const sortedSelf = sortPropsBody(body, categoryOrder, target);
   if (sortedSelf !== undefined) {
     body = sortedSelf;
     changed = true;
@@ -571,10 +632,12 @@ export class SortPropsCodeActionProvider
       return undefined;
     }
     const text = document.getText();
-    // Fast reject: nothing to sort in a file without any element factory
-    // call. Skips the full createElement-scan + cursor-walk for huge
-    // non-UI files when the user is just navigating around.
-    if (text.indexOf("(") === -1 || text.indexOf("{") === -1) {
+    // Fast reject: nothing to sort in a file without a table. Skips the
+    // full createElement-scan + cursor-walk for huge non-UI files when
+    // the user is just navigating around. (Only `{` is required — a
+    // Fusion/Vide file written entirely in call sugar, `New "Frame" { … }`,
+    // may not contain a single `(`.)
+    if (text.indexOf("{") === -1) {
       return undefined;
     }
     const cursor = document.offsetAt(range.start);
@@ -612,7 +675,7 @@ export class SortPropsCodeActionProvider
       "sortProps.categoryOrder",
       DEFAULT_CATEGORY_ORDER
     );
-    const sorted = sortPropsBody(body, order);
+    const sorted = sortPropsBody(body, order, match);
     if (!sorted) {
       return undefined;
     }
@@ -705,7 +768,7 @@ export class SortPropsOnSaveListener implements vscode.Disposable {
     for (const top of topLevel) {
       const start = top.propsBraceStart + 1;
       const end = top.propsBraceEnd;
-      const sorted = sortBodyRecursive(text, start, end, calls, order);
+      const sorted = sortBodyRecursive(text, start, end, calls, order, top);
       if (sorted === undefined) continue;
       edits.push(
         vscode.TextEdit.replace(
@@ -724,3 +787,7 @@ export class SortPropsOnSaveListener implements vscode.Disposable {
     this.disposable.dispose();
   }
 }
+
+export const _internal = {
+  sortBodyRecursive,
+};

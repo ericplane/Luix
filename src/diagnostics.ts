@@ -564,6 +564,13 @@ function computePropValidationDiagnostics(
           known.add(event);
         }
       }
+      // Fusion / Vide mount by setting `Parent` in the same table
+      // (`New "ScreenGui" { Parent = playerGui }`). `Parent` is
+      // deliberately absent from `classHierarchy` (React/Roact users
+      // shouldn't be offered it), so accept it here per framework.
+      if (framework?.parentAsProp) {
+        known.add("Parent");
+      }
       for (const entry of entries) {
         if (known.has(entry.key)) {
           // Check enum type, if we know one. Use class-aware lookup so
@@ -605,9 +612,18 @@ function computePropValidationDiagnostics(
         const suggestion = closestMatch(entry.key, known);
         const start = document.positionAt(bodyStart + entry.keyStart);
         const end = document.positionAt(bodyStart + entry.keyEnd);
-        const msg = suggestion
+        let msg = suggestion
           ? `Unknown property \`${entry.key}\` on \`${call.className}\`. Did you mean \`${suggestion}\`?`
           : `Unknown property \`${entry.key}\` on \`${call.className}\`.`;
+        // `Parent` is a real property; it's flagged here only because
+        // React/Roact don't take it as a prop. Say so rather than
+        // leaving the user to wonder why a property they can see in
+        // the Roblox docs is "unknown".
+        if (entry.key === "Parent" && framework && !framework.parentAsProp) {
+          msg = `Unknown property \`Parent\` on \`${call.className}\`. ${
+            framework.id === "roact" ? "Roact" : "React"
+          } mounts through a root or portal instead of a \`Parent\` key.`;
+        }
         const d = new vscode.Diagnostic(
           new vscode.Range(start, end),
           msg,

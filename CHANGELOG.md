@@ -4,7 +4,7 @@ All notable changes to **Luix** will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [1.5.3]
 
 ### Vide events are no longer flagged as unknown props ([#4](https://github.com/ericplane/Luix/issues/4))
 
@@ -16,7 +16,86 @@ every Vide event handler on a host class was warned about as
 `Unknown property`. The diagnostic now unions `flattenClassEvents` into
 its known set when the call's alias belongs to an `eventsAsProps`
 framework. React, Roact and Fusion spell events as computed keys and
-are unaffected.
+are unaffected. Thanks to @WaleedAmer for the report and the fix.
+
+A misspelt event now gets the same did-you-mean nudge as a misspelt
+prop — `Activatd` → *Did you mean `Activated`?* — and the same fix
+carries through to everything that reads the same known-key set.
+
+### Event data covers `Instance`, `VideoFrame` and `UIPageLayout`
+
+The class hierarchy only declared events on `GuiBase2d`, `GuiObject`,
+`GuiButton` and `TextBox`, so the generic signals every instance has —
+`Destroying`, `AncestryChanged`, `Changed`, `ChildAdded`, `ChildRemoved`,
+`DescendantAdded`, `DescendantRemoving`, `AttributeChanged`,
+`StyledPropertiesChanged` — plus `VideoFrame`'s playback events
+(`Played`, `Paused`, `Ended`, `Loaded`, `DidLoop`), `UIPageLayout`'s
+`PageEnter` / `PageLeave` / `Stopped` and `GuiButton.SecondaryActivated`
+(right-click / long-press / gamepad activation) were still "unknown"
+under Vide and missing from every framework's event completion
+(`[React.Event.|`, `[OnEvent "|`, …).
+
+Because the same data feeds every feature, all of them pick this up at
+once. Event lists are now ordered most-specific first (`Activated`,
+`MouseButton1Click`, … before `MouseEnter`, … before `Destroying`), so
+the generic `Instance` signals sit at the bottom of the suggestion list
+rather than crowding out the handlers you actually reach for.
+
+### `Parent = …` is a known key for Fusion and Vide
+
+Both mount by setting `Parent` in the props table — `New "ScreenGui"
+{ Parent = playerGui }` — and Luix flagged it as an unknown property on
+every root element. `Parent` is now accepted, completed (typed
+`Instance`) and documented on hover for Fusion and Vide host classes.
+React and Roact mount through a root instead, so a bare `Parent` there
+is still flagged — and the warning now says so (*"React mounts through a
+root or portal instead of a `Parent` key"*) rather than calling a real
+property unknown. The opt-in Roblox API-dump merge skips `Parent` so it
+can't quietly re-enter the prop list for React/Roact.
+
+### Event keys get hover docs; Vide events get proper completion items
+
+Hovering an event key showed nothing anywhere — a Vide plain key
+(`Activated = …` in `create "TextButton" { … }` or the direct
+`TextButton({ … })` form), or the name inside a computed key
+(`[React.Event.Activated]`, `[Roact.Event.X]`, `[OnEvent "X"]`). All of
+them now show the event, the class that introduces it, and a docs link,
+matching prop hovers; an event key on a custom component with a known
+base (`---@extends TextButton`) is reported as forwarded from that base.
+The event and `Parent` hovers only fire on table keys, not on the same
+identifier inside a value (`Size = other.Changed`).
+
+In completion the merged Vide events carry the *Event* kind and insert a
+handler body (`Activated = function()\n\t\nend,`) instead of the generic
+`= …` value template.
+
+### Sort props no longer drops Vide inline children
+
+Sorting a table that contained keyless entries — Vide's inline children
+(`create "TextLabel" { … }`, `Child(props)`) or action calls
+(`action(fn)`, `changed("Size", fn)`) — silently **deleted** them: the
+sorter only re-emitted `key = value` entries. Both the *Sort props*
+code action and the `luix.sortProps.onSave` formatter were affected.
+Positional entries now travel with the sort, landing in the
+**Children** slot in their original order, so a `Frame` with children
+sorts to props-then-children with nothing lost.
+
+The code action also no longer requires a `(` somewhere in the file —
+a Fusion/Vide file written entirely in call sugar (`New "Frame" { … }`)
+never offered the action.
+
+### Sort props recognises every event as an event
+
+The *Sort props* action put Vide-style event keys into the **Events**
+group using a hand-written list that missed `MouseWheelForward`,
+`MouseWheelBackward`, `TouchSwipe`, `TouchLongPress`, `TouchRotate`,
+`SelectionChanged`, `ReturnPressedFromOnScreenKeyboard` and the events
+added above; those fell through to **Other**. The group is now driven by
+the class hierarchy's event data, scoped to the element being sorted: a
+`VideoFrame` treats `Ended` as an event, while a custom component keeps
+`Ended` / `Loaded` / `Changed` as ordinary props and only files the
+unambiguous GUI signals under **Events**.
+
 ## [1.5.2]
 
 ### Fusion 0.3 and StyLua-formatted calls are recognised ([#3](https://github.com/ericplane/Luix/issues/3))

@@ -1,8 +1,11 @@
 import * as vscode from "vscode";
 import {
   getPropType,
+  classHierarchy,
   defaultPropsMap,
   findIntroducingClass,
+  findIntroducingEventClass,
+  flattenClassEvents,
   flattenClassProps,
 } from "./data";
 import {
@@ -16,7 +19,12 @@ import {
   findEnclosingPropsCall,
   scanDocument,
 } from "./parser";
-import { getAliasPartition } from "./frameworks";
+import {
+  FRAMEWORKS,
+  findFrameworkForAlias,
+  getAliasPartition,
+  getEnabledFrameworks,
+} from "./frameworks";
 import { configChangeAffects, getConfig } from "./configCompat";
 import { WorkspaceIndex } from "./workspaceIndex";
 import { fetchAssetThumbnail } from "./assetThumbnails";
@@ -187,11 +195,42 @@ export class PropHoverProvider implements vscode.HoverProvider {
 
     if (defaultPropsMap[detected.className]) {
       const props = flattenClassProps(detected.className);
-      if (!props.includes(word)) {
-        return undefined;
+      if (props.includes(word)) {
+        const md = buildPropHoverMarkdown(detected.className, word);
+        return new vscode.Hover(md, wordRange);
       }
-      const md = buildPropHoverMarkdown(detected.className, word);
-      return new vscode.Hover(md, wordRange);
+      // Vide takes events (`Activated = …`) and Fusion/Vide take
+      // `Parent = …` as plain keys in the same table; attribute a direct
+      // instance call (`TextButton({ … })`) to Vide the way completion
+      // does so those keys get a hover too.
+      let framework = detected.alias
+        ? findFrameworkForAlias(detected.alias)
+        : undefined;
+      if (
+        !framework &&
+        detected.isDirectComponentCall &&
+        classHierarchy[detected.className]
+      ) {
+        framework = FRAMEWORKS.vide;
+      }
+      const isEvent = flattenClassEvents(detected.className).includes(word);
+      if (
+        isEvent &&
+        ((framework?.eventsAsProps && isTableKey(document, wordRange)) ||
+          isComputedEventKey(document, wordRange))
+      ) {
+        const md = buildEventHoverMarkdown(detected.className, word);
+        return new vscode.Hover(md, wordRange);
+      }
+      if (
+        framework?.parentAsProp &&
+        word === "Parent" &&
+        isTableKey(document, wordRange)
+      ) {
+        const md = buildParentHoverMarkdown(detected.className);
+        return new vscode.Hover(md, wordRange);
+      }
+      return undefined;
     }
 
     // Custom component — show inferred prop info.
@@ -199,7 +238,16 @@ export class PropHoverProvider implements vscode.HoverProvider {
     if (!component) {
       return undefined;
     }
-    const md = buildCustomPropHover(component, detected.className, word);
+    const md =
+      buildCustomPropHover(component, detected.className, word) ??
+      buildCustomEventHover(
+        component,
+        detected.className,
+        word,
+        document,
+        wordRange,
+        detected.alias
+      );
     if (!md) {
       return undefined;
     }
@@ -411,6 +459,134 @@ function buildPropHoverMarkdown(
   if (introduced && introduced !== className) {
     lines.push(`Inherited from \`${introduced}\`.`);
   }
+  lines.push("");
+  lines.push(`[Roblox docs ↗](${docsUrl})`);
+
+  const md = new vscode.MarkdownString(lines.join("\n"));
+  md.isTrusted = false;
+  return md;
+}
+
+/**
+ * Is `wordRange` a table key — i.e. the next non-blank character on the
+ * line is a single `=`? Keeps the event / `Parent` hovers off identifiers
+ * that merely appear in a value (`Size = other.Changed`).
+ */
+function isTableKey(
+  document: vscode.TextDocument,
+  wordRange: vscode.Range
+): boolean {
+  // Look past line breaks too so `Activated\n  = function() … end` (a
+  // key whose `=` wrapped onto the next line) still counts.
+  const from = document.offsetAt(wordRange.end);
+  const rest = document.getText().slice(from, from + 64);
+  return /^\s*=(?!=)/.test(rest);
+}
+
+/**
+ * Is `wordRange` the event name inside a computed event key —
+ * `[React.Event.Activated]`, `[Roact.Event.Activated]` or
+ * `[OnEvent "Activated"]`?
+ */
+function isComputedEventKey(
+  document: vscode.TextDocument,
+  wordRange: vscode.Range
+): boolean {
+  const before = document
+    .lineAt(wordRange.start.line)
+    .text.slice(0, wordRange.start.character);
+  return /(?:React|Roact)\s*\.\s*Event\s*\.\s*$/.test(before) ||
+    /\bOnEvent\s*\(?\s*["']$/.test(before);
+}
+
+// `Changed` is declared on `Object`, the engine root above `Instance`;
+// the data model files it under `Instance` (see data.ts) but the docs
+// page that actually has the anchor is `Object`.
+const EVENT_DOCS_CLASS_OVERRIDE: Record<string, string> = {
+  Changed: "Object",
+};
+
+function buildEventHoverMarkdown(
+  className: string,
+  eventName: string
+): vscode.MarkdownString {
+  const introduced = findIntroducingEventClass(className, eventName);
+  const docsAnchor =
+    EVENT_DOCS_CLASS_OVERRIDE[eventName] ?? introduced ?? className;
+  const docsUrl = `https://create.roblox.com/docs/reference/engine/classes/${docsAnchor}#${eventName}`;
+
+  const lines: string[] = [];
+  lines.push(`**${className}.${eventName}**`);
+  lines.push("");
+  lines.push("Event — the handler is connected when the instance is created.");
+  if (introduced && introduced !== className) {
+    lines.push(`Inherited from \`${introduced}\`.`);
+  }
+  lines.push("");
+  lines.push(`[Roblox docs ↗](${docsUrl})`);
+
+  const md = new vscode.MarkdownString(lines.join("\n"));
+  md.isTrusted = false;
+  return md;
+}
+
+/**
+ * Event hover for a custom component whose base class is known
+ * (`---@extends TextButton` or a detected root element): a Vide
+ * `create(Button, { Activated = … })` key, or a computed event key under
+ * any framework. Mirrors the host-class branch so completion (which
+ * already labels these as events) and hover agree.
+ */
+function buildCustomEventHover(
+  component: DocumentComponentInfo,
+  invokedAs: string,
+  word: string,
+  document: vscode.TextDocument,
+  wordRange: vscode.Range,
+  alias: string | undefined
+): vscode.MarkdownString | undefined {
+  const base = component.annotations.extendsClass ?? component.detectedBase;
+  if (!base || !flattenClassEvents(base).includes(word)) {
+    return undefined;
+  }
+  // A direct component call (`Button { … }`) carries no factory alias,
+  // so it can't be attributed to a framework; treat a plain event key
+  // there as Vide's only when an events-as-props framework is enabled.
+  const framework = alias ? findFrameworkForAlias(alias) : undefined;
+  const eventsAsProps = framework
+    ? framework.eventsAsProps
+    : getEnabledFrameworks().some((f) => f.eventsAsProps);
+  const plainKey = eventsAsProps && isTableKey(document, wordRange);
+  if (!plainKey && !isComputedEventKey(document, wordRange)) {
+    return undefined;
+  }
+  const introduced = findIntroducingEventClass(base, word);
+  const docsAnchor = EVENT_DOCS_CLASS_OVERRIDE[word] ?? introduced ?? base;
+  const docsUrl = `https://create.roblox.com/docs/reference/engine/classes/${docsAnchor}#${word}`;
+
+  const lines: string[] = [];
+  lines.push(`**${invokedAs}.${word}**`);
+  lines.push("");
+  lines.push(`Event forwarded from \`${base}.${word}\`.`);
+  lines.push("");
+  lines.push(`[Roblox docs ↗](${docsUrl})`);
+
+  const md = new vscode.MarkdownString(lines.join("\n"));
+  md.isTrusted = false;
+  return md;
+}
+
+function buildParentHoverMarkdown(className: string): vscode.MarkdownString {
+  const docsUrl =
+    "https://create.roblox.com/docs/reference/engine/classes/Instance#Parent";
+  const lines: string[] = [];
+  lines.push(`**${className}.Parent**`);
+  lines.push("");
+  lines.push("Type: `Instance`");
+  lines.push("");
+  lines.push(
+    "Mounts the created instance under the given parent. Fusion and Vide apply it after the other properties so the instance appears fully configured."
+  );
   lines.push("");
   lines.push(`[Roblox docs ↗](${docsUrl})`);
 
