@@ -5,7 +5,6 @@ import {
   readActiveFrameworkSetting,
   resetDocumentDetectionCache,
 } from "./activeFramework";
-import { configChangeAffects } from "./configCompat";
 import { FrameworkId, getEnabledFrameworks } from "./frameworks";
 
 // ============================================================================
@@ -68,7 +67,7 @@ export class ActiveFrameworkStatusBar implements vscode.Disposable {
         }
       }),
       vscode.workspace.onDidChangeConfiguration((e) => {
-        if (configChangeAffects(e, "activeFramework")) {
+        if (e.affectsConfiguration("luix")) {
           // Override changed — bust the per-document cache so every
           // subsequent detection picks up the new override, then
           // refresh the label.
@@ -83,7 +82,7 @@ export class ActiveFrameworkStatusBar implements vscode.Disposable {
 
   /** Public re-render — useful after a setWorkspaceFallback() call. */
   refresh(): void {
-    if (this.disposed) return;
+    if (this.disposed) {return;}
     const editor = vscode.window.activeTextEditor;
     if (!editor || !isLuaDoc(editor.document)) {
       this.item.hide();
@@ -142,7 +141,7 @@ export class ActiveFrameworkStatusBar implements vscode.Disposable {
   }
 
   private scheduleRefresh(): void {
-    if (this.refreshTimer) clearTimeout(this.refreshTimer);
+    if (this.refreshTimer) {clearTimeout(this.refreshTimer);}
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = undefined;
       this.refresh();
@@ -155,7 +154,7 @@ export class ActiveFrameworkStatusBar implements vscode.Disposable {
       clearTimeout(this.refreshTimer);
       this.refreshTimer = undefined;
     }
-    for (const d of this.disposables) d.dispose();
+    for (const d of this.disposables) {d.dispose();}
     this.disposables = [];
   }
 
@@ -192,7 +191,7 @@ export async function pickActiveFrameworkCommand(): Promise<void> {
     base: string
   ): string {
     const parts: string[] = [base];
-    if (id === current) parts.push("• current");
+    if (id === current) {parts.push("• current");}
     if (id !== "auto" && !enabledIds.has(id as FrameworkId)) {
       parts.push("• not in luix.frameworks");
     }
@@ -241,7 +240,7 @@ export async function pickActiveFrameworkCommand(): Promise<void> {
     placeHolder:
       "Auto detects per file; the four named options force one framework everywhere.",
   });
-  if (!choice) return;
+  if (!choice) {return;}
 
   const config = vscode.workspace.getConfiguration("luix");
   const hasWorkspace = !!vscode.workspace.workspaceFolders?.length;

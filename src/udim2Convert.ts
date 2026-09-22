@@ -70,16 +70,16 @@ function parseUDim2Args(
   form: "fromScale" | "fromOffset" | "new"
 ): UDim2Value | undefined {
   const parts = argsText.split(",").map((s) => Number(s.trim()));
-  if (parts.some((n) => !Number.isFinite(n))) return undefined;
+  if (parts.some((n) => !Number.isFinite(n))) {return undefined;}
   switch (form) {
     case "fromScale":
-      if (parts.length !== 2) return undefined;
+      if (parts.length !== 2) {return undefined;}
       return { sx: parts[0], ox: 0, sy: parts[1], oy: 0 };
     case "fromOffset":
-      if (parts.length !== 2) return undefined;
+      if (parts.length !== 2) {return undefined;}
       return { sx: 0, ox: parts[0], sy: 0, oy: parts[1] };
     case "new":
-      if (parts.length !== 4) return undefined;
+      if (parts.length !== 4) {return undefined;}
       return { sx: parts[0], ox: parts[1], sy: parts[2], oy: parts[3] };
   }
 }
@@ -99,7 +99,7 @@ function findUDim2LiteralAt(
     if (m.index <= offset && offset <= m.index + m[0].length) {
       const form = m[1] as "fromScale" | "fromOffset" | "new";
       const value = parseUDim2Args(m[2], form);
-      if (!value) return undefined;
+      if (!value) {return undefined;}
       return { value, form, start: m.index, end: m.index + m[0].length };
     }
   }
@@ -134,7 +134,7 @@ function findParentCall(
   let best: CreateElementCall | undefined;
   let bestSize = Infinity;
   for (const c of calls) {
-    if (c === child) continue;
+    if (c === child) {continue;}
     if (c.aliasStart < child.aliasStart && child.fullEnd < c.fullEnd) {
       const size = c.fullEnd - c.aliasStart;
       if (size < bestSize) {
@@ -165,7 +165,7 @@ function getSizeOf(
     call.propsBraceEnd
   );
   const entry = entries.find((e) => e.key === "Size");
-  if (!entry) return undefined;
+  if (!entry) {return undefined;}
   const valueText = text
     .slice(
       call.propsBraceStart + 1 + entry.valueStart,
@@ -211,20 +211,20 @@ function parseMappedFromOffset(valueText: string): UDim2Value | undefined {
     /:\s*map\s*\(\s*function\s*\([^)]*\)\s*return\s+UDim2\.fromOffset\s*\(([^,]+),\s*([^)]+)\)\s*end\s*\)/.exec(
       valueText
     );
-  if (!m) return undefined;
+  if (!m) {return undefined;}
   const x = extractAxisCoefficient(m[1]);
   const y = extractAxisCoefficient(m[2]);
-  if (x === undefined || y === undefined) return undefined;
+  if (x === undefined || y === undefined) {return undefined;}
   return { sx: 0, ox: x, sy: 0, oy: y };
 }
 
 function extractAxisCoefficient(expr: string): number | undefined {
   const t = expr.trim();
-  if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
+  if (/^-?\d+(\.\d+)?$/.test(t)) {return Number(t);}
   const numFirst = /^(-?\d+(?:\.\d+)?)\s*\*\s*[A-Za-z_]\w*$/.exec(t);
-  if (numFirst) return Number(numFirst[1]);
+  if (numFirst) {return Number(numFirst[1]);}
   const numLast = /^[A-Za-z_]\w*\s*\*\s*(-?\d+(?:\.\d+)?)$/.exec(t);
-  if (numLast) return Number(numLast[1]);
+  if (numLast) {return Number(numLast[1]);}
   return undefined;
 }
 
@@ -244,7 +244,7 @@ function computePixelSize(
   // 64 is far above that and guards against pathological inputs.
   for (let depth = 0; depth < 64 && current; depth++) {
     const size = getSizeOf(current, text);
-    if (!size) return undefined;
+    if (!size) {return undefined;}
     // Pure offset → we have a concrete pixel size to anchor on.
     if (size.sx === 0 && size.sy === 0) {
       return { x: cumSx * size.ox, y: cumSy * size.oy };
@@ -289,7 +289,7 @@ export class UDim2ResolveCodeActionProvider
     const cursorOffset = document.offsetAt(range.start);
 
     const literal = findUDim2LiteralAt(text, cursorOffset);
-    if (!literal) return [];
+    if (!literal) {return [];}
     // Only fire on the two pure forms — `UDim2.new(…)` already has
     // both axes encoded so there's nothing to convert.
     if (literal.form !== "fromScale" && literal.form !== "fromOffset") {
@@ -299,16 +299,16 @@ export class UDim2ResolveCodeActionProvider
     const aliases = getAliasPartition();
     const calls = findAllCreateElementCalls(text, aliases);
     const enclosing = findEnclosingCall(calls, cursorOffset);
-    if (!enclosing) return [];
+    if (!enclosing) {return [];}
 
     // Verify the literal is the value of *this* call's `Size` prop —
     // not a UDim2 used elsewhere (Position, CanvasSize, etc.). The
     // conversion is only meaningful relative to the parent's Size, so
     // applying it to e.g. Position would produce a wrong number.
-    if (!isLiteralTheSizeOf(literal, enclosing, text)) return [];
+    if (!isLiteralTheSizeOf(literal, enclosing, text)) {return [];}
 
     const parent = findParentCall(calls, enclosing);
-    if (!parent) return [];
+    if (!parent) {return [];}
 
     // Strict — if the parent chain doesn't resolve to a concrete
     // pixel size, hide the action entirely rather than emit an
@@ -316,8 +316,8 @@ export class UDim2ResolveCodeActionProvider
     // "wrong value" (a wrong conversion silently breaks UI more
     // visibly than a missing lightbulb).
     const parentPixels = computePixelSize(parent, calls, text);
-    if (!parentPixels) return [];
-    if (parentPixels.x <= 0 || parentPixels.y <= 0) return [];
+    if (!parentPixels) {return [];}
+    if (parentPixels.x <= 0 || parentPixels.y <= 0) {return [];}
 
     const literalRange = new vscode.Range(
       document.positionAt(literal.start),
@@ -371,7 +371,7 @@ function isLiteralTheSizeOf(
     call.propsBraceEnd
   );
   const sizeEntry = entries.find((e) => e.key === "Size");
-  if (!sizeEntry) return false;
+  if (!sizeEntry) {return false;}
   const valStart = call.propsBraceStart + 1 + sizeEntry.valueStart;
   const valEnd = call.propsBraceStart + 1 + sizeEntry.valueEnd;
   return literal.start >= valStart && literal.end <= valEnd;
@@ -460,8 +460,8 @@ function pixelSizeOfChild(
   text: string
 ): ChildPixelSize | undefined {
   const size = getSizeOf(child, text);
-  if (!size) return undefined;
-  if (size.sx !== 0 || size.sy !== 0) return undefined;
+  if (!size) {return undefined;}
+  if (size.sx !== 0 || size.sy !== 0) {return undefined;}
   return { width: size.ox, height: size.oy };
 }
 
@@ -485,7 +485,7 @@ function readUDimOffsetEntry(
     call.propsBraceEnd
   );
   const entry = entries.find((e) => e.key === key);
-  if (!entry) return 0;
+  if (!entry) {return 0;}
   const value = text
     .slice(
       call.propsBraceStart + 1 + entry.valueStart,
@@ -532,8 +532,8 @@ function readUIListLayout(
         call.propsBraceStart + 1 + dirEntry.valueEnd
       )
       .trim();
-    if (/Horizontal/.test(v)) direction = "Horizontal";
-    else if (/Vertical/.test(v)) direction = "Vertical";
+    if (/Horizontal/.test(v)) {direction = "Horizontal";}
+    else if (/Vertical/.test(v)) {direction = "Vertical";}
   }
   const padding = readUDimOffsetEntry(call, text, "Padding");
   return { direction, padding };
@@ -548,7 +548,7 @@ function computeSizeFromChildren(
   text: string
 ): ChildPixelSize | undefined {
   const children = directChildCalls(parent, calls);
-  if (children.length === 0) return undefined;
+  if (children.length === 0) {return undefined;}
 
   let padding: UIPaddingValues = { top: 0, bottom: 0, left: 0, right: 0 };
   let layout: UIListLayoutValues | undefined;
@@ -582,11 +582,11 @@ function computeSizeFromChildren(
     }
     // Anything else needs a literal pixel Size.
     const px = pixelSizeOfChild(child, text);
-    if (!px) return undefined;
+    if (!px) {return undefined;}
     contentful.push(px);
   }
 
-  if (contentful.length === 0) return undefined;
+  if (contentful.length === 0) {return undefined;}
 
   let width: number;
   let height: number;
@@ -609,7 +609,7 @@ function computeSizeFromChildren(
 
   width += padding.left + padding.right;
   height += padding.top + padding.bottom;
-  if (width <= 0 || height <= 0) return undefined;
+  if (width <= 0 || height <= 0) {return undefined;}
   return { width, height };
 }
 
@@ -631,7 +631,7 @@ export class UDim2FromChildrenCodeActionProvider
     // prop. Mirrors the other action's gating exactly — the lightbulb
     // shows next to the literal you're trying to replace.
     const literal = findUDim2LiteralAt(text, cursorOffset);
-    if (!literal) return [];
+    if (!literal) {return [];}
     if (literal.form !== "fromScale" && literal.form !== "fromOffset") {
       return [];
     }
@@ -639,11 +639,11 @@ export class UDim2FromChildrenCodeActionProvider
     const aliases = getAliasPartition();
     const calls = findAllCreateElementCalls(text, aliases);
     const enclosing = findEnclosingCall(calls, cursorOffset);
-    if (!enclosing) return [];
-    if (!isLiteralTheSizeOf(literal, enclosing, text)) return [];
+    if (!enclosing) {return [];}
+    if (!isLiteralTheSizeOf(literal, enclosing, text)) {return [];}
 
     const implied = computeSizeFromChildren(enclosing, calls, text);
-    if (!implied) return [];
+    if (!implied) {return [];}
 
     const literalRange = new vscode.Range(
       document.positionAt(literal.start),

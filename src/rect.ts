@@ -1,3 +1,4 @@
+import { rewriteLiteralProps } from "./propEdits";
 import * as vscode from "vscode";
 import {
   applyMask,
@@ -341,7 +342,7 @@ export class RectEditorManager implements vscode.Disposable {
     // and the editor sat on "Loading…" forever. The fetch now happens
     // inside the handler instead.
     panel.webview.onDidReceiveMessage(async (msg) => {
-      if (disposed) return;
+      if (disposed) {return;}
       if (msg?.type === "ready") {
         // Resolve dims in this order:
         //   1. Cached dims (from a prior Open Cloud lookup OR a user's
@@ -361,7 +362,7 @@ export class RectEditorManager implements vscode.Disposable {
           // fine. Only call when no cache at all.
           cachedDims ? Promise.resolve(undefined) : fetchAssetNativeDimensions(this.context, hit.assetId),
         ]);
-        if (disposed) return;
+        if (disposed) {return;}
         if (!cachedDims && freshDims) {
           cachedDims = freshDims;
         }
@@ -475,72 +476,20 @@ async function applyRectEdit(
   const offsetLiteral = `Vector2.new(${Math.round(newOffset.x)}, ${Math.round(newOffset.y)})`;
   const sizeLiteral = `Vector2.new(${Math.round(newSize.x)}, ${Math.round(newSize.y)})`;
 
+  let replacement: string;
+  try {
+    replacement = rewriteLiteralProps(propsBody, entries, [
+      { key: "ImageRectOffset", value: offsetLiteral, remove: isWholeImage },
+      { key: "ImageRectSize", value: sizeLiteral, remove: isWholeImage },
+    ], propIndent);
+  } catch (err) {
+    void vscode.window.showWarningMessage(`Luix: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
   const edit = new vscode.WorkspaceEdit();
-
-  const setProp = (
-    key: string,
-    value: string,
-    isDefault: boolean
-  ): void => {
-    const existing = entries.find((e) => e.key === key);
-    if (isDefault) {
-      if (existing) {
-        let s = existing.keyStart;
-        while (
-          s > 0 &&
-          (propsBody[s - 1] === " " || propsBody[s - 1] === "\t")
-        ) {
-          s--;
-        }
-        if (s > 0 && propsBody[s - 1] === "\n") {
-          s--;
-        }
-        if (s > 0 && propsBody[s - 1] === "\r") {
-          s--;
-        }
-        let e = existing.valueEnd;
-        while (
-          e < propsBody.length &&
-          (propsBody[e] === " " || propsBody[e] === "\t")
-        ) {
-          e++;
-        }
-        if (propsBody[e] === ",") {
-          e++;
-        }
-        edit.delete(
-          uri,
-          new vscode.Range(
-            document.positionAt(bodyStart + s),
-            document.positionAt(bodyStart + e)
-          )
-        );
-      }
-      return;
-    }
-    if (existing) {
-      edit.replace(
-        uri,
-        new vscode.Range(
-          document.positionAt(bodyStart + existing.valueStart),
-          document.positionAt(bodyStart + existing.valueEnd)
-        ),
-        value
-      );
-    } else {
-      const before = text.slice(0, call.propsBraceEnd);
-      const lastNonWs = before.replace(/\s+$/, "");
-      const needsComma = !lastNonWs.endsWith(",") && !lastNonWs.endsWith("{");
-      edit.insert(
-        uri,
-        document.positionAt(call.propsBraceEnd),
-        (needsComma ? "," : "") + `\n${propIndent}${key} = ${value},`
-      );
-    }
-  };
-
-  setProp("ImageRectOffset", offsetLiteral, isWholeImage);
-  setProp("ImageRectSize", sizeLiteral, isWholeImage);
+  edit.replace(uri, new vscode.Range(
+    document.positionAt(bodyStart), document.positionAt(call.propsBraceEnd)
+  ), replacement);
 
   await vscode.workspace.applyEdit(edit);
 }

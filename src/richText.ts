@@ -594,9 +594,9 @@ function parseColorValue(value: string): ParsedColor | undefined {
 }
 
 function clamp255(n: number): number {
-  if (Number.isNaN(n)) return 0;
-  if (n < 0) return 0;
-  if (n > 255) return 255;
+  if (Number.isNaN(n)) {return 0;}
+  if (n < 0) {return 0;}
+  if (n > 255) {return 255;}
   return n;
 }
 

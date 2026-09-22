@@ -4,6 +4,49 @@ All notable changes to **Luix** will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.5.4]
+
+### Fixed
+
+- Incomplete props tables containing a stray closing parenthesis or bracket no
+  longer freeze the extension host while typing. This could leave language-server
+  errors and element labels stuck after the source was corrected, including when
+  changing Vide's `create()` to `create "TextLabel" { ... }`.
+- Closing element labels stay within the editor's requested range, so a child
+  range does not return its parent's label from a later line.
+- Property sorting preserves commas and semicolons inside callback bodies.
+- Wrapping elements preserves Fusion scopes, constructor syntax and multiline
+  literals, and puts generated Fusion list layouts inside the children table.
+- Component rename follows local bindings, module return values and resolvable
+  relative imports, without renaming unrelated components that share a name.
+- Extract to component passes captured inputs and Fusion scopes explicitly,
+  preserving multiline string contents and Windows line endings.
+  File creation and source replacement use one workspace edit; unsupported
+  captures are rejected before any files are changed.
+- Sprite and gradient editors apply property updates together, preserving valid
+  separators when the original table has no trailing comma.
+- Class-name completion no longer inserts a trailing table comma into a function
+  argument list or duplicates existing multiline call arguments. Component
+  completion preserves function references and avoids rewriting declarations.
+- Persisted component indexes discard deleted/excluded files, invalidate when
+  parser settings change, and never reuse discarded unsaved content as disk data.
+  Restored indexes notify their consumers when ready.
+- Framework detection ignores imports in comments and example strings, handles
+  nested/multiline requires, refreshes document decisions when the workspace
+  fallback changes, and respects an empty enabled-framework list.
+- Fusion component scaffolds use caller-owned scopes for 0.3; projects declaring
+  Fusion 0.2 or using legacy construction retain the older scaffold. Snippets
+  adapt to a visible scope and use the 0.3 Computed/For callback parameters.
+- Vide direct constructors receive property diagnostics, document symbols and
+  inlay hints consistently, while custom component bindings take precedence.
+- Removed the incorrect warning against TextScaled with scale-based sizes.
+  Contrast checks account for literal transparency and skip unknown backgrounds.
+- Wally/Rojo actions pass filenames as process arguments and run in the selected
+  workspace root, independent of a terminal's current directory.
+- Finishing thumbnail downloads cannot restore disabled decorations or recreate
+  a purged cache. Workspace diagnostic totals exclude files outside the workspace.
+- Bundled Roblox asset discovery works on VS Code 1.85, including nested folders.
+
 ## [1.5.3]
 
 ### Vide events are no longer flagged as unknown props ([#4](https://github.com/ericplane/Luix/issues/4))
@@ -19,7 +62,7 @@ framework. React, Roact and Fusion spell events as computed keys and
 are unaffected. Thanks to @WaleedAmer for the report and the fix.
 
 A misspelt event now gets the same did-you-mean nudge as a misspelt
-prop — `Activatd` → *Did you mean `Activated`?* — and the same fix
+prop — `Activatd` → _Did you mean `Activated`?_ — and the same fix
 carries through to everything that reads the same known-key set.
 
 ### Event data covers `Instance`, `VideoFrame` and `UIPageLayout`
@@ -48,8 +91,8 @@ Both mount by setting `Parent` in the props table — `New "ScreenGui"
 every root element. `Parent` is now accepted, completed (typed
 `Instance`) and documented on hover for Fusion and Vide host classes.
 React and Roact mount through a root instead, so a bare `Parent` there
-is still flagged — and the warning now says so (*"React mounts through a
-root or portal instead of a `Parent` key"*) rather than calling a real
+is still flagged — and the warning now says so (_"React mounts through a
+root or portal instead of a `Parent` key"_) rather than calling a real
 property unknown. The opt-in Roblox API-dump merge skips `Parent` so it
 can't quietly re-enter the prop list for React/Roact.
 
@@ -65,7 +108,7 @@ base (`---@extends TextButton`) is reported as forwarded from that base.
 The event and `Parent` hovers only fire on table keys, not on the same
 identifier inside a value (`Size = other.Changed`).
 
-In completion the merged Vide events carry the *Event* kind and insert a
+In completion the merged Vide events carry the _Event_ kind and insert a
 handler body (`Activated = function()\n\t\nend,`) instead of the generic
 `= …` value template.
 
@@ -74,7 +117,7 @@ handler body (`Activated = function()\n\t\nend,`) instead of the generic
 Sorting a table that contained keyless entries — Vide's inline children
 (`create "TextLabel" { … }`, `Child(props)`) or action calls
 (`action(fn)`, `changed("Size", fn)`) — silently **deleted** them: the
-sorter only re-emitted `key = value` entries. Both the *Sort props*
+sorter only re-emitted `key = value` entries. Both the _Sort props_
 code action and the `luix.sortProps.onSave` formatter were affected.
 Positional entries now travel with the sort, landing in the
 **Children** slot in their original order, so a `Frame` with children
@@ -86,7 +129,7 @@ never offered the action.
 
 ### Sort props recognises every event as an event
 
-The *Sort props* action put Vide-style event keys into the **Events**
+The _Sort props_ action put Vide-style event keys into the **Events**
 group using a hand-written list that missed `MouseWheelForward`,
 `MouseWheelBackward`, `TouchSwipe`, `TouchLongPress`, `TouchRotate`,
 `SelectionChanged`, `ReturnPressedFromOnScreenKeyboard` and the events

@@ -53,7 +53,7 @@ export function planUICornerRefactor(
 
   // Expand: exactly one `CornerRadius`, no individual corners.
   if (cornerValue !== undefined && individualPresent.length === 0) {
-    if (cornerValue.length === 0) return undefined;
+    if (cornerValue.length === 0) {return undefined;}
     return { kind: "expand", value: cornerValue };
   }
 
@@ -66,7 +66,7 @@ export function planUICornerRefactor(
     entries.length === 4
   ) {
     const values = individualPresent.map((k) => byKey.get(k) ?? "");
-    if (values[0].length === 0) return undefined;
+    if (values[0].length === 0) {return undefined;}
     if (values.every((v) => v === values[0])) {
       return { kind: "collapse", value: values[0] };
     }
@@ -83,7 +83,7 @@ function findEnclosingUICorner(
   let best: CreateElementCall | undefined;
   let bestSize = Infinity;
   for (const c of calls) {
-    if (c.className !== "UICorner" || !c.isStringLiteralName) continue;
+    if (c.className !== "UICorner" || !c.isStringLiteralName) {continue;}
     if (c.aliasStart <= offset && offset <= c.fullEnd) {
       const size = c.fullEnd - c.aliasStart;
       if (size < bestSize) {
@@ -98,9 +98,9 @@ function findEnclosingUICorner(
 /** Leading whitespace of the line containing `offset`. */
 function lineIndentAt(text: string, offset: number): string {
   let lineStart = offset;
-  while (lineStart > 0 && text[lineStart - 1] !== "\n") lineStart--;
+  while (lineStart > 0 && text[lineStart - 1] !== "\n") {lineStart--;}
   let i = lineStart;
-  while (i < offset && (text[i] === " " || text[i] === "\t")) i++;
+  while (i < offset && (text[i] === " " || text[i] === "\t")) {i++;}
   return text.slice(lineStart, i);
 }
 
@@ -133,7 +133,7 @@ export class UICornerCodeActionProvider implements vscode.CodeActionProvider {
       bodyStart,
       call.propsBraceEnd
     );
-    if (raw.length === 0) return [];
+    if (raw.length === 0) {return [];}
 
     const entries: CornerEntry[] = raw.map((e) => ({
       key: e.key,
@@ -145,17 +145,17 @@ export class UICornerCodeActionProvider implements vscode.CodeActionProvider {
     const plan = planUICornerRefactor(
       entries.map((e) => ({ key: e.key, valueText: e.valueText }))
     );
-    if (!plan) return [];
+    if (!plan) {return [];}
 
     // Only the EXPAND direction is a cursor-driven refactor here. The
     // COLLAPSE direction is surfaced as a diagnostic
     // (`CornerRadiusCollapsible`) plus its quick-fix, so it shows a
     // visible nudge rather than hiding behind the lightbulb — and we
     // avoid a duplicate "Collapse…" entry in the action menu.
-    if (plan.kind !== "expand") return [];
+    if (plan.kind !== "expand") {return [];}
 
     const corner = entries.find((e) => e.key === "CornerRadius");
-    if (!corner) return [];
+    if (!corner) {return [];}
     const indent = lineIndentAt(text, corner.keyStart);
     const replacement = UICORNER_INDIVIDUAL_RADII.map(
       (k) => `${k} = ${plan.value}`

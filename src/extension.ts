@@ -146,7 +146,9 @@ export function activate(context: vscode.ExtensionContext) {
   // `luix.activeFramework`. The picker command is also exposed via
   // the command palette ("Luix: Set active framework…").
   const statusBar = new ActiveFrameworkStatusBar();
+  let frameworkRefreshVersion = 0;
   const refreshWorkspaceFallback = async () => {
+    const refreshVersion = ++frameworkRefreshVersion;
     const fw = await inferWorkspaceFramework(workspaceIndex.indexedUris());
     // The infer call awaits up to 25 openTextDocument round-trips —
     // can take hundreds of ms. If deactivate fired in the meantime,
@@ -154,7 +156,7 @@ export function activate(context: vscode.ExtensionContext) {
     // disposed object" in some VS Code versions. The disposed flag
     // (added in statusBar.ts) makes both writes idempotent on a
     // dead instance.
-    if (statusBar.isDisposed()) return;
+    if (statusBar.isDisposed() || refreshVersion !== frameworkRefreshVersion) {return;}
     setWorkspaceFallback(fw);
     statusBar.refresh();
   };
@@ -272,7 +274,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Inlay hints — labels at the closing `)` of every multi-line
   // createElement call.
-  const inlayHints = new CreateElementInlayHintsProvider();
+  const inlayHints = new CreateElementInlayHintsProvider(workspaceIndex);
   context.subscriptions.push(
     inlayHints,
     vscode.languages.registerInlayHintsProvider(selector, inlayHints)
@@ -282,7 +284,7 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.languages.registerDocumentSymbolProvider(
       selector,
-      new CreateElementSymbolProvider()
+      new CreateElementSymbolProvider(workspaceIndex)
     )
   );
 
@@ -729,7 +731,7 @@ export function activate(context: vscode.ExtensionContext) {
           { modal: true },
           "Purge"
         );
-        if (choice !== "Purge") return;
+        if (choice !== "Purge") {return;}
         await purgeAllThumbnails(context);
         const dimsRemoved = await purgeAllCachedAssetDims(context);
         imageGutter.clearAllDecorations();
@@ -776,7 +778,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand(
       "luix.palette.addEntry",
       async (literal?: string) => {
-        if (typeof literal !== "string") return;
+        if (typeof literal !== "string") {return;}
         const name = await vscode.window.showInputBox({
           title: "Luix: save Color3 to palette",
           prompt:
@@ -786,7 +788,7 @@ export function activate(context: vscode.ExtensionContext) {
               ? undefined
               : "Use a simple identifier (letters/digits/dash/underscore).",
         });
-        if (!name) return;
+        if (!name) {return;}
         const target = await vscode.window.showQuickPick(
           [
             { label: "User settings (global)", target: vscode.ConfigurationTarget.Global },
@@ -794,7 +796,7 @@ export function activate(context: vscode.ExtensionContext) {
           ],
           { title: "Where should the palette entry live?" }
         );
-        if (!target) return;
+        if (!target) {return;}
         const cfg = vscode.workspace.getConfiguration("luix");
         const current = cfg.get<Record<string, string>>("palette", {}) ?? {};
         if (current[name] && current[name] !== literal) {
@@ -803,7 +805,7 @@ export function activate(context: vscode.ExtensionContext) {
             { modal: true },
             "Overwrite"
           );
-          if (overwrite !== "Overwrite") return;
+          if (overwrite !== "Overwrite") {return;}
         }
         await cfg.update("palette", { ...current, [name]: literal }, target.target);
         void vscode.window.showInformationMessage(

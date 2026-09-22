@@ -140,18 +140,18 @@ export interface ParsedRbxThumb {
 export function parseRbxThumb(inner: string): ParsedRbxThumb | undefined {
   const trimmed = inner.trim();
   const m = /^rbxthumb:\/\/(.*)$/.exec(trimmed);
-  if (!m) return undefined;
+  if (!m) {return undefined;}
   const out: ParsedRbxThumb = {};
   for (const part of m[1].split("&")) {
     const eq = part.indexOf("=");
-    if (eq < 0) continue;
+    if (eq < 0) {continue;}
     const key = part.slice(0, eq);
     const value = part.slice(eq + 1);
-    if (key === "type") out.type = value;
-    else if (key === "id") out.id = value;
-    else if (key === "w") out.w = value;
-    else if (key === "h") out.h = value;
-    else if (key === "filters") out.filters = value;
+    if (key === "type") {out.type = value;}
+    else if (key === "id") {out.id = value;}
+    else if (key === "w") {out.w = value;}
+    else if (key === "h") {out.h = value;}
+    else if (key === "filters") {out.filters = value;}
   }
   return out;
 }
@@ -257,7 +257,7 @@ export function getEnclosingString(
   offset: number
 ): EnclosingString | undefined {
   let lineStart = offset;
-  while (lineStart > 0 && text[lineStart - 1] !== "\n") lineStart--;
+  while (lineStart > 0 && text[lineStart - 1] !== "\n") {lineStart--;}
   let inString = false;
   let quote = "";
   let innerStart = -1;
@@ -279,11 +279,11 @@ export function getEnclosingString(
       innerStart = i + 1;
     }
   }
-  if (!inString) return undefined;
+  if (!inString) {return undefined;}
   // Extend to the closing quote (or end of line) for hover / full-inner.
   let end = offset;
   while (end < text.length && text[end] !== quote && text[end] !== "\n") {
-    if (text[end] === "\\") end++;
+    if (text[end] === "\\") {end++;}
     end++;
   }
   return { innerStart, innerEnd: end, quote };
@@ -312,13 +312,13 @@ export class RbxThumbCompletionProvider
     document: vscode.TextDocument,
     position: vscode.Position
   ): vscode.ProviderResult<vscode.CompletionItem[]> {
-    if (!getConfig<boolean>("robloxContent.enabled", true)) return undefined;
+    if (!getConfig<boolean>("robloxContent.enabled", true)) {return undefined;}
     const text = document.getText();
     const offset = document.offsetAt(position);
     const enc = getEnclosingString(text, offset);
-    if (!enc) return undefined;
+    if (!enc) {return undefined;}
     const before = text.slice(enc.innerStart, offset);
-    if (!before.startsWith(RBXTHUMB_PREFIX)) return undefined;
+    if (!before.startsWith(RBXTHUMB_PREFIX)) {return undefined;}
     const afterScheme = before.slice(RBXTHUMB_PREFIX.length);
 
     // Context B — editing a size field.
@@ -326,7 +326,7 @@ export class RbxThumbCompletionProvider
     if (sizeMatch) {
       const typeMatch = /(?:^|&)type=([A-Za-z]+)/.exec(afterScheme);
       const spec = typeMatch ? getRbxThumbType(typeMatch[1]) : undefined;
-      if (!spec) return undefined;
+      if (!spec) {return undefined;}
       const partial = sizeMatch[2];
       const range = new vscode.Range(
         document.positionAt(offset - partial.length),
@@ -347,7 +347,7 @@ export class RbxThumbCompletionProvider
 
     // Context A — choosing the type. Only when nothing past the type
     // value has been typed yet (`""`, `type=`, or `type=Partial`).
-    if (!/^(?:type=)?[A-Za-z]*$/.test(afterScheme)) return undefined;
+    if (!/^(?:type=)?[A-Za-z]*$/.test(afterScheme)) {return undefined;}
     const range = new vscode.Range(
       document.positionAt(enc.innerStart + RBXTHUMB_PREFIX.length),
       position
@@ -385,14 +385,14 @@ export class RbxThumbHoverProvider implements vscode.HoverProvider {
     document: vscode.TextDocument,
     position: vscode.Position
   ): vscode.ProviderResult<vscode.Hover> {
-    if (!getConfig<boolean>("robloxContent.enabled", true)) return undefined;
+    if (!getConfig<boolean>("robloxContent.enabled", true)) {return undefined;}
     const text = document.getText();
     const offset = document.offsetAt(position);
     const enc = getEnclosingString(text, offset);
-    if (!enc) return undefined;
+    if (!enc) {return undefined;}
     const inner = text.slice(enc.innerStart, enc.innerEnd);
     const parsed = parseRbxThumb(inner);
-    if (!parsed) return undefined;
+    if (!parsed) {return undefined;}
     const spec = parsed.type ? getRbxThumbType(parsed.type) : undefined;
     const lines: string[] = [];
     if (spec) {
@@ -463,10 +463,10 @@ export class RbxThumbDiagnostics implements vscode.Disposable {
   }
 
   private schedule(doc: vscode.TextDocument): void {
-    if (!this.isLua(doc)) return;
+    if (!this.isLua(doc)) {return;}
     const key = doc.uri.toString();
     const existing = this.timers.get(key);
-    if (existing) clearTimeout(existing);
+    if (existing) {clearTimeout(existing);}
     this.timers.set(
       key,
       setTimeout(() => {
@@ -483,7 +483,7 @@ export class RbxThumbDiagnostics implements vscode.Disposable {
   }
 
   refresh(doc: vscode.TextDocument): void {
-    if (!this.isLua(doc)) return;
+    if (!this.isLua(doc)) {return;}
     if (!getConfig<boolean>("robloxContent.enabled", true)) {
       this.collection.delete(doc.uri);
       return;
@@ -494,7 +494,7 @@ export class RbxThumbDiagnostics implements vscode.Disposable {
     let m: RegExpExecArray | null;
     while ((m = RBXTHUMB_SCAN_RE.exec(text)) !== null) {
       const parsed = parseRbxThumb(m[0]);
-      if (!parsed) continue;
+      if (!parsed) {continue;}
       // Only the high-signal problems — never the "incomplete while
       // typing" ones (missing type / size), which would flicker as the
       // user types the URL out.
@@ -504,7 +504,7 @@ export class RbxThumbDiagnostics implements vscode.Disposable {
           p.kind === "bad-size" ||
           p.kind === "bad-filter"
       );
-      if (problems.length === 0) continue;
+      if (problems.length === 0) {continue;}
       const range = new vscode.Range(
         doc.positionAt(m.index),
         doc.positionAt(m.index + m[0].length)
@@ -524,9 +524,9 @@ export class RbxThumbDiagnostics implements vscode.Disposable {
   }
 
   dispose(): void {
-    for (const t of this.timers.values()) clearTimeout(t);
+    for (const t of this.timers.values()) {clearTimeout(t);}
     this.timers.clear();
-    for (const d of this.disposables) d.dispose();
+    for (const d of this.disposables) {d.dispose();}
     this.disposables = [];
   }
 }
@@ -595,7 +595,7 @@ function newestVersionContent(versionsDir: string): string | undefined {
     return undefined;
   }
   for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
+    if (!entry.isDirectory()) {continue;}
     const contentDir = path.join(versionsDir, entry.name, "content");
     let stat: fs.Stats;
     try {
@@ -603,9 +603,9 @@ function newestVersionContent(versionsDir: string): string | undefined {
     } catch {
       continue;
     }
-    if (!stat.isDirectory()) continue;
+    if (!stat.isDirectory()) {continue;}
     const mtime = stat.mtimeMs;
-    if (!best || mtime > best.mtime) best = { dir: contentDir, mtime };
+    if (!best || mtime > best.mtime) {best = { dir: contentDir, mtime };}
   }
   return best?.dir;
 }
@@ -617,19 +617,19 @@ function newestVersionContent(versionsDir: string): string | undefined {
  * the newest install on Windows / macOS. Cached.
  */
 export function discoverContentDir(): string | undefined {
-  if (_contentDir !== undefined) return _contentDir ?? undefined;
+  if (_contentDir !== undefined) {return _contentDir ?? undefined;}
 
   const resolve = (): string | undefined => {
     const override = getConfig<string>("robloxContent.path", "").trim();
     if (override) {
       try {
-        if (!fs.existsSync(override)) return undefined;
+        if (!fs.existsSync(override)) {return undefined;}
       } catch {
         return undefined;
       }
-      if (looksLikeContentDir(override)) return override;
+      if (looksLikeContentDir(override)) {return override;}
       const sub = path.join(override, "content");
-      if (looksLikeContentDir(sub)) return sub;
+      if (looksLikeContentDir(sub)) {return sub;}
       return newestVersionContent(override);
     }
 
@@ -646,12 +646,12 @@ export function discoverContentDir(): string | undefined {
     }
     for (const versionsDir of candidates) {
       const content = newestVersionContent(versionsDir);
-      if (content) return content;
+      if (content) {return content;}
     }
     // macOS Studio ships content directly inside the app bundle.
     const macStudio =
       "/Applications/RobloxStudio.app/Contents/Resources/content";
-    if (looksLikeContentDir(macStudio)) return macStudio;
+    if (looksLikeContentDir(macStudio)) {return macStudio;}
     return undefined;
   };
 
@@ -668,24 +668,56 @@ export function discoverContentDir(): string | undefined {
 /** Scan (once, cached) the discovered content folder for completable
  *  asset files, returned as forward-slash relative paths. */
 export function getContentFiles(): Promise<string[]> {
-  if (!_filesPromise) _filesPromise = scanContentFiles();
+  if (!_filesPromise) {_filesPromise = scanContentFiles();}
   return _filesPromise;
 }
 
 async function scanContentFiles(): Promise<string[]> {
   const dir = discoverContentDir();
-  if (!dir) return [];
+  if (!dir) {return [];}
   try {
-    const entries = await fs.promises.readdir(dir, { recursive: true });
+    // VS Code 1.85 embeds Node 18.15, before readdir's recursive option.
+    // Keep the same depth-first directory order, following directory links
+    // while preventing a link back to an ancestor from looping forever.
+    const rootPath = await fs.promises.realpath(dir);
+    const pending = [{
+      relative: "",
+      entries: await fs.promises.readdir(dir, { withFileTypes: true }),
+      ancestors: new Set([rootPath]),
+    }];
     const out: string[] = [];
-    for (const entry of entries) {
-      const rel = entry.toString();
-      if (!CONTENT_EXTENSIONS.has(path.extname(rel).toLowerCase())) continue;
-      out.push(rel.split(path.sep).join("/"));
-      if (out.length >= MAX_CONTENT_FILES) break;
+    while (pending.length > 0) {
+      const current = pending.pop()!;
+      for (const entry of current.entries) {
+        const relative = path.join(current.relative, entry.name);
+        const absolute = path.join(dir, relative);
+        let isDirectory = entry.isDirectory();
+        if (entry.isSymbolicLink()) {
+          try {
+            isDirectory = (await fs.promises.stat(absolute)).isDirectory();
+          } catch {
+            // A broken link is not traversable, as with native readdir.
+          }
+        }
+        if (CONTENT_EXTENSIONS.has(path.extname(relative).toLowerCase())) {
+          out.push(relative.split(path.sep).join("/"));
+          if (out.length >= MAX_CONTENT_FILES) {
+            return out.sort();
+          }
+        }
+        if (isDirectory) {
+          const realPath = await fs.promises.realpath(absolute);
+          if (!current.ancestors.has(realPath)) {
+            pending.push({
+              relative,
+              entries: await fs.promises.readdir(absolute, { withFileTypes: true }),
+              ancestors: new Set([...current.ancestors, realPath]),
+            });
+          }
+        }
+      }
     }
-    out.sort();
-    return out;
+    return out.sort();
   } catch (err) {
     logWarn("rbxasset autocomplete: failed to scan content folder", err);
     return [];
@@ -723,9 +755,9 @@ export function computeRbxAssetChildren(
   const folders = new Set<string>();
   const fileNames = new Set<string>();
   for (const file of files) {
-    if (committedDir && !file.startsWith(committedDir)) continue;
+    if (committedDir && !file.startsWith(committedDir)) {continue;}
     const rest = file.slice(committedDir.length);
-    if (rest.length === 0) continue;
+    if (rest.length === 0) {continue;}
     const slash = rest.indexOf("/");
     if (slash === -1) {
       fileNames.add(rest);
@@ -734,8 +766,8 @@ export function computeRbxAssetChildren(
     }
   }
   const out: RbxAssetChild[] = [];
-  for (const name of folders) out.push({ name, isFolder: true });
-  for (const name of fileNames) out.push({ name, isFolder: false });
+  for (const name of folders) {out.push({ name, isFolder: true });}
+  for (const name of fileNames) {out.push({ name, isFolder: false });}
   // Folders first, then files; alphabetical within each group.
   out.sort((a, b) =>
     a.isFolder === b.isFolder
@@ -754,16 +786,16 @@ export class RbxAssetCompletionProvider
     document: vscode.TextDocument,
     position: vscode.Position
   ): Promise<vscode.CompletionItem[] | undefined> {
-    if (!getConfig<boolean>("robloxContent.enabled", true)) return undefined;
+    if (!getConfig<boolean>("robloxContent.enabled", true)) {return undefined;}
     const text = document.getText();
     const offset = document.offsetAt(position);
     const enc = getEnclosingString(text, offset);
-    if (!enc) return undefined;
+    if (!enc) {return undefined;}
     const before = text.slice(enc.innerStart, offset);
-    if (!before.startsWith(RBXASSET_PREFIX)) return undefined;
+    if (!before.startsWith(RBXASSET_PREFIX)) {return undefined;}
 
     const files = await getContentFiles();
-    if (files.length === 0) return undefined;
+    if (files.length === 0) {return undefined;}
 
     // Split the typed path into the committed directory (up to and
     // including the last `/`) and the partial segment being typed.
@@ -774,7 +806,7 @@ export class RbxAssetCompletionProvider
     const partial = typedPath.slice(lastSlash + 1);
 
     const children = computeRbxAssetChildren(files, committedDir);
-    if (children.length === 0) return undefined;
+    if (children.length === 0) {return undefined;}
 
     // Replace only the partial segment — selecting a child appends to
     // the committed dir rather than rewriting the whole path.
@@ -806,7 +838,7 @@ export class RbxAssetCompletionProvider
         };
       }
       out.push(item);
-      if (out.length >= MAX_RBXASSET_RESULTS) break;
+      if (out.length >= MAX_RBXASSET_RESULTS) {break;}
     }
     return out;
   }

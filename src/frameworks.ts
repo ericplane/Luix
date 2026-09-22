@@ -149,9 +149,9 @@ try {
  * — invalidated on config change.
  */
 export function getEnabledFrameworks(): FrameworkSpec[] {
-  if (_enabledFrameworks) return _enabledFrameworks;
+  if (_enabledFrameworks) {return _enabledFrameworks;}
   const enabled = getConfig<FrameworkId[]>("frameworks", ALL_FRAMEWORK_IDS);
-  const ids = Array.isArray(enabled) && enabled.length > 0
+  const ids = Array.isArray(enabled)
     ? enabled.filter((id): id is FrameworkId =>
         ALL_FRAMEWORK_IDS.includes(id as FrameworkId)
       )
@@ -191,7 +191,7 @@ export interface AliasPartition {
 }
 
 export function getAliasPartition(): AliasPartition {
-  if (_aliasPartition) return _aliasPartition;
+  if (_aliasPartition) {return _aliasPartition;}
   const parens: string[] = [];
   const curried: string[] = [];
   const parensWithInlineChildren: string[] = [];

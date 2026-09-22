@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { createHash } from "crypto";
 import { configChangeAffects, getConfig } from "./configCompat";
 import { getAliasPartition, getDirectInstanceClassNames } from "./frameworks";
 import {
@@ -109,6 +110,9 @@ export class WorkspaceIndex implements vscode.Disposable {
   private _persistTimer: NodeJS.Timeout | undefined;
   private _scanTimers = new Map<string, NodeJS.Timeout>();
   private context: vscode.ExtensionContext | undefined;
+  private disposed = false;
+  private generation = 0;
+  private scanVersions = new Map<string, number>();
   /**
    * Memoised view of every component name across the cache, lazily built
    * on first read after a cache mutation. Completion / hover / anchor /
@@ -128,6 +132,7 @@ export class WorkspaceIndex implements vscode.Disposable {
 
   /** Coalesce rapid scan calls into a single fire (200ms). */
   private scheduleChange(): void {
+    if (this.disposed) {return;}
     if (this._changeTimer) {
       clearTimeout(this._changeTimer);
     }
@@ -160,12 +165,10 @@ export class WorkspaceIndex implements vscode.Disposable {
         this.scanUri(uri).catch(() => {});
       }),
       watcher.onDidDelete((uri) => {
-        if (this.cache.delete(uri.toString())) {
-          this.invalidateNameCaches();
-          this.scheduleChange();
-        }
+        this.removeUri(uri);
       }),
       vscode.workspace.onDidChangeTextDocument((e) => {
+        if (e.contentChanges.length === 0) {return;}
         const langId = e.document.languageId;
         if (langId !== "lua" && langId !== "luau") {
           return;
@@ -173,7 +176,9 @@ export class WorkspaceIndex implements vscode.Disposable {
         if (isExcluded(e.document.uri, getExcludedDirs())) {
           return;
         }
+        if (!vscode.workspace.getWorkspaceFolder(e.document.uri)) {return;}
         const key = e.document.uri.toString();
+        this.scanVersions.set(key, (this.scanVersions.get(key) ?? 0) + 1);
         const existing = this._scanTimers.get(key);
         if (existing) {
           clearTimeout(existing);
@@ -182,10 +187,20 @@ export class WorkspaceIndex implements vscode.Disposable {
           key,
           setTimeout(() => {
             this._scanTimers.delete(key);
-            this.scanDocument(e.document);
+            if (!this.disposed && !e.document.isClosed) {
+              this.scanDocument(e.document);
+            }
           }, 200)
         );
       }),
+      vscode.workspace.onDidSaveTextDocument((doc) => {
+        void this.scanUri(doc.uri).catch(() => {});
+      }),
+      vscode.workspace.onDidCloseTextDocument((doc) => {
+        // A discarded buffer must stop shadowing the saved file.
+        void this.scanUri(doc.uri).catch(() => {});
+      }),
+      vscode.workspace.onDidChangeWorkspaceFolders(() => this.rebuild()),
       vscode.workspace.onDidChangeConfiguration((e) => {
         if (
           configChangeAffects(e, "createElementAliases") ||
@@ -196,10 +211,7 @@ export class WorkspaceIndex implements vscode.Disposable {
           configChangeAffects(e, "vide.aliases") ||
           configChangeAffects(e, "exclude")
         ) {
-          this.cache.clear();
-          this.invalidateNameCaches();
-          this.warmupPromise = this.warmup().catch(() => {});
-          this.scheduleChange();
+          this.rebuild();
         } else if (configChangeAffects(e, "vide.directInstanceCalls")) {
           // Doesn't change the parsed cache, just the direct-call gate;
           // bust the union cache so the next read picks up the new
@@ -210,7 +222,32 @@ export class WorkspaceIndex implements vscode.Disposable {
     );
   }
 
+  private rebuild(): void {
+    this.generation++;
+    for (const timer of this._scanTimers.values()) {clearTimeout(timer);}
+    this._scanTimers.clear();
+    this.cache.clear();
+    this.invalidateNameCaches();
+    this.warmupPromise = this.warmup().catch(() => {});
+    this.scheduleChange();
+  }
+
+  private removeUri(uri: vscode.Uri): void {
+    const key = uri.toString();
+    this.scanVersions.set(key, (this.scanVersions.get(key) ?? 0) + 1);
+    const timer = this._scanTimers.get(key);
+    if (timer) {clearTimeout(timer);}
+    this._scanTimers.delete(key);
+    if (this.cache.delete(key)) {
+      this.invalidateNameCaches();
+      this.scheduleChange();
+      this.schedulePersist();
+    }
+  }
+
   private async warmup(): Promise<void> {
+    const generation = this.generation;
+    const configuration = cacheConfiguration();
     const excludedDirs = getExcludedDirs();
     const excludeGlob = buildExcludeGlob(excludedDirs);
     // Restore persisted cache (if any) before scanning so unchanged
@@ -220,51 +257,83 @@ export class WorkspaceIndex implements vscode.Disposable {
     const persistEnabled =
       getConfig<boolean>("indexPersistence.enabled", true) &&
       this.context !== undefined;
-    if (persistEnabled) {
-      await this.loadPersistedCache().catch(() => {});
-    }
+    const restored = persistEnabled
+      ? await this.loadPersistedCache(configuration).catch(() => new Map<string, CacheEntry>())
+      : new Map<string, CacheEntry>();
     const files = await vscode.workspace.findFiles(
       "**/*.{lua,luau}",
       excludeGlob || null
     );
+    if (this.disposed || generation !== this.generation) {return;}
+    const eligible = new Set(files
+      .filter((uri) => !isExcluded(uri, excludedDirs))
+      .map((uri) => uri.toString()));
+    for (const key of this.cache.keys()) {
+      if (!eligible.has(key)) {this.cache.delete(key);}
+    }
+    for (const [key, entry] of restored) {
+      // Do not overwrite a buffer changed while the cache was loading.
+      if (eligible.has(key) && !this.cache.has(key)) {this.cache.set(key, entry);}
+    }
+    this.invalidateNameCaches();
     await Promise.all(
-      files.map((uri) => this.scanUri(uri).catch(() => undefined))
+      files.map((uri) => this.scanUri(uri, generation).catch(() => undefined))
     );
+    if (this.disposed || generation !== this.generation) {return;}
+    // Cache hits are also a completed warmup: notify consumers even
+    // when no file needed reparsing.
+    this.invalidateNameCaches();
+    this.scheduleChange();
     if (persistEnabled) {
       this.schedulePersist();
     }
   }
 
-  private async scanUri(uri: vscode.Uri): Promise<void> {
-    if (isExcluded(uri, getExcludedDirs())) {
+  private async scanUri(uri: vscode.Uri, generation = this.generation): Promise<void> {
+    if (this.disposed || generation !== this.generation ||
+      !/\.(lua|luau)$/i.test(uri.path) ||
+      !vscode.workspace.getWorkspaceFolder(uri) || isExcluded(uri, getExcludedDirs())) {
+      return;
+    }
+    const key = uri.toString();
+    const scanVersion = (this.scanVersions.get(key) ?? 0) + 1;
+    this.scanVersions.set(key, scanVersion);
+    const isCurrent = () => !this.disposed && generation === this.generation &&
+      this.scanVersions.get(key) === scanVersion;
+    const open = vscode.workspace.textDocuments.find((doc) => !doc.isClosed && doc.uri.toString() === key);
+    if (open?.isDirty) {
+      this.scanText(open.uri, open.getText());
       return;
     }
     // Skip re-parsing if the persisted cache entry matches the file's
     // current size + mtime.
-    const cached = this.cache.get(uri.toString());
-    if (cached?.fingerprint) {
-      try {
-        const stat = await vscode.workspace.fs.stat(uri);
+    const cached = this.cache.get(key);
+    let before: vscode.FileStat;
+    try {
+      before = await vscode.workspace.fs.stat(uri);
+      if (!isCurrent()) {return;}
+      if (cached?.fingerprint) {
         if (
-          stat.mtime === cached.fingerprint.mtime &&
-          stat.size === cached.fingerprint.size
+          before.mtime === cached.fingerprint.mtime &&
+          before.size === cached.fingerprint.size
         ) {
           return;
         }
-      } catch {
-        // File no longer exists — clear cache entry, fall through to
-        // the normal failure handling.
-        this.cache.delete(uri.toString());
-        return;
       }
+    } catch {
+      if (isCurrent()) {this.removeUri(uri);}
+      return;
     }
     const doc = await vscode.workspace.openTextDocument(uri);
-    this.scanDocument(doc);
+    if (!isCurrent()) {return;}
+    const version = doc.version;
+    this.scanText(doc.uri, doc.getText());
     // Stamp the fresh fingerprint so subsequent cold-starts can skip.
     try {
       const stat = await vscode.workspace.fs.stat(uri);
-      const entry = this.cache.get(uri.toString());
-      if (entry) {
+      const entry = this.cache.get(key);
+      if (isCurrent() && entry && !doc.isDirty && doc.version === version &&
+        before.mtime === stat.mtime && before.size === stat.size) {
         entry.fingerprint = { mtime: stat.mtime, size: stat.size };
       }
     } catch {
@@ -273,8 +342,13 @@ export class WorkspaceIndex implements vscode.Disposable {
   }
 
   private scanDocument(doc: vscode.TextDocument): void {
+    const key = doc.uri.toString();
+    this.scanVersions.set(key, (this.scanVersions.get(key) ?? 0) + 1);
+    this.scanText(doc.uri, doc.getText());
+  }
+
+  private scanText(uri: vscode.Uri, text: string): void {
     const aliases = getAliasPartition();
-    const text = doc.getText();
     const components = scanDocument(text, aliases);
     const callSites = new Map<string, CreateElementCall[]>();
     for (const call of findAllCreateElementCalls(text, aliases)) {
@@ -289,13 +363,11 @@ export class WorkspaceIndex implements vscode.Disposable {
         callSites.set(key, [call]);
       }
     }
-    // Preserve any existing fingerprint — the caller (`scanUri`)
-    // refreshes it after writing the entry.
-    const existing = this.cache.get(doc.uri.toString());
-    this.cache.set(doc.uri.toString(), {
+    // Buffer contents have no disk fingerprint. Only scanUri can stamp
+    // one after checking that the saved file and document stayed stable.
+    this.cache.set(uri.toString(), {
       components,
       callSites,
-      fingerprint: existing?.fingerprint,
     });
     this.invalidateNameCaches();
     this.scheduleChange();
@@ -305,9 +377,9 @@ export class WorkspaceIndex implements vscode.Disposable {
   // ---- Persistence ------------------------------------------------------
 
   private schedulePersist(): void {
-    if (!this.context) return;
-    if (!getConfig<boolean>("indexPersistence.enabled", true)) return;
-    if (this._persistTimer) clearTimeout(this._persistTimer);
+    if (this.disposed || !this.context) {return;}
+    if (!getConfig<boolean>("indexPersistence.enabled", true)) {return;}
+    if (this._persistTimer) {clearTimeout(this._persistTimer);}
     // 5s after the last change — avoids hammering disk during edits.
     this._persistTimer = setTimeout(() => {
       this._persistTimer = undefined;
@@ -316,11 +388,13 @@ export class WorkspaceIndex implements vscode.Disposable {
   }
 
   private async persistNow(): Promise<void> {
-    if (!this.context) return;
+    if (this.disposed || !this.context ||
+      !getConfig<boolean>("indexPersistence.enabled", true)) {return;}
     const folder = vscode.workspace.workspaceFolders?.[0];
-    if (!folder) return;
-    const file = persistFileFor(this.context, folder);
-    const data = serialiseCache(this.cache);
+    if (!folder) {return;}
+    const generation = this.generation;
+    const file = persistFileFor(this.context);
+    const data = serialiseCache(this.cache, cacheConfiguration());
     try {
       await vscode.workspace.fs.createDirectory(
         vscode.Uri.joinPath(file, "..")
@@ -328,34 +402,38 @@ export class WorkspaceIndex implements vscode.Disposable {
     } catch {
       // exists — fine.
     }
+    if (this.disposed || generation !== this.generation) {return;}
     await vscode.workspace.fs.writeFile(
       file,
       new TextEncoder().encode(JSON.stringify(data))
     );
   }
 
-  private async loadPersistedCache(): Promise<void> {
-    if (!this.context) return;
+  private async loadPersistedCache(configuration: string): Promise<Map<string, CacheEntry>> {
+    const restored = new Map<string, CacheEntry>();
+    if (!this.context) {return restored;}
     const folder = vscode.workspace.workspaceFolders?.[0];
-    if (!folder) return;
-    const file = persistFileFor(this.context, folder);
+    if (!folder) {return restored;}
+    const file = persistFileFor(this.context);
     let bytes: Uint8Array;
     try {
       bytes = await vscode.workspace.fs.readFile(file);
     } catch {
-      return; // No prior cache.
+      return restored; // No prior cache.
     }
     try {
       const data = JSON.parse(new TextDecoder().decode(bytes)) as PersistedCache;
-      if (data.version !== PERSIST_VERSION) {
-        return;
+      if (data.version !== PERSIST_VERSION || data.configuration !== configuration) {
+        return restored;
       }
       for (const [uriStr, entry] of Object.entries(data.files)) {
-        this.cache.set(uriStr, deserialiseEntry(entry));
+        if (entry.fingerprint) {restored.set(uriStr, deserialiseEntry(entry));}
       }
     } catch {
-      // Corrupt JSON — silently ignore, full rescan happens anyway.
+      // Do not retain a partial load from corrupt data.
+      restored.clear();
     }
+    return restored;
   }
 
   /**
@@ -531,7 +609,7 @@ export class WorkspaceIndex implements vscode.Disposable {
     let total = 0;
     for (const entry of this.cache.values()) {
       const hits = entry.callSites.get(key);
-      if (hits) total += hits.length;
+      if (hits) {total += hits.length;}
     }
     return total;
   }
@@ -550,7 +628,7 @@ export class WorkspaceIndex implements vscode.Disposable {
     const out: Array<{ uri: vscode.Uri; range: vscode.Range }> = [];
     for (const [uriString, entry] of this.cache) {
       const hits = entry.callSites.get(key);
-      if (!hits) continue;
+      if (!hits) {continue;}
       let doc: vscode.TextDocument | undefined;
       try {
         doc = await vscode.workspace.openTextDocument(
@@ -578,16 +656,20 @@ export class WorkspaceIndex implements vscode.Disposable {
   _seedForTesting(
     entries: Array<[string, Map<string, DocumentComponentInfo>]>
   ): void {
+    this.generation++;
     for (const [uriString, components] of entries) {
       this.cache.set(uriString, {
         components,
         callSites: new Map(),
       });
     }
+    this.invalidateNameCaches();
     this.warmupPromise = Promise.resolve();
   }
 
   dispose(): void {
+    this.disposed = true;
+    this.generation++;
     for (const d of this.disposables) {
       d.dispose();
     }
@@ -629,10 +711,11 @@ export const _internal = {
 // serialised structure changes; older caches are silently discarded on
 // load.
 
-const PERSIST_VERSION = 1;
+const PERSIST_VERSION = 2;
 
 interface PersistedCache {
   version: number;
+  configuration: string;
   files: Record<string, PersistedFileEntry>;
 }
 interface PersistedFileEntry {
@@ -649,18 +732,19 @@ interface PersistedComponentInfo {
   hardcodedProps?: string[];
 }
 
-function persistFileFor(
-  context: vscode.ExtensionContext,
-  folder: vscode.WorkspaceFolder
-): vscode.Uri {
-  // Tag the cache file by a short hash of the workspace path so
-  // separate projects don't clobber each other.
-  const path = folder.uri.fsPath;
-  let h = 0;
-  for (let i = 0; i < path.length; i++) {
-    h = (h * 31 + path.charCodeAt(i)) | 0;
-  }
-  const tag = (h >>> 0).toString(36);
+function cacheConfiguration(): string {
+  return JSON.stringify({
+    aliases: getAliasPartition(),
+    excluded: [...getExcludedDirs()].sort(),
+  });
+}
+
+function persistFileFor(context: vscode.ExtensionContext): vscode.Uri {
+  // Include every root and URI authority (remote workspaces can have
+  // identical filesystem paths on different hosts).
+  const roots = (vscode.workspace.workspaceFolders ?? [])
+    .map((folder) => folder.uri.toString()).sort();
+  const tag = createHash("sha256").update(JSON.stringify(roots)).digest("hex");
   return vscode.Uri.joinPath(
     context.globalStorageUri,
     "workspaceIndex",
@@ -669,10 +753,14 @@ function persistFileFor(
 }
 
 function serialiseCache(
-  cache: Map<string, CacheEntry>
+  cache: Map<string, CacheEntry>,
+  configuration: string
 ): PersistedCache {
   const files: Record<string, PersistedFileEntry> = {};
   for (const [uri, entry] of cache) {
+    // Dirty buffers and scans without a verified disk snapshot must
+    // be reparsed next session, never restored as saved-file data.
+    if (!entry.fingerprint) {continue;}
     const components: Array<[string, PersistedComponentInfo]> = [];
     for (const [name, info] of entry.components) {
       components.push([
@@ -698,7 +786,7 @@ function serialiseCache(
       callSites: Array.from(entry.callSites.entries()),
     };
   }
-  return { version: PERSIST_VERSION, files };
+  return { version: PERSIST_VERSION, configuration, files };
 }
 
 function deserialiseEntry(entry: PersistedFileEntry): CacheEntry {

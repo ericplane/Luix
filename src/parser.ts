@@ -57,6 +57,9 @@ export interface DocumentComponentInfo {
 export interface CreateElementCall {
   className: string;
   isStringLiteralName: boolean;
+  isDirectComponentCall?: boolean;
+  /** A configured Vide constructor, after excluding component bindings. */
+  isDirectInstanceCall?: boolean;
   nameProp?: string;
   /**
    * The factory alias that matched (`e`, `New`, `Vide.create`, …),
@@ -385,7 +388,7 @@ const factoryNameStageParensCache = new Map<string, RegExp>();
 
 function parensPatternFor(aliasPattern: string): RegExp {
   const hit = parensPatternCache.get(aliasPattern);
-  if (hit) return hit;
+  if (hit) {return hit;}
   const re = new RegExp(
     `(?:^|[^A-Za-z0-9_.])(${aliasPattern})\\s*\\(\\s*` +
       `(?:"([A-Za-z_][A-Za-z0-9_]*)"|'([A-Za-z_][A-Za-z0-9_]*)'|` +
@@ -398,7 +401,7 @@ function parensPatternFor(aliasPattern: string): RegExp {
 
 function curriedPatternFor(aliasPattern: string): RegExp {
   const hit = curriedPatternCache.get(aliasPattern);
-  if (hit) return hit;
+  if (hit) {return hit;}
   const re = new RegExp(
     `(?:^|[^A-Za-z0-9_.])${RECEIVER_PREFIX}(${aliasPattern})` +
       `\\s+${CLASS_NAME_ALT}\\s*$`
@@ -414,7 +417,7 @@ function curriedPatternFor(aliasPattern: string): RegExp {
  */
 function curriedNameParensPatternFor(aliasPattern: string): RegExp {
   const hit = curriedNameParensPatternCache.get(aliasPattern);
-  if (hit) return hit;
+  if (hit) {return hit;}
   const re = new RegExp(
     `(?:^|[^A-Za-z0-9_.])${RECEIVER_PREFIX}(${aliasPattern})` +
       `\\s*\\(\\s*${LEADING_ARGS}${CLASS_NAME_ALT}\\s*\\)\\s*(?:\\(\\s*)?$`
@@ -430,7 +433,7 @@ function curriedNameParensPatternFor(aliasPattern: string): RegExp {
  */
 function curriedPropsParensPatternFor(aliasPattern: string): RegExp {
   const hit = curriedPropsParensPatternCache.get(aliasPattern);
-  if (hit) return hit;
+  if (hit) {return hit;}
   const re = new RegExp(
     `(?:^|[^A-Za-z0-9_.])${RECEIVER_PREFIX}(${aliasPattern})` +
       `\\s+${CLASS_NAME_ALT}\\s*\\(\\s*$`
@@ -446,7 +449,7 @@ function curriedPropsParensPatternFor(aliasPattern: string): RegExp {
  */
 function factoryNameStageParensPatternFor(aliasPattern: string): RegExp {
   const hit = factoryNameStageParensCache.get(aliasPattern);
-  if (hit) return hit;
+  if (hit) {return hit;}
   const re = new RegExp(
     `(?:^|[^A-Za-z0-9_.])${RECEIVER_PREFIX}(${aliasPattern})` +
       `\\s*\\(\\s*${LEADING_ARGS}$`
@@ -693,6 +696,8 @@ export interface EnclosingStringArg {
    * inserting the suggestion should NOT add another `{ … }`.
    */
   hasPropsAfter: boolean;
+  /** Existing punctuation/comments must stay outside the single-line edit. */
+  preserveSuffix?: boolean;
 }
 
 /**
@@ -820,50 +825,62 @@ export function findEnclosingFactoryStringArg(
     return undefined;
   }
 
-  // Inspect what follows the closing quote (if present) on the same line.
+  // Inspect existing arguments across line breaks without widening the
+  // completion's edit range. Only a same-line, trivia-free closing paren
+  // can be consumed while expanding the call.
   let closeParen = -1;
   let hasPropsAfter = false;
-  if (stringEnd !== -1) {
-    let i = stringEnd + 1;
-    while (i < text.length && text[i] !== "\n" && /[ \t]/.test(text[i])) {
-      i++;
+  let preserveSuffix = false;
+  const skipTrivia = (start: number): number => {
+    let i = start;
+    while (i < text.length) {
+      if (/\s/.test(text[i])) { i++; continue; }
+      if (!text.startsWith("--", i)) { break; }
+      const block = /^--\[(=*)\[/.exec(text.slice(i));
+      if (block) {
+        const end = text.indexOf(`]${block[1]}]`, i + block[0].length);
+        i = end < 0 ? text.length : end + block[1].length + 2;
+      } else {
+        const end = text.indexOf("\n", i + 2);
+        i = end < 0 ? text.length : end + 1;
+      }
     }
+    return i;
+  };
+  if (stringEnd !== -1) {
+    const i = skipTrivia(stringEnd + 1);
     if (callShape === "parens") {
       if (text[i] === ",") {
-        // Already has a comma → props table likely already present.
-        let j = i + 1;
-        while (j < text.length && text[j] !== "\n" && /[ \t]/.test(text[j])) {
-          j++;
-        }
-        if (text[j] === "{") {
-          hasPropsAfter = true;
-        }
+        // Existing props may be a table, a variable or an unfinished arg.
+        hasPropsAfter = true;
       } else if (text[i] === ")") {
-        closeParen = i;
+        const next = skipTrivia(i + 1);
+        if (partition.curried.includes(alias) && (text[next] === "{" || text[next] === "(")) {
+          callShape = "curried";
+          nameStageParens = true;
+          hasPropsAfter = true;
+        } else if (/^[ \t]*$/.test(text.slice(stringEnd + 1, i))) {
+          closeParen = i;
+        } else {
+          preserveSuffix = true;
+        }
       }
     } else if (nameStageParens) {
       // `New("Fr|")` — the name stage's own `)` comes first, then the
       // props stage in either shape: `) { … }` or `)({ … })`.
       if (text[i] === ")") {
-        let j = i + 1;
-        while (j < text.length && /[ \t]/.test(text[j])) {
-          j++;
-        }
-        if (text[j] === "(") {
-          j++;
-          while (j < text.length && /[ \t]/.test(text[j])) {
-            j++;
-          }
-        }
-        if (text[j] === "{") {
+        const j = skipTrivia(i + 1);
+        if (text[j] === "{" || text[j] === "(") {
           hasPropsAfter = true;
-        } else {
+        } else if (/^[ \t]*$/.test(text.slice(stringEnd + 1, i))) {
           closeParen = i;
+        } else {
+          preserveSuffix = true;
         }
       }
     } else {
       // curried
-      if (text[i] === "{") {
+      if (text[i] === "{" || text[i] === "(") {
         hasPropsAfter = true;
       }
     }
@@ -878,6 +895,7 @@ export function findEnclosingFactoryStringArg(
     stringEnd,
     closeParen,
     hasPropsAfter,
+    preserveSuffix,
   };
 }
 
@@ -940,12 +958,12 @@ function parsePropEntriesFromMasked(masked: string): PropEntry[] {
       let depth = 1;
       i++;
       while (i < masked.length && depth > 0) {
-        if (masked[i] === "[") depth++;
-        else if (masked[i] === "]") depth--;
+        if (masked[i] === "[") {depth++;}
+        else if (masked[i] === "]") {depth--;}
         i++;
       }
       // Skip `= value` for this computed key.
-      while (i < masked.length && /\s/.test(masked[i])) i++;
+      while (i < masked.length && /\s/.test(masked[i])) {i++;}
       if (masked[i] === "=") {
         i++;
         i = skipValueExpression(masked, i);
@@ -955,7 +973,10 @@ function parsePropEntriesFromMasked(masked: string): PropEntry[] {
     if (!/[A-Za-z_]/.test(masked[i])) {
       // Could be a positional value (Vide inline child, `e(...)`,
       // `local …` block, etc.). Skip the value expression and move on.
-      i = skipValueExpression(masked, i);
+      // While typing, an unmatched closer can make the value scanner
+      // stop immediately. Always consume at least that character so
+      // malformed input cannot spin forever and freeze the extension host.
+      i = Math.max(i + 1, skipValueExpression(masked, i));
       continue;
     }
     const keyStart = i;
@@ -995,17 +1016,17 @@ function skipValueExpression(masked: string, start: number): number {
         return i;
       }
     }
-    if (c === "{") braceDepth++;
+    if (c === "{") {braceDepth++;}
     else if (c === "}") {
-      if (braceDepth === 0) return i;
+      if (braceDepth === 0) {return i;}
       braceDepth--;
-    } else if (c === "(") parenDepth++;
+    } else if (c === "(") {parenDepth++;}
     else if (c === ")") {
-      if (parenDepth === 0) return i;
+      if (parenDepth === 0) {return i;}
       parenDepth--;
-    } else if (c === "[") bracketDepth++;
+    } else if (c === "[") {bracketDepth++;}
     else if (c === "]") {
-      if (bracketDepth === 0) return i;
+      if (bracketDepth === 0) {return i;}
       bracketDepth--;
     }
     i++;
@@ -1616,7 +1637,7 @@ export function scanDocument(
 ): Map<string, DocumentComponentInfo> {
   const partition = asPartition(aliases);
   const aliasesKey =
-    partition.parens.join("|") + " " + partition.curried.join("|");
+    partition.parens.join("|") + "\0" + partition.curried.join("|");
   const len = text.length;
   for (let i = scanCache.length - 1; i >= 0; i--) {
     const entry = scanCache[i];
@@ -1624,9 +1645,9 @@ export function scanDocument(
     // O(short-string), so we only pay the full O(N) string-equality
     // cost when a real hit is plausible. On big files this keeps the
     // cache check at near-constant time for misses.
-    if (entry.textLen !== len) continue;
-    if (entry.aliasesKey !== aliasesKey) continue;
-    if (entry.text !== text) continue;
+    if (entry.textLen !== len) {continue;}
+    if (entry.aliasesKey !== aliasesKey) {continue;}
+    if (entry.text !== text) {continue;}
     const hit = scanCache.splice(i, 1)[0];
     scanCache.push(hit);
     return hit.result;
@@ -1706,16 +1727,26 @@ interface AllCallsCacheEntry {
   aliasesKey: string;
   result: CreateElementCall[];
 }
+
+export interface DirectCallOptions {
+  componentNames?: ReadonlySet<string>;
+  instanceNames?: ReadonlySet<string>;
+}
 const allCallsCache: AllCallsCacheEntry[] = [];
 const ALL_CALLS_CACHE_MAX = 4;
 
 export function findAllCreateElementCalls(
   text: string,
-  aliases: AliasPartition | string[]
+  aliases: AliasPartition | string[],
+  directCalls?: DirectCallOptions
 ): CreateElementCall[] {
   const partition = asPartition(aliases);
   const aliasesKey =
-    partition.parens.join("|") + " " + partition.curried.join("|");
+    JSON.stringify([
+      partition.parens, partition.curried, partition.parensWithInlineChildren,
+      [...(directCalls?.componentNames ?? [])].sort(),
+      [...(directCalls?.instanceNames ?? [])].sort(),
+    ]);
   for (let i = allCallsCache.length - 1; i >= 0; i--) {
     if (
       allCallsCache[i].text === text &&
@@ -1726,7 +1757,7 @@ export function findAllCreateElementCalls(
       return hit.result;
     }
   }
-  const result = findAllCreateElementCallsImpl(text, partition);
+  const result = findAllCreateElementCallsImpl(text, partition, directCalls);
   allCallsCache.push({ text, aliasesKey, result });
   if (allCallsCache.length > ALL_CALLS_CACHE_MAX) {
     allCallsCache.shift();
@@ -1739,7 +1770,8 @@ export function findAllCreateElementCalls(
 
 function findAllCreateElementCallsImpl(
   text: string,
-  partition: AliasPartition
+  partition: AliasPartition,
+  directCalls?: DirectCallOptions
 ): CreateElementCall[] {
   const { masked } = getMaskedDoc(text);
   const results: CreateElementCall[] = [];
@@ -1923,6 +1955,66 @@ function findAllCreateElementCallsImpl(
         childrenEnd: parsed.closeBrace,
         propsBraceStart: parsed.openBrace,
         propsBraceEnd: parsed.closeBrace,
+      });
+    }
+  }
+
+  if (directCalls) {
+    const names = new Set([
+      ...(directCalls.componentNames ?? []),
+      ...(directCalls.instanceNames ?? []),
+    ]);
+    const existingStarts = new Set(results.map((call) => call.aliasStart));
+    const re = /(?<![A-Za-z0-9_.:])([A-Za-z_][A-Za-z0-9_]*)\s*(?=[({])/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(masked)) !== null) {
+      const name = m[1];
+      if (!names.has(name) || existingStarts.has(m.index)) {continue;}
+      // A function definition's parameter table is not a call. Inspect
+      // only the preceding token instead of rescanning the document prefix.
+      let before = m.index - 1;
+      while (before >= 0 && /\s/.test(masked[before])) {before--;}
+      if (masked.slice(Math.max(0, before - 7), before + 1) === "function" &&
+          !/[A-Za-z0-9_]/.test(masked[before - 8] ?? "")) {continue;}
+      let openBrace = m.index + m[0].length;
+      let fullEnd: number;
+      if (masked[openBrace] === "(") {
+        const closeParen = findMatchingParen(masked, openBrace);
+        if (closeParen === -1) {continue;}
+        const args = splitTopLevelArgs(masked, openBrace + 1, closeParen);
+        // Custom components may take a Fusion scope before props.
+        const arg = args.length === 1 ? args[0]
+          : args.length === 2 && directCalls.componentNames?.has(name)
+            ? args[1] : undefined;
+        if (!arg) {continue;}
+        openBrace = arg.start;
+        while (/\s/.test(masked[openBrace] ?? "") && openBrace < arg.end) {openBrace++;}
+        if (masked[openBrace] !== "{") {continue;}
+        const endBrace = findMatchingBrace(masked, openBrace);
+        if (endBrace === -1 || masked.slice(endBrace + 1, arg.end).trim()) {continue;}
+        fullEnd = closeParen + 1;
+      } else {
+        const closeBrace = findMatchingBrace(masked, openBrace);
+        if (closeBrace === -1) {continue;}
+        fullEnd = closeBrace + 1;
+      }
+      const closeBrace = findMatchingBrace(masked, openBrace);
+      if (closeBrace === -1) {continue;}
+      const entries = extractPropEntriesFromDocument(text, openBrace + 1, closeBrace);
+      const nameEntry = entries.find((entry) => entry.key === "Name");
+      const nameValue = nameEntry && text.slice(
+        openBrace + 1 + nameEntry.valueStart, openBrace + 1 + nameEntry.valueEnd
+      ).trim();
+      const nameProp = nameValue && /^(["'])([^\n]*?)\1$/.exec(nameValue)?.[2];
+      results.push({
+        className: name, isStringLiteralName: false,
+        isDirectComponentCall: true,
+        isDirectInstanceCall: directCalls.instanceNames?.has(name) ?? false,
+        nameProp: nameProp || undefined, alias: name,
+        aliasStart: m.index, fullEnd,
+        classNameStart: m.index, classNameEnd: m.index + name.length,
+        propsBraceStart: openBrace, propsBraceEnd: closeBrace,
+        childrenStart: openBrace + 1, childrenEnd: closeBrace,
       });
     }
   }

@@ -40,6 +40,7 @@ export class WorkspaceValidation implements vscode.Disposable {
   constructor() {
     this.disposables.push(
       vscode.languages.onDidChangeDiagnostics(() => this.scheduleRefresh()),
+      vscode.workspace.onDidChangeWorkspaceFolders(() => this.scheduleRefresh()),
       vscode.workspace.onDidChangeConfiguration((e) => {
         if (configChangeAffects(e, "workspaceValidation")) {
           this.scheduleRefresh();
@@ -54,7 +55,7 @@ export class WorkspaceValidation implements vscode.Disposable {
   }
 
   private scheduleRefresh(): void {
-    if (this.refreshTimer) clearTimeout(this.refreshTimer);
+    if (this.refreshTimer) {clearTimeout(this.refreshTimer);}
     // Aggressively debounced — diagnostic events fire constantly while
     // the user types and the totals don't change meaningfully per
     // keystroke.
@@ -67,7 +68,7 @@ export class WorkspaceValidation implements vscode.Disposable {
   private refresh(): void {
     if (!getConfig<boolean>("workspaceValidation.enabled", false)) {
       const wasNonZero =
-        this.summary.warnings + this.summary.errors + this.summary.info > 0;
+        this.summary.warnings + this.summary.errors + this.summary.info + this.summary.fileCount > 0;
       this.summary = { warnings: 0, errors: 0, info: 0, fileCount: 0 };
       if (wasNonZero) {
         this._onDidChange.fire();
@@ -79,13 +80,14 @@ export class WorkspaceValidation implements vscode.Disposable {
     let info = 0;
     let fileCount = 0;
     for (const [uri, diags] of vscode.languages.getDiagnostics()) {
+      if (!vscode.workspace.getWorkspaceFolder(uri)) {continue;}
       // Only count Lua/Luau files. The languageId isn't directly
       // available on the URI alone, so we filter by extension.
       const fsPath = uri.fsPath;
       if (!fsPath.endsWith(".lua") && !fsPath.endsWith(".luau")) {
         continue;
       }
-      if (diags.length === 0) continue;
+      if (diags.length === 0) {continue;}
       fileCount++;
       for (const d of diags) {
         switch (d.severity) {
@@ -113,8 +115,8 @@ export class WorkspaceValidation implements vscode.Disposable {
   }
 
   dispose(): void {
-    if (this.refreshTimer) clearTimeout(this.refreshTimer);
-    for (const d of this.disposables) d.dispose();
+    if (this.refreshTimer) {clearTimeout(this.refreshTimer);}
+    for (const d of this.disposables) {d.dispose();}
     this.disposables = [];
     this._onDidChange.dispose();
   }

@@ -14,6 +14,7 @@ import {
 import { WorkspaceIndex } from "./workspaceIndex";
 import { detectFrameworkForDocument } from "./activeFramework";
 import { getConfig } from "./configCompat";
+import { fusionSnippetBody } from "./fusionSnippets";
 
 // ============================================================================
 // Luix snippets — context-aware completion items
@@ -1204,7 +1205,7 @@ export class ElementSnippetCompletionProvider
     // / state / expr) for users who want a quieter completion list. The
     // workspace-component completions (a separate provider) are
     // unaffected.
-    if (!getConfig<boolean>("snippets.enabled", true)) return undefined;
+    if (!getConfig<boolean>("snippets.enabled", true)) {return undefined;}
 
     const text = document.getText();
     const offset = document.offsetAt(position);
@@ -1215,7 +1216,7 @@ export class ElementSnippetCompletionProvider
     // interiors as false; the partial's last char is at offset-1.
     if (offset > 0) {
       const mask = buildCodeMask(text);
-      if (mask[offset - 1] === false) return undefined;
+      if (mask[offset - 1] === false) {return undefined;}
     }
 
     // (1b) Computed-key context split. Inside an unclosed `[…]` we
@@ -1231,14 +1232,14 @@ export class ElementSnippetCompletionProvider
     while (identStart > 0 && /[A-Za-z0-9_]/.test(text[identStart - 1])) {
       identStart--;
     }
-    if (identStart === offset) return undefined;
+    if (identStart === offset) {return undefined;}
     const partial = text.slice(identStart, offset);
 
     // Skip member-access tails — `obj.eFrame` / `self:useState` should
     // not surface the snippets.
     if (identStart > 0) {
       const ch = text[identStart - 1];
-      if (ch === "." || ch === ":") return undefined;
+      if (ch === "." || ch === ":") {return undefined;}
     }
 
     // Enclosing-call + prop-key-position lookups — used only by
@@ -1264,7 +1265,7 @@ export class ElementSnippetCompletionProvider
     // `reactEvent` / computed-key starters are React-or-Roact
     // patterns; element snippets are framework-specific.
     const active = detectFrameworkForDocument(document).effective;
-    if (!active) return undefined;
+    if (!active) {return undefined;}
     const isReactish = active === "react" || active === "roact";
 
     const wordRange = new vscode.Range(
@@ -1319,7 +1320,7 @@ export class ElementSnippetCompletionProvider
       }
 
       function pushComputed(label: string, body: string, detail: string) {
-        if (!label.toLowerCase().startsWith(lowerPartial)) return;
+        if (!label.toLowerCase().startsWith(lowerPartial)) {return;}
         out.push(makeComputedItem(label, detail, body, wordRange, idx++));
       }
     }
@@ -1352,8 +1353,8 @@ export class ElementSnippetCompletionProvider
       // Per-kind framework gating + prop-key + computed-key
       // suppression. Computed-context split is enforced first so the
       // existing switch only sees the relevant kinds.
-      if (inComputed && snip.kind !== "computed") continue;
-      if (!inComputed && snip.kind === "computed") continue;
+      if (inComputed && snip.kind !== "computed") {continue;}
+      if (!inComputed && snip.kind === "computed") {continue;}
 
       let allowed: boolean;
       switch (snip.kind) {
@@ -1451,8 +1452,8 @@ export class ElementSnippetCompletionProvider
           allowed = !!snip.framework && snip.framework === active;
           break;
       }
-      if (!allowed) continue;
-      if (!snip.prefix.toLowerCase().startsWith(lowerPartial)) continue;
+      if (!allowed) {continue;}
+      if (!snip.prefix.toLowerCase().startsWith(lowerPartial)) {continue;}
       const item = new vscode.CompletionItem(
         snip.prefix,
         vscode.CompletionItemKind.Snippet
@@ -1464,7 +1465,10 @@ export class ElementSnippetCompletionProvider
       // muscle memory still works.
       item.sortText = `08_${String(idx).padStart(4, "0")}`;
       item.range = wordRange;
-      item.insertText = new vscode.SnippetString(snip.body.join("\n"));
+      const body = snip.body.join("\n");
+      item.insertText = new vscode.SnippetString(snip.framework === "fusion"
+        ? fusionSnippetBody(snip.prefix, body, text, offset)
+        : body);
       out.push(item);
       idx++;
     }

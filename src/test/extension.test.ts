@@ -1991,16 +1991,9 @@ suite("activeFramework — detectFromRequires (1.5.0)", () => {
     assert.strictEqual(detectFromRequires(text), undefined);
   });
 
-  test("require inside a string literal still matches the regex (acceptable)", () => {
-    // The detection regex is intentionally permissive — it matches
-    // `require(... <name> ...)` shape anywhere in the file, including
-    // inside strings. The cost of stricter parsing isn't worth it
-    // (false positives here mean "we picked a framework for a file
-    // that wasn't really using one", which is the same effective
-    // behaviour as the workspace fallback). This test pins the
-    // current behaviour so we notice if it ever changes.
+  test("require inside a string literal does not select a framework", () => {
     const text = `local s = "require(Packages.Vide)"\n`;
-    assert.strictEqual(detectFromRequires(text), "vide");
+    assert.strictEqual(detectFromRequires(text), undefined);
   });
 });
 

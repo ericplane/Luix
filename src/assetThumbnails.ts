@@ -44,6 +44,9 @@ interface CachedUrl {
   state?: ThumbnailState;
 }
 const thumbnailUrlCache = new Map<string, CachedUrl>();
+let cacheGeneration = 0;
+let purgePromise: Promise<void> | undefined;
+const activeWrites = new Set<Promise<void>>();
 const THUMBNAIL_TTL_OK = 24 * 60 * 60 * 1000;
 /**
  * Cache lifetime for *settled* failures (asset blocked, moderated, the
@@ -104,6 +107,7 @@ export async function fetchAssetThumbnail(
   size: string = THUMBNAIL_SIZE
 ): Promise<ThumbnailLookup> {
   const cacheKey = `${assetId}@${size}`;
+  const generation = cacheGeneration;
   const now = Date.now();
   const cached = thumbnailUrlCache.get(cacheKey);
   if (cached && cached.expires > now) {
@@ -114,6 +118,7 @@ export async function fetchAssetThumbnail(
     `?assetIds=${assetId}&size=${size}&format=Png&isCircular=false`;
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+    if (generation !== cacheGeneration) {return { url: null, state: "Unknown" };}
     if (!res.ok) {
       logWarn(
         `Thumbnail API returned ${res.status} for asset ${assetId}`
@@ -124,6 +129,7 @@ export async function fetchAssetThumbnail(
       data?: Array<{ state?: string; imageUrl?: string | null }>;
     };
     const entry = payload?.data?.[0];
+    if (generation !== cacheGeneration) {return { url: null, state: "Unknown" };}
     const state = (entry?.state ?? "Unknown") as ThumbnailState;
     if (state === "Completed" && entry?.imageUrl) {
       thumbnailUrlCache.set(cacheKey, {
@@ -143,6 +149,7 @@ export async function fetchAssetThumbnail(
     return cacheFailure(cacheKey, now, state);
   } catch (err) {
     logWarn(`Thumbnail API fetch failed for asset ${assetId}`, err);
+    if (generation !== cacheGeneration) {return { url: null, state: "Unknown" };}
     return cacheFailure(cacheKey, now, "Unknown");
   }
 }
@@ -216,18 +223,23 @@ function allKnownCacheDirs(
  */
 export async function ensureThumbnailFile(
   context: vscode.ExtensionContext,
-  assetId: string
+  assetId: string,
+  canWrite: () => boolean = () => true
 ): Promise<vscode.Uri | undefined> {
+  if (purgePromise) {await purgePromise;}
+  const generation = cacheGeneration;
+  const isCurrent = () => generation === cacheGeneration && canWrite();
+  if (!isCurrent()) {return undefined;}
   const cacheDir = getThumbnailCacheDir(context);
   const filePath = vscode.Uri.joinPath(cacheDir, `${assetId}.png`);
   try {
     await vscode.workspace.fs.stat(filePath);
-    return filePath;
+    return isCurrent() ? filePath : undefined;
   } catch {
     // Not cached yet — fall through to download.
   }
   const cdnUrl = await fetchAssetThumbnailUrl(assetId);
-  if (!cdnUrl) {
+  if (!cdnUrl || !isCurrent()) {
     return undefined;
   }
   try {
@@ -239,9 +251,18 @@ export async function ensureThumbnailFile(
       return undefined;
     }
     const buffer = new Uint8Array(await res.arrayBuffer());
-    await ensureCacheDirReady(cacheDir);
-    await vscode.workspace.fs.writeFile(filePath, buffer);
-    return filePath;
+    if (!isCurrent()) {return undefined;}
+    const write = (async () => {
+      await ensureCacheDirReady(cacheDir);
+      if (isCurrent()) {await vscode.workspace.fs.writeFile(filePath, buffer);}
+    })();
+    activeWrites.add(write);
+    try {
+      await write;
+    } finally {
+      activeWrites.delete(write);
+    }
+    return isCurrent() ? filePath : undefined;
   } catch (err) {
     logWarn(`Thumbnail download failed for asset ${assetId}`, err);
     return undefined;
@@ -305,8 +326,8 @@ export async function getCacheStats(
       continue;
     }
     for (const [name, type] of entries) {
-      if (type !== vscode.FileType.File) continue;
-      if (!name.endsWith(".png")) continue;
+      if (type !== vscode.FileType.File) {continue;}
+      if (!name.endsWith(".png")) {continue;}
       try {
         const stat = await vscode.workspace.fs.stat(
           vscode.Uri.joinPath(dir, name)
@@ -329,15 +350,29 @@ export async function getCacheStats(
 export async function purgeAllThumbnails(
   context: vscode.ExtensionContext
 ): Promise<void> {
-  for (const dir of allKnownCacheDirs(context)) {
-    try {
-      await vscode.workspace.fs.delete(dir, {
-        recursive: true,
-        useTrash: false,
-      });
-    } catch {
-      // Directory may not exist — fine.
+  if (purgePromise) {return purgePromise;}
+  cacheGeneration++;
+  thumbnailUrlCache.clear();
+  const purge = (async () => {
+    // Finish writes already dispatched before deleting their directories;
+    // downloads still in flight fail their generation check before writing.
+    await Promise.allSettled([...activeWrites]);
+    for (const dir of allKnownCacheDirs(context)) {
+      try {
+        await vscode.workspace.fs.delete(dir, {
+          recursive: true,
+          useTrash: false,
+        });
+      } catch {
+        // Directory may not exist — fine.
+      }
     }
+  })();
+  purgePromise = purge;
+  try {
+    await purge;
+  } finally {
+    if (purgePromise === purge) {purgePromise = undefined;}
   }
 }
 

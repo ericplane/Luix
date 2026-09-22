@@ -278,24 +278,17 @@ Cursor anywhere in an element call → 💡 lightbulb offers:
 
 Framework-aware. Emits parens form (`e(...)`) for React/Roact, curried
 form (`New "..." { [Children] = { ... } }`) for Fusion, inline children
-for Vide.
+for Vide. Existing Fusion 0.3 scope arguments and receivers are preserved,
+along with multiline text inside the selected element.
 
 ### Extract-to-component refactor
 
 Right-click an element call → **Luix: Extract to component…**
 
 ```lua
--- Before
-local function HomeScreen()
-    return e("Frame", { Size = ... }, {
-        e("Frame", { -- cursor here
-            Size = ...,
-            BackgroundColor3 = ...,
-        }, {
-            e("UICorner", { CornerRadius = UDim.new(0, 8) }),
-            e("TextLabel", { Text = "Welcome" }),
-        })
-    })
+-- Before (cursor inside the TextLabel call)
+local function HomeScreen(props)
+    return e("TextLabel", { Text = props.title })
 end
 ```
 
@@ -303,38 +296,29 @@ end
 -- After (HomeScreen.luau)
 local Card = require(script.Parent.Card)
 
-local function HomeScreen()
-    return e("Frame", { Size = ... }, {
-        e(Card, {})
-    })
+local function HomeScreen(props)
+    return e(Card, { __luix_e = e, __luix_props = props })
 end
 ```
 
 ```lua
 -- After (Card.luau, freshly written)
-local React = require(Packages.react)
-local e = React.createElement
-
-local function Card(props)
-    return e("Frame", {
-        Size = ...,
-        BackgroundColor3 = ...,
-    }, {
-        e("UICorner", { CornerRadius = UDim.new(0, 8) }),
-        e("TextLabel", { Text = "Welcome" }),
-    })
+local function Card(__luixInputs)
+    local e = __luixInputs.__luix_e
+    local props = __luixInputs.__luix_props
+    return e("TextLabel", { Text = props.title })
 end
 
 return Card
 ```
 
-Imports are pulled across **transitively** — `local e =
-React.createElement` brings `React` along too, so the new file
-compiles immediately. Anything the extracted code *doesn't* use stays
-behind. The new file is written in the same folder as the source; the
-component is invoked as `e(Card, {})` (React/Roact) or `Card {}`
-(Fusion/Vide — which compose components by direct call rather than via
-`New`/`create`).
+Captured inputs, including imports and reactive state, are passed from the
+existing call site so extraction does not recreate state or lose enclosing
+props. Generated input names avoid React's reserved `key` and `ref` props.
+Fusion 0.3 components also receive their existing scope as the first argument;
+Fusion/Vide invoke the component directly. The sibling file and source edit
+apply together. Selections with mutable captured variables, varargs or type
+dependencies that cannot be preserved safely are rejected before any edit.
 
 ### Class-name completion inside factory calls
 

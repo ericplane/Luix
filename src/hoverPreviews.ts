@@ -470,13 +470,13 @@ export function roundedRectPath(
   const parts: string[] = [];
   parts.push(`M ${x + tl} ${y}`);
   parts.push(`H ${x + w - tr}`);
-  if (tr > 0) parts.push(`A ${tr} ${tr} 0 0 1 ${x + w} ${y + tr}`);
+  if (tr > 0) {parts.push(`A ${tr} ${tr} 0 0 1 ${x + w} ${y + tr}`);}
   parts.push(`V ${y + h - br}`);
-  if (br > 0) parts.push(`A ${br} ${br} 0 0 1 ${x + w - br} ${y + h}`);
+  if (br > 0) {parts.push(`A ${br} ${br} 0 0 1 ${x + w - br} ${y + h}`);}
   parts.push(`H ${x + bl}`);
-  if (bl > 0) parts.push(`A ${bl} ${bl} 0 0 1 ${x} ${y + h - bl}`);
+  if (bl > 0) {parts.push(`A ${bl} ${bl} 0 0 1 ${x} ${y + h - bl}`);}
   parts.push(`V ${y + tl}`);
-  if (tl > 0) parts.push(`A ${tl} ${tl} 0 0 1 ${x + tl} ${y}`);
+  if (tl > 0) {parts.push(`A ${tl} ${tl} 0 0 1 ${x + tl} ${y}`);}
   parts.push("Z");
   return parts.join(" ");
 }

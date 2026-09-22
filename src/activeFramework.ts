@@ -1,9 +1,10 @@
 import * as vscode from "vscode";
-import { findAllCreateElementCalls } from "./parser";
+import { applyMask, buildCodeMask } from "./parser";
+import { findDocumentCalls } from "./documentCalls";
+import { luaTokens } from "./editSyntax";
 import {
   findFrameworkForAlias,
   FrameworkId,
-  getAliasPartition,
   getEnabledFrameworks,
 } from "./frameworks";
 import { getConfig, configChangeAffects } from "./configCompat";
@@ -101,10 +102,11 @@ function rememberDetection(
 // (intentionally — they're the same inputs).
 let _configListener: vscode.Disposable | undefined;
 function ensureConfigListener(): void {
-  if (_configListener) return;
+  if (_configListener) {return;}
   _configListener = vscode.workspace.onDidChangeConfiguration((e) => {
     if (
       configChangeAffects(e, "frameworks") ||
+      configChangeAffects(e, "activeFramework") ||
       configChangeAffects(e, "react.aliases") ||
       configChangeAffects(e, "roact.aliases") ||
       configChangeAffects(e, "fusion.aliases") ||
@@ -126,7 +128,11 @@ function ensureConfigListener(): void {
 let _workspaceFallback: FrameworkId | undefined;
 
 export function setWorkspaceFallback(fw: FrameworkId | undefined): void {
+  if (_workspaceFallback === fw) {
+    return;
+  }
   _workspaceFallback = fw;
+  docCache.clear();
 }
 
 export function getWorkspaceFallback(): FrameworkId | undefined {
@@ -134,43 +140,80 @@ export function getWorkspaceFallback(): FrameworkId | undefined {
 }
 
 // ----------------------------------------------------------------------
-// Detection regexes — module-level constants so we don't recompile
-// per invocation. The require regex is greedy enough to catch:
+// Import detection balances parentheses and masks comments / strings:
 //
 //   require(ReplicatedStorage.Packages.React)
 //   require(script.Parent.Vide)
 //   require(game:GetService("ReplicatedStorage").Packages.Fusion)
 //   require("@Packages/vide")
 //
-// Order of checks matters because "Roact" contains "react" — Roact
-// must be tested first.
+// Mixed imports retain the established framework preference order.
 // ----------------------------------------------------------------------
 
-const REQUIRE_ROACT_RE = /require\s*\([^)\n]*\bRoact\b/i;
-const REQUIRE_VIDE_RE = /require\s*\([^)\n]*\bvide\b/i;
-const REQUIRE_FUSION_RE = /require\s*\([^)\n]*\bfusion\b/i;
-const REQUIRE_REACT_RE = /require\s*\([^)\n]*\breact\b/i;
-
-function detectFromRequires(text: string): FrameworkId | undefined {
-  if (REQUIRE_ROACT_RE.test(text)) return "roact";
-  if (REQUIRE_VIDE_RE.test(text)) return "vide";
-  if (REQUIRE_FUSION_RE.test(text)) return "fusion";
-  if (REQUIRE_REACT_RE.test(text)) return "react";
-  return undefined;
+function detectFromRequires(
+  text: string,
+  enabled: ReadonlySet<FrameworkId> = new Set(["roact", "react", "fusion", "vide"])
+): FrameworkId | undefined {
+  const masked = applyMask(text, buildCodeMask(text));
+  const matches = new Set<FrameworkId>();
+  const requirePattern = /\brequire\s*\(/g;
+  for (const match of masked.matchAll(requirePattern)) {
+    const start = match.index!;
+    let previous = start - 1;
+    while (previous >= 0 && /\s/.test(masked[previous])) {
+      previous--;
+    }
+    if (previous >= 0 && /[.:]/.test(masked[previous])) {
+      continue;
+    }
+    const argumentStart = start + match[0].length;
+    let depth = 1;
+    let end = argumentStart;
+    for (; end < masked.length; end++) {
+      if (masked[end] === "(") {
+        depth++;
+      } else if (masked[end] === ")" && --depth === 0) {
+        break;
+      }
+    }
+    if (depth !== 0) {
+      continue;
+    }
+    // Only a literal module path needs its string contents. For instance
+    // paths, mask comments and nested string arguments such as GetService.
+    let argument = masked.slice(argumentStart, end);
+    try {
+      const tokens = luaTokens(text.slice(argumentStart, end), false);
+      if (tokens.length === 1 && tokens[0].kind === "string") {
+        argument = tokens[0].value;
+      }
+    } catch {
+      continue;
+    }
+    for (const fw of ["roact", "react", "fusion", "vide"] as FrameworkId[]) {
+      if (new RegExp(`\\b${fw}\\b`, "i").test(argument)) {
+        matches.add(fw);
+      }
+    }
+  }
+  return (["roact", "vide", "fusion", "react"] as FrameworkId[])
+    .find((fw) => matches.has(fw) && enabled.has(fw));
 }
 
 function detectFromCalls(text: string): FrameworkId | undefined {
-  const aliases = getAliasPartition();
-  const calls = findAllCreateElementCalls(text, aliases);
+  const calls = findDocumentCalls(text);
   for (const call of calls) {
+    if (call.isDirectInstanceCall) {
+      return "vide";
+    }
     // The parser hands us the resolved alias. Reading it back out of
     // the text at `aliasStart` no longer works: that offset points at
     // the receiver for Fusion 0.3's `scope:New "Frame" { … }`, and
     // `scope` owns no framework.
     const alias = call.alias;
-    if (!alias) continue;
+    if (!alias) {continue;}
     const fw = findFrameworkForAlias(alias);
-    if (fw) return fw.id;
+    if (fw) {return fw.id;}
   }
   return undefined;
 }
@@ -190,17 +233,19 @@ export function detectFrameworkForDocument(
   ensureConfigListener();
   const key = cacheKey(doc);
   const cached = docCache.get(key);
-  if (cached) return cached;
+  if (cached) {return cached;}
 
   const override = readOverride();
   const text = doc.getText();
+  const enabled = new Set(getEnabledFrameworks().map((fw) => fw.id));
 
   // Run each pure-text detector ONCE and remember which one matched —
   // previously we re-ran `detectFromRequires` just to label the source
   // string, doubling the full-document scan on every cache miss.
-  const fromRequires = detectFromRequires(text);
+  const fromRequires = detectFromRequires(text, enabled);
   const fromCalls = fromRequires ? undefined : detectFromCalls(text);
-  const detected = fromRequires ?? fromCalls;
+  const candidate = fromRequires ?? fromCalls;
+  const detected = candidate && enabled.has(candidate) ? candidate : undefined;
 
   let effective: FrameworkId | undefined;
   let source: DocumentDetection["source"];
@@ -210,7 +255,7 @@ export function detectFrameworkForDocument(
   } else if (detected) {
     effective = detected;
     source = fromRequires ? "import" : "call";
-  } else if (_workspaceFallback) {
+  } else if (_workspaceFallback && enabled.has(_workspaceFallback)) {
     effective = _workspaceFallback;
     source = "workspace";
   } else {
@@ -292,6 +337,7 @@ export async function inferWorkspaceFramework(
     fusion: 0,
     vide: 0,
   };
+  const enabled = new Set(getEnabledFrameworks().map((fw) => fw.id));
   for (const uri of sample) {
     let text: string;
     try {
@@ -300,14 +346,13 @@ export async function inferWorkspaceFramework(
     } catch {
       continue;
     }
-    const fw = detectFromRequires(text) ?? detectFromCalls(text);
-    if (fw) counts[fw]++;
+    const fw = detectFromRequires(text, enabled) ?? detectFromCalls(text);
+    if (fw && enabled.has(fw)) {
+      counts[fw]++;
+    }
   }
-  // Pick the framework with the highest count. Ties broken by
-  // iteration order — `roact` BEFORE `react` to match
-  // `detectFromRequires`'s priority (since "Roact" contains "react",
-  // Roact is the more specific match). Previously this iterated
-  // `react` first which contradicted the per-file priority comment.
+  // Pick the framework with the highest count, keeping a stable priority
+  // when workspace files use several frameworks equally often.
   let best: FrameworkId | undefined;
   let bestCount = 0;
   for (const fw of ["roact", "react", "fusion", "vide"] as FrameworkId[]) {

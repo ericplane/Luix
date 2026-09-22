@@ -27,6 +27,8 @@ import { WorkspaceIndex } from "./workspaceIndex";
 import { buildImportPath } from "./codeActions";
 import { getAutoImportConfig } from "./config";
 import { detectFrameworkForDocument } from "./activeFramework";
+import { documentDirectCalls } from "./documentCalls";
+import { luaTokens } from "./editSyntax";
 
 // ----------------------------------------------------------------------
 // Computed-key fast-path regexes
@@ -85,7 +87,10 @@ export class ReactLuauPropsCompletionProvider
     // (which is how this used to work — the React.Event fast-path
     // re-detected after falling through) was a real cost on big files.
     const aliases = getAliasPartition();
-    const directTargets = this.workspaceIndex.knownDirectCallTargets();
+    const directCalls = documentDirectCalls(text, this.workspaceIndex);
+    const directTargets = new Set([
+      ...(directCalls.componentNames ?? []), ...(directCalls.instanceNames ?? []),
+    ]);
     const detected = findEnclosingPropsCall(
       text,
       cursorOffset,
@@ -95,6 +100,8 @@ export class ReactLuauPropsCompletionProvider
     if (!detected) {
       return undefined;
     }
+    const customDirect = detected.isDirectComponentCall === true &&
+      directCalls.componentNames?.has(detected.className) === true;
 
     // Fast-path: per-framework computed-key event / change / out
     // key completions inside a props table. The cursor must be in
@@ -156,7 +163,8 @@ export class ReactLuauPropsCompletionProvider
       const baseClass = await resolveEffectiveClass(
         detected.className,
         document,
-        this.workspaceIndex
+        this.workspaceIndex,
+        customDirect
       );
       if (!baseClass) {
         return undefined;
@@ -209,7 +217,8 @@ export class ReactLuauPropsCompletionProvider
     let props = await getPropsForClass(
       detected.className,
       document,
-      this.workspaceIndex
+      this.workspaceIndex,
+      customDirect
     );
     if (!props || props.length === 0) {
       return undefined;
@@ -230,6 +239,7 @@ export class ReactLuauPropsCompletionProvider
       detected.alias && findFrameworkForAlias(detected.alias);
     if (
       !framework &&
+      !customDirect &&
       detected.isDirectComponentCall &&
       classHierarchy[detected.className]
     ) {
@@ -422,7 +432,7 @@ export class ClassNameCompletionProvider
       // `closeParen` is only ever set when the paren is ours to
       // rewrite — the call's own `)` for the parens form, the name
       // stage's `)` for `New("Fr|")`.
-      if (ctx.closeParen !== -1 && !ctx.hasPropsAfter) {
+      if (ctx.closeParen !== -1 && !ctx.hasPropsAfter && !ctx.preserveSuffix) {
         replaceEnd = ctx.closeParen + 1;
       }
     }
@@ -443,12 +453,13 @@ export class ClassNameCompletionProvider
     const openParenBeforeString =
       ctx.callShape === "parens" || !!ctx.nameStageParens;
     const tailComma =
-      !ctx.hasPropsAfter &&
-      isInListElementContext(text, ctx.stringStart, openParenBeforeString)
+      !ctx.hasPropsAfter && !ctx.preserveSuffix &&
+      isInListElementContext(text, ctx.stringStart, openParenBeforeString) &&
+      !hasFollowingListSeparator(text, replaceEnd)
         ? ",$0"
         : "";
     const trailing = (() => {
-      if (ctx.hasPropsAfter) {
+      if (ctx.hasPropsAfter || ctx.preserveSuffix) {
         // Just re-emit the closing quote — props table already exists.
         return q;
       }
@@ -513,18 +524,18 @@ function findCallAliasOffset(
 ): number | undefined {
   let i = ctx.stringStart - 1;
   // Skip whitespace between the alias's punctuation and the string.
-  while (i >= 0 && /[ \t]/.test(text[i])) i--;
+  while (i >= 0 && /[ \t]/.test(text[i])) {i--;}
   if (ctx.callShape === "parens" || ctx.nameStageParens) {
     // The `(` sits between alias and string — and for Fusion 0.3's
     // `New(scope, "Fr|")` there are leading arguments to step over too.
     i = skipBackOverLeadingArgs(text, i);
-    if (text[i] !== "(") return undefined;
+    if (text[i] !== "(") {return undefined;}
     i--;
-    while (i >= 0 && /[ \t]/.test(text[i])) i--;
+    while (i >= 0 && /[ \t]/.test(text[i])) {i--;}
   }
   // Walk back across the alias identifier — dotted forms like
   // `React.createElement` / `Fusion.New`, plus any `scope:` receiver.
-  while (i >= 0 && /[A-Za-z0-9_.:]/.test(text[i])) i--;
+  while (i >= 0 && /[A-Za-z0-9_.:]/.test(text[i])) {i--;}
   const aliasStart = i + 1;
   return aliasStart < ctx.stringStart ? aliasStart : undefined;
 }
@@ -537,7 +548,7 @@ function findCallAliasOffset(
  * `i` unchanged when there's nothing to skip.
  */
 function skipBackOverLeadingArgs(text: string, from: number): number {
-  if (text[from] !== ",") return from;
+  if (text[from] !== ",") {return from;}
   let i = from;
   while (i >= 0 && text[i] !== "(" && text[i] !== "\n" && text[i] !== ")") {
     i--;
@@ -565,11 +576,37 @@ function isPrecededByListElementSeparator(
   text: string,
   pos: number
 ): boolean {
+  const mask = buildCodeMask(text);
   let i = pos - 1;
-  while (i >= 0 && /\s/.test(text[i])) i--;
-  if (i < 0) return false;
+  while (i >= 0 && (!mask[i] || /\s/.test(text[i]))) {i--;}
+  if (i < 0) {return false;}
   const prev = text[i];
-  return prev === "{" || prev === ",";
+  if (prev !== "{" && prev !== ",") {return false;}
+  // A comma also separates function arguments and assignment values.
+  // Only a nearest enclosing table constructor permits a trailing comma.
+  const stack: string[] = [];
+  const tokens = /[A-Za-z_]\w*|[(){}\[\]]/g;
+  let token: RegExpExecArray | null;
+  while ((token = tokens.exec(text)) && token.index < pos) {
+    if (!mask[token.index]) {continue;}
+    const c = token[0];
+    if (c === "(" || c === "{" || c === "[" ||
+        c === "function" || c === "if" || c === "do" || c === "repeat") {
+      stack.push(c);
+    } else if (c === ")" || c === "}" || c === "]" || c === "end" || c === "until") {
+      stack.pop();
+    }
+  }
+  return stack[stack.length - 1] === "{";
+}
+
+function hasFollowingListSeparator(text: string, offset: number): boolean {
+  const mask = buildCodeMask(text);
+  let i = offset;
+  while (i < text.length && (!mask[i] || /\s/.test(text[i]))) {
+    i++;
+  }
+  return text[i] === "," || text[i] === ";";
 }
 
 /**
@@ -586,17 +623,17 @@ function isInListElementContext(
 ): boolean {
   let i = stringStart - 1;
   // Skip whitespace between the alias punctuation and the opening quote.
-  while (i >= 0 && /[ \t]/.test(text[i])) i--;
+  while (i >= 0 && /[ \t]/.test(text[i])) {i--;}
   // Step over the `(` (and any leading `scope,` argument) when present.
   if (openParenBeforeString) {
     i = skipBackOverLeadingArgs(text, i);
-    if (text[i] !== "(") return false;
+    if (text[i] !== "(") {return false;}
     i--;
-    while (i >= 0 && /[ \t]/.test(text[i])) i--;
+    while (i >= 0 && /[ \t]/.test(text[i])) {i--;}
   }
   // Skip the alias identifier — dotted forms like `React.createElement`,
   // and any `scope:` receiver Fusion 0.3 puts in front of it.
-  while (i >= 0 && /[A-Za-z0-9_.:]/.test(text[i])) i--;
+  while (i >= 0 && /[A-Za-z0-9_.:]/.test(text[i])) {i--;}
   // `i` now points just before the alias's first char.
   return isPrecededByListElementSeparator(text, i + 1);
 }
@@ -635,20 +672,20 @@ export class FactoryOpenParenCompletionProvider
     // alias's `(` — possibly with a paired `)` immediately after if
     // the editor auto-paired the bracket.
     const aliases = getAliasPartition();
-    if (aliases.parens.length === 0) return undefined;
+    if (aliases.parens.length === 0) {return undefined;}
     // Walk back from cursor: must be `(`.
-    if (text[offset - 1] !== "(") return undefined;
+    if (text[offset - 1] !== "(") {return undefined;}
     // Suppress when the `(` is inside a string literal — `"some(text"`
     // would otherwise look indistinguishable from a real `e(` call to
     // this walker. The code mask marks string interiors as `false`.
     const mask = buildCodeMask(text);
-    if (mask[offset - 1] === false) return undefined;
+    if (mask[offset - 1] === false) {return undefined;}
     // Walk further back over the alias identifier (allow dotted).
     let i = offset - 2;
     const end = i + 1;
-    while (i >= 0 && /[A-Za-z0-9_.]/.test(text[i])) i--;
+    while (i >= 0 && /[A-Za-z0-9_.]/.test(text[i])) {i--;}
     const alias = text.slice(i + 1, end);
-    if (!aliases.parens.includes(alias)) return undefined;
+    if (!aliases.parens.includes(alias)) {return undefined;}
     const aliasOffset = i + 1;
 
     // Suppress when this call sits at a prop-key slot of an outer
@@ -683,7 +720,7 @@ export class FactoryOpenParenCompletionProvider
       afterCursor === "" ||
       afterCursor === "\n" ||
       autoPairedCloseParen;
-    if (!isEmptyAfter) return undefined;
+    if (!isEmptyAfter) {return undefined;}
 
     // Range covers from the cursor to the auto-paired `)` (if present)
     // so accepting overwrites both rather than leaving a stray `)`.
@@ -698,7 +735,8 @@ export class FactoryOpenParenCompletionProvider
     // table constructor (preceding non-whitespace char is `{` or `,`).
     // The alias starts at `i + 1` (where the loop above left off), so
     // we look at what precedes that.
-    const tailComma = isPrecededByListElementSeparator(text, i + 1)
+    const tailComma = isPrecededByListElementSeparator(text, i + 1) &&
+      !hasFollowingListSeparator(text, replaceEnd)
       ? ",$0"
       : "";
 
@@ -765,7 +803,11 @@ export class FactoryComponentCompletionProvider
       identStart--;
     }
     const partial = text.slice(identStart, offset);
-    if (partial.length === 0) return undefined;
+    if (partial.length === 0) {return undefined;}
+    let identEnd = offset;
+    while (identEnd < text.length && /[A-Za-z0-9_]/.test(text[identEnd])) {
+      identEnd++;
+    }
 
     // Suppress when the cursor is inside a string literal — typing
     // `Text = "WEEKLY m|"` shouldn't surface workspace components
@@ -774,20 +816,20 @@ export class FactoryComponentCompletionProvider
     // sits immediately before the cursor.
     if (identStart > 0) {
       const mask = buildCodeMask(text);
-      if (mask[offset - 1] === false) return undefined;
+      if (mask[offset - 1] === false) {return undefined;}
     }
     // Suppress when the cursor is inside an unclosed `[` — typing
     // `[Reac|` to start `[React.Event.Activated]` shouldn't surface
     // workspace components like `ReactCharm` / `ReactRoblox`. The
     // user is writing a key expression, not invoking a component.
-    if (isInsideComputedKey(document, position)) return undefined;
+    if (isInsideComputedKey(document, position)) {return undefined;}
 
     // Skip when the partial is the tail of a member access (`obj.MyComp`,
     // `self:MyComp`, `Mod.SubMod.MyComp`). The user isn't *invoking* the
     // component there — they're either referencing it or calling a method.
     if (identStart > 0) {
       const before = text[identStart - 1];
-      if (before === "." || before === ":") return undefined;
+      if (before === "." || before === ":") {return undefined;}
     }
 
     // Suppress when the cursor is inside a Luau `type X = …` /
@@ -796,7 +838,8 @@ export class FactoryComponentCompletionProvider
     // are TYPE positions, not value positions — surfacing workspace
     // components there is meaningless and pollutes the dropdown when
     // typing type-alias names that share a prefix with components.
-    if (isInTypeDeclaration(document, position)) return undefined;
+    if (isInTypeDeclaration(document, position)) {return undefined;}
+    if (!isComponentValuePosition(text, identStart)) {return undefined;}
 
     // File-context gate: workspace-component suggestions only fire in
     // files where Luix has detected an active framework — same
@@ -806,7 +849,7 @@ export class FactoryComponentCompletionProvider
     // dropdown stays quiet.
     const aliases = getAliasPartition();
     const activeFw = detectFrameworkForDocument(document).effective;
-    if (!activeFw) return undefined;
+    if (!activeFw) {return undefined;}
 
     // Suppress when the cursor is at a prop-*key* slot inside a props
     // table (`e("Frame", { Name = ..., eTextButt|` ). The user is
@@ -820,20 +863,26 @@ export class FactoryComponentCompletionProvider
       aliases,
       this.workspaceIndex.knownDirectCallTargets()
     );
+    let directChildSlot = false;
     if (enclosing && isAtPropKeyPosition(document, position)) {
-      const framework = enclosing.alias
+      let framework = enclosing.alias
         ? findFrameworkForAlias(enclosing.alias)
         : undefined;
+      if (!framework && enclosing.isDirectComponentCall &&
+          documentDirectCalls(text, this.workspaceIndex).instanceNames?.has(enclosing.className)) {
+        framework = FRAMEWORKS.vide;
+      }
       if (!framework || framework.childrenLayout !== "inline") {
         return undefined;
       }
+      directChildSlot = activeFw === "vide";
     }
 
     // Match workspace components by case-insensitive prefix so the
     // dropdown only carries plausibly-relevant entries. Keeps us from
     // dumping all N workspace components on every identifier keystroke.
     const components = this.workspaceIndex.knownComponentNames();
-    if (components.size === 0) return undefined;
+    if (components.size === 0) {return undefined;}
     const matches: string[] = [];
     const lowerPartial = partial.toLowerCase();
     for (const name of components) {
@@ -841,17 +890,15 @@ export class FactoryComponentCompletionProvider
         matches.push(name);
       }
     }
-    if (matches.length === 0) return undefined;
+    if (matches.length === 0) {return undefined;}
     matches.sort();
 
-    // Figure out which call shape to materialise. The parens-form
-    // factories (React, Roact) require `<alias>(<partial>|` — if we're
-    // there, that wins. Otherwise we fall back to the direct-call
-    // (Vide/Fusion) shape, if a curried framework is enabled.
+    // Expand explicit factory arguments and known Vide child slots.
+    // Other value expressions can refer to the component function itself.
     const ctx =
-      detectReactParensContext(text, identStart, offset) ??
-      detectDirectCallContext(text, identStart, offset);
-    if (!ctx) return undefined;
+      detectReactParensContext(text, identStart, identEnd) ??
+      detectDirectCallContext(text, identStart, identEnd, directChildSlot);
+    if (!ctx) {return undefined;}
 
     const range = new vscode.Range(
       document.positionAt(ctx.identStart),
@@ -1007,8 +1054,8 @@ function detectReactParensContext(
 ): CallShapeContext | undefined {
   // Look back across optional whitespace, then expect `(`.
   let i = identStart - 1;
-  while (i >= 0 && /[ \t]/.test(text[i])) i--;
-  if (text[i] !== "(") return undefined;
+  while (i >= 0 && /[ \t]/.test(text[i])) {i--;}
+  if (text[i] !== "(") {return undefined;}
   const parenIdx = i;
 
   // Alias identifier (possibly dotted) directly before the `(`.
@@ -1017,31 +1064,32 @@ function detectReactParensContext(
     aliasStart--;
   }
   const alias = text.slice(aliasStart + 1, parenIdx);
-  if (alias.length === 0) return undefined;
-  if (!getAliasPartition().parens.includes(alias)) return undefined;
+  if (alias.length === 0) {return undefined;}
+  if (!getAliasPartition().parens.includes(alias)) {return undefined;}
 
   // Append `,$0` after the closing `})` only when this call sits as a
   // list element of a parent table — otherwise a trailing comma after
   // a top-level / assigned / return-value call would be a syntax
   // error. Same heuristic as the string-literal class-name path.
-  const tailComma = isPrecededByListElementSeparator(text, aliasStart + 1)
+  const tailComma = (end: number) => isPrecededByListElementSeparator(text, aliasStart + 1) &&
+    !hasFollowingListSeparator(text, end)
     ? ",$0"
     : "";
 
   // Inspect what follows the cursor to decide between full expansion,
   // identifier-only, and bail-out.
   let after = cursor;
-  while (after < text.length && /[ \t]/.test(text[after])) after++;
+  while (after < text.length && /[ \t]/.test(text[after])) {after++;}
   const nextChar = text[after] ?? "";
   if (nextChar === ")") {
     return {
       identStart,
       replaceEnd: after + 1,
-      trailing: `, {\n\t$1,\n})${tailComma}`,
+      trailing: `, {\n\t$1,\n})${tailComma(after + 1)}`,
       shapeLabel: alias + "(...)",
     };
   }
-  if (nextChar === ",") {
+  if (nextChar === "," || nextChar === "\n" || nextChar === "\r") {
     return {
       identStart,
       replaceEnd: cursor,
@@ -1049,11 +1097,11 @@ function detectReactParensContext(
       shapeLabel: alias + "(...)",
     };
   }
-  if (nextChar === "" || nextChar === "\n" || nextChar === "\r") {
+  if (nextChar === "") {
     return {
       identStart,
       replaceEnd: cursor,
-      trailing: `, {\n\t$1,\n})${tailComma}`,
+      trailing: `, {\n\t$1,\n})${tailComma(cursor)}`,
       shapeLabel: alias + "(...)",
     };
   }
@@ -1061,9 +1109,9 @@ function detectReactParensContext(
 }
 
 /**
- * Vide/Fusion case: bare `<partial>|` at a value-expression position.
- * Inserts the curried form `Name {\n\t$1,\n}` because it's the
- * idiomatic shape in both frameworks. Suppressed when:
+ * Bare component identifier at a value-expression position. Only a
+ * known Vide child slot expands to `Name {\n\t$1,\n}`; other positions
+ * receive a reference to the component function. Suppressed when:
  *
  *   - Neither Vide nor Fusion is enabled (no point — direct calls
  *     aren't a React/Roact idiom).
@@ -1074,14 +1122,15 @@ function detectReactParensContext(
 function detectDirectCallContext(
   text: string,
   identStart: number,
-  cursor: number
+  cursor: number,
+  expandChild: boolean
 ): CallShapeContext | undefined {
   const frameworks = getEnabledFrameworks();
   const hasCurried = frameworks.some((f) => f.callShape === "curried");
-  if (!hasCurried) return undefined;
+  if (!hasCurried) {return undefined;}
 
   let after = cursor;
-  while (after < text.length && /[ \t]/.test(text[after])) after++;
+  while (after < text.length && /[ \t]/.test(text[after])) {after++;}
   const nextChar = text[after] ?? "";
   if (
     nextChar === "(" ||
@@ -1093,10 +1142,18 @@ function detectDirectCallContext(
     return undefined;
   }
 
+  // Exports, callbacks and variable assignments can refer to the component
+  // function itself. Only a known Vide child slot proves an invocation is
+  // wanted; accepting a normal reference must not silently call it.
+  if (!expandChild) {
+    return { identStart, replaceEnd: cursor, trailing: "", shapeLabel: "reference" };
+  }
+
   // Trailing-comma decision: bare `Comp {…}` inside a parent table
   // ought to end with `,` so a following sibling doesn't trip a parse
   // error. Skipped for top-level / return / assignment positions.
-  const tailComma = isPrecededByListElementSeparator(text, identStart)
+  const tailComma = isPrecededByListElementSeparator(text, identStart) &&
+    !hasFollowingListSeparator(text, cursor)
     ? ",$0"
     : "";
 
@@ -1106,6 +1163,52 @@ function detectDirectCallContext(
     trailing: ` {\n\t$1,\n}${tailComma}`,
     shapeLabel: "curried",
   };
+}
+
+/** Restrict component suggestions to value expressions, excluding signatures
+ * and type syntax while the user is still typing an incomplete declaration. */
+function isComponentValuePosition(text: string, identStart: number): boolean {
+  let tokens: ReturnType<typeof luaTokens>;
+  try {
+    tokens = luaTokens(text.slice(0, identStart), false);
+  } catch {
+    return false;
+  }
+  let declaring = false;
+  let awaitingSignature = false;
+  let inType = false;
+  const delimiters: Array<{ value: string; signature: boolean }> = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.kind === "string") {continue;}
+    const value = token.value;
+    if (["return", "local", "for", "while", "if", "do", "repeat", "end", ";"].includes(value)) {
+      inType = false;
+      declaring = value === "local" || value === "for";
+    }
+    if (value === "type" && tokens[i + 1]?.kind === "word") {inType = true;}
+    if (value === "::") {inType = true;}
+    if (value === "=" || value === "in") {declaring = false;}
+    if (value === "function") {awaitingSignature = true;}
+    if (["(", "{", "["].includes(value)) {
+      delimiters.push({ value, signature: value === "(" && awaitingSignature });
+      if (value === "(") {awaitingSignature = false;}
+    } else if ([")", "}", "]"].includes(value)) {
+      const closed = delimiters.pop();
+      if (closed?.signature) {
+        declaring = false;
+        if (tokens[i + 1]?.value === ":") {inType = true;}
+      }
+    }
+  }
+  if (declaring || awaitingSignature || inType || delimiters.some((entry) => entry.signature)) {
+    return false;
+  }
+  const previous = tokens[tokens.length - 1]?.value;
+  return previous !== undefined && new Set([
+    "=", "return", "(", "{", ",", ";", "and", "or", "then", "else",
+    "+", "-", "*", "/", "%", "^", "..", "==", "~=", "<", ">", "<=", ">=",
+  ]).has(previous);
 }
 
 // ============================================================================
@@ -1178,7 +1281,8 @@ export type UserPropsEntry =
 export async function getPropsForClass(
   className: string,
   document?: vscode.TextDocument,
-  workspaceIndex?: WorkspaceIndex
+  workspaceIndex?: WorkspaceIndex,
+  preferComponent = false
 ): Promise<string[] | undefined> {
   const userMap = getConfig<Record<string, UserPropsEntry>>("props", {}) ?? {};
   const aliases = getAliasPartition();
@@ -1189,7 +1293,8 @@ export async function getPropsForClass(
     workspaceIndex,
     aliases,
     new Set(),
-    0
+    0,
+    preferComponent
   );
 }
 
@@ -1200,7 +1305,8 @@ async function resolveProps(
   workspaceIndex: WorkspaceIndex | undefined,
   aliases: AliasPartition,
   visited: Set<string>,
-  depth: number
+  depth: number,
+  preferComponent = false
 ): Promise<string[] | undefined> {
   if (depth > 8 || visited.has(className)) {
     return undefined;
@@ -1220,15 +1326,19 @@ async function resolveProps(
     );
   }
 
-  // 2. Built-in defaults win outright.
-  if (defaultPropsMap[className]) {
+  // Direct component bindings can shadow a Roblox constructor name.
+  let info = preferComponent && document
+    ? scanDocument(document.getText(), aliases).get(className) : undefined;
+  if (preferComponent && !info && workspaceIndex) {
+    info = await workspaceIndex.findComponent(className, document?.uri.toString());
+  }
+  // Quoted host classes always keep the built-in defaults.
+  if (!info && defaultPropsMap[className]) {
     return defaultPropsMap[className];
   }
 
   // 3. Custom component: same-file inference first, then workspace-wide.
-  let info = document
-    ? scanDocument(document.getText(), aliases).get(className)
-    : undefined;
+  info ??= document ? scanDocument(document.getText(), aliases).get(className) : undefined;
   if (!info && workspaceIndex) {
     info = await workspaceIndex.findComponent(
       className,
@@ -1306,9 +1416,10 @@ async function resolveUserEntry(
 export async function resolveEffectiveClass(
   className: string,
   document: vscode.TextDocument | undefined,
-  workspaceIndex: WorkspaceIndex | undefined
+  workspaceIndex: WorkspaceIndex | undefined,
+  preferComponent = false
 ): Promise<string | undefined> {
-  if (defaultPropsMap[className]) {
+  if (!preferComponent && defaultPropsMap[className]) {
     return className;
   }
   if (!document) {
@@ -1539,8 +1650,8 @@ export function isAtPropKeyPosition(
       line === position.line ? position.character - 1 : lineText.length - 1;
     for (let i = startCol; i >= 0; i--) {
       const c = lineText[i];
-      if (c === "=") return false; // value position
-      if (c === "," || c === ";" || c === "{") return true;
+      if (c === "=") {return false;} // value position
+      if (c === "," || c === ";" || c === "{") {return true;}
     }
   }
   // No boundary found — assume key position (top of file, no `=`).
@@ -1569,8 +1680,8 @@ export function isInsideComputedKey(
   let depth = 0;
   for (let i = 0; i < position.character && i < line.length; i++) {
     const c = line[i];
-    if (c === "[") depth++;
-    else if (c === "]") depth--;
+    if (c === "[") {depth++;}
+    else if (c === "]") {depth--;}
   }
   return depth > 0;
 }

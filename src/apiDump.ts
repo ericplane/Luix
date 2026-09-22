@@ -53,7 +53,7 @@ export function maybeAugmentFromApiDump(
   }
   void (async () => {
     const dump = await loadDump(context);
-    if (!dump || mergeApplied) return;
+    if (!dump || mergeApplied) {return;}
     mergeIntoBuiltins(dump);
     mergeApplied = true;
   })();
@@ -82,7 +82,7 @@ async function loadDump(
     const res = await fetch(API_DUMP_URL, {
       signal: AbortSignal.timeout(15_000),
     });
-    if (!res.ok) return undefined;
+    if (!res.ok) {return undefined;}
     const text = await res.text();
     // Validate it parses before writing.
     const parsed = JSON.parse(text) as ApiDump;
@@ -116,25 +116,25 @@ async function loadDump(
  * `Hidden`, or `ReadOnly` — those would be noise in a completion list.
  */
 function mergeIntoBuiltins(dump: ApiDump): void {
-  if (!dump.Classes) return;
+  if (!dump.Classes) {return;}
   const byName = new Map<string, ApiClass>();
   for (const cls of dump.Classes) {
-    if (cls?.Name) byName.set(cls.Name, cls);
+    if (cls?.Name) {byName.set(cls.Name, cls);}
   }
   let mutated = false;
   for (const className of Object.keys(defaultPropsMap)) {
     const cls = byName.get(className);
-    if (!cls?.Members) continue;
+    if (!cls?.Members) {continue;}
     const hierarchyEntry = classHierarchy[className];
-    if (!hierarchyEntry) continue;
+    if (!hierarchyEntry) {continue;}
     // Dedupe against the *flattened* prop list (which includes inherited
     // props from synthetic intermediate classes like `GuiObject`).
     // Otherwise we'd re-add inherited props onto every subclass.
     const existing = new Set(defaultPropsMap[className]);
     for (const m of cls.Members) {
-      if (m.MemberType !== "Property") continue;
-      if (!m.Name) continue;
-      if (existing.has(m.Name)) continue;
+      if (m.MemberType !== "Property") {continue;}
+      if (!m.Name) {continue;}
+      if (existing.has(m.Name)) {continue;}
       // `Parent` is a real Instance property in the dump, but Luix
       // admits it per framework (`FrameworkSpec.parentAsProp`) rather
       // than as a class prop — merging it here would offer it to

@@ -375,9 +375,7 @@ suite("e2e diagnostics — Parent as a table key", () => {
     assert.ok(od.message.includes("Roact mounts through a root or portal"), od.message);
   });
 
-  test("Vide direct instance call `ScreenGui({ … })` is not prop-validated at all", async () => {
-    // `NotARealProp` would be flagged on a scanned host-class call; its
-    // absence proves the direct-call shape never reaches the validator.
+  test("Vide direct instance call `ScreenGui({ … })` validates props and accepts Parent", async () => {
     const diags = await luixDiagnostics(
       [
         "local gui = ScreenGui({",
@@ -386,7 +384,7 @@ suite("e2e diagnostics — Parent as a table key", () => {
         "})",
       ].join("\n")
     );
-    assert.deepStrictEqual(unknownPropKeys(diags), []);
+    assert.deepStrictEqual(unknownPropKeys(diags), ["NotARealProp"]);
   });
 });
 

@@ -7,6 +7,7 @@ import {
 import { classHierarchy, flattenClassEvents } from "./data";
 import { getAliasPartition } from "./frameworks";
 import { getConfig } from "./configCompat";
+import { luaValueEnd } from "./editSyntax";
 
 // ============================================================================
 // Sort props by category — code action + on-save formatter.
@@ -346,7 +347,7 @@ function extractSortableEntries(body: string): SortableEntry[] {
   const entries: SortableEntry[] = [];
   let i = 0;
   const pushPositional = (start: number) => {
-    let end = skipValueExpression(masked, start);
+    let end = luaValueEnd(body, start);
     if (end === start) {
       // Nothing consumable here (a stray closer) — step over it.
       end = start + 1;
@@ -370,8 +371,8 @@ function extractSortableEntries(body: string): SortableEntry[] {
       let depth = 1;
       let j = i + 1;
       while (j < masked.length && depth > 0) {
-        if (masked[j] === "[") depth++;
-        else if (masked[j] === "]") depth--;
+        if (masked[j] === "[") {depth++;}
+        else if (masked[j] === "]") {depth--;}
         j++;
       }
       key = body.slice(i, j);
@@ -401,45 +402,10 @@ function extractSortableEntries(body: string): SortableEntry[] {
     while (i < masked.length && /\s/.test(masked[i])) {
       i++;
     }
-    i = skipValueExpression(masked, i);
+    i = luaValueEnd(body, i);
     entries.push({ key, positional: false, start, end: i });
   }
   return entries;
-}
-
-function skipValueExpression(masked: string, start: number): number {
-  let i = start;
-  let braceDepth = 0;
-  let parenDepth = 0;
-  let bracketDepth = 0;
-  while (i < masked.length) {
-    const c = masked[i];
-    if (
-      braceDepth === 0 &&
-      parenDepth === 0 &&
-      bracketDepth === 0 &&
-      (c === "," || c === ";")
-    ) {
-      break;
-    }
-    if (
-      braceDepth === 0 &&
-      parenDepth === 0 &&
-      bracketDepth === 0 &&
-      c === "}"
-    ) {
-      // Reached the table's closer — caller handles.
-      break;
-    }
-    if (c === "{") braceDepth++;
-    else if (c === "}") braceDepth--;
-    else if (c === "(") parenDepth++;
-    else if (c === ")") parenDepth--;
-    else if (c === "[") bracketDepth++;
-    else if (c === "]") bracketDepth--;
-    i++;
-  }
-  return i;
 }
 
 // ============================================================================
@@ -486,7 +452,14 @@ export function sortPropsBody(
     return undefined;
   }
   const eventNames = eventNamesForTarget(target);
-  const entries = extractSortableEntries(body);
+  let entries: SortableEntry[];
+  try {
+    entries = extractSortableEntries(body);
+  } catch {
+    // An incomplete callback or string is common while typing. Never turn
+    // uncertain syntax into a destructive on-save edit.
+    return undefined;
+  }
   if (entries.length < 2) {
     return undefined;
   }
@@ -525,8 +498,8 @@ export function sortPropsBody(
   });
 
   decorated.sort((a, b) => {
-    if (a.order !== b.order) return a.order - b.order;
-    if (a.catPos !== b.catPos) return a.catPos - b.catPos;
+    if (a.order !== b.order) {return a.order - b.order;}
+    if (a.catPos !== b.catPos) {return a.catPos - b.catPos;}
     return a.originalIdx - b.originalIdx;
   });
 
@@ -769,7 +742,7 @@ export class SortPropsOnSaveListener implements vscode.Disposable {
       const start = top.propsBraceStart + 1;
       const end = top.propsBraceEnd;
       const sorted = sortBodyRecursive(text, start, end, calls, order, top);
-      if (sorted === undefined) continue;
+      if (sorted === undefined) {continue;}
       edits.push(
         vscode.TextEdit.replace(
           new vscode.Range(

@@ -50,7 +50,7 @@ export class ComponentReferencesLensProvider
     for (const [name, info] of components) {
       // Bail early if VS Code has moved on — typical when the user
       // keeps typing past the previous lens refresh.
-      if (token.isCancellationRequested) return [];
+      if (token.isCancellationRequested) {return [];}
       const line = lines[info.defLineIndex] ?? "";
       // Anchor the lens at the line of the function definition. Indent
       // by the existing leading whitespace so it lines up with the body
@@ -129,7 +129,7 @@ export class FrameStatsLensProvider
     );
     const text = document.getText();
     const calls = findAllCreateElementCalls(text, getAliasPartition());
-    if (calls.length === 0) return [];
+    if (calls.length === 0) {return [];}
     const tree = buildCallTree(calls);
     const out: vscode.CodeLens[] = [];
     for (const root of tree) {
@@ -163,7 +163,7 @@ export class FrameStatsLensProvider
   }
 
   dispose(): void {
-    for (const d of this.disposables) d.dispose();
+    for (const d of this.disposables) {d.dispose();}
     this.disposables = [];
     this._onDidChange.dispose();
   }
@@ -178,7 +178,7 @@ function countStats(
     descendants++;
     const s = countStats(child);
     descendants += s.descendants;
-    if (s.depth > maxChildDepth) maxChildDepth = s.depth;
+    if (s.depth > maxChildDepth) {maxChildDepth = s.depth;}
   }
   return { descendants, depth: 1 + maxChildDepth };
 }

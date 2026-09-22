@@ -15,7 +15,6 @@ import {
   buildCallTree,
   buildCodeMask,
   extractColorLiterals,
-  findAllCreateElementCalls,
   findEnclosingPropsCall,
   scanDocument,
 } from "./parser";
@@ -28,6 +27,7 @@ import {
 import { configChangeAffects, getConfig } from "./configCompat";
 import { WorkspaceIndex } from "./workspaceIndex";
 import { fetchAssetThumbnail } from "./assetThumbnails";
+import { documentDirectCalls, findDocumentCalls } from "./documentCalls";
 
 // ============================================================================
 // Color preview — DocumentColorProvider
@@ -154,7 +154,7 @@ export class PropHoverProvider implements vscode.HoverProvider {
     }
 
     // ---- 1. Hovering the class/component slot of a factory call? ----
-    const calls = findAllCreateElementCalls(text, aliases);
+    const calls = findDocumentCalls(text, this.workspaceIndex);
     for (const call of calls) {
       if (
         cursorOffset >= call.classNameStart &&
@@ -175,11 +175,12 @@ export class PropHoverProvider implements vscode.HoverProvider {
     }
 
     // ---- 2. Hovering a prop inside a props table? ----
+    const directCalls = documentDirectCalls(text, this.workspaceIndex);
     const detected = findEnclosingPropsCall(
       text,
       cursorOffset,
       aliases,
-      this.workspaceIndex?.knownDirectCallTargets()
+      new Set([...(directCalls.componentNames ?? []), ...(directCalls.instanceNames ?? [])])
     );
     if (!detected) {
       return undefined;
@@ -193,7 +194,9 @@ export class PropHoverProvider implements vscode.HoverProvider {
     }
     const word = document.getText(wordRange);
 
-    if (defaultPropsMap[detected.className]) {
+    const customDirect = detected.isDirectComponentCall === true &&
+      directCalls.componentNames?.has(detected.className) === true;
+    if (!customDirect && defaultPropsMap[detected.className]) {
       const props = flattenClassProps(detected.className);
       if (props.includes(word)) {
         const md = buildPropHoverMarkdown(detected.className, word);
@@ -424,7 +427,7 @@ function collectKnownProps(component: DocumentComponentInfo): string[] {
   const out: string[] = [];
   const known = new Set<string>();
   const push = (xs: string[] | undefined) => {
-    if (!xs) return;
+    if (!xs) {return;}
     for (const x of xs) {
       if (!known.has(x)) {
         known.add(x);
@@ -609,7 +612,7 @@ export class CreateElementInlayHintsProvider
 
   private selectionDebounce: NodeJS.Timeout | undefined;
 
-  constructor() {
+  constructor(private readonly workspaceIndex?: WorkspaceIndex) {
     this.disposables.push(
       vscode.window.onDidChangeTextEditorSelection(() => {
         const scope = getConfig<string>(
@@ -652,7 +655,7 @@ export class CreateElementInlayHintsProvider
     );
 
     const text = document.getText();
-    const calls = findAllCreateElementCalls(text, getAliasPartition());
+    const calls = findDocumentCalls(text, this.workspaceIndex);
     const hints: vscode.InlayHint[] = [];
 
     let cursorOffset: number | undefined;
@@ -690,6 +693,11 @@ export class CreateElementInlayHintsProvider
         hintOffset = call.fullEnd + 1;
       }
       const hintPos = document.positionAt(hintOffset);
+      // A call can enclose the requested lines while its closing label lies
+      // outside them. VS Code only accepts hints inside the requested range.
+      if (!range.contains(hintPos)) {
+        continue;
+      }
 
       const label = call.nameProp
         ? `▸ ${call.className} (${call.nameProp})`
@@ -726,6 +734,8 @@ export class CreateElementInlayHintsProvider
 export class CreateElementSymbolProvider
   implements vscode.DocumentSymbolProvider
 {
+  constructor(private readonly workspaceIndex?: WorkspaceIndex) {}
+
   provideDocumentSymbols(
     document: vscode.TextDocument
   ): vscode.ProviderResult<vscode.DocumentSymbol[]> {
@@ -733,7 +743,7 @@ export class CreateElementSymbolProvider
       return [];
     }
     const text = document.getText();
-    const calls = findAllCreateElementCalls(text, getAliasPartition());
+    const calls = findDocumentCalls(text, this.workspaceIndex);
     const tree = buildCallTree(calls);
     return tree.map((node) => this.nodeToSymbol(document, node));
   }
@@ -756,13 +766,13 @@ export class CreateElementSymbolProvider
       ? `${call.className} (${call.nameProp})`
       : call.className;
 
-    const kind = call.isStringLiteralName
+    const kind = call.isStringLiteralName || call.isDirectInstanceCall
       ? vscode.SymbolKind.Object
       : vscode.SymbolKind.Function;
 
     const symbol = new vscode.DocumentSymbol(
       name,
-      call.isStringLiteralName ? "" : "(component)",
+      call.isStringLiteralName || call.isDirectInstanceCall ? "" : "(component)",
       kind,
       fullRange,
       selectionRange

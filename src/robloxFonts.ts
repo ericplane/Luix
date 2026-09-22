@@ -153,15 +153,15 @@ export function getEffectiveFonts(): {
     getConfig<Record<string, unknown>>("customFonts", {}) ?? {};
   const customFonts: Array<RobloxFont & { isCustom: true }> = [];
   for (const [family, value] of Object.entries(raw)) {
-    if (!/^[A-Za-z0-9_-]+$/.test(family)) continue;
-    if (!Array.isArray(value)) continue;
+    if (!/^[A-Za-z0-9_-]+$/.test(family)) {continue;}
+    if (!Array.isArray(value)) {continue;}
     const weights: RobloxFontWeight[] = [];
     for (const w of value) {
       if (typeof w === "string" && ALL_WEIGHTS.includes(w as RobloxFontWeight)) {
         weights.push(w as RobloxFontWeight);
       }
     }
-    if (weights.length === 0) continue;
+    if (weights.length === 0) {continue;}
     customFonts.push({ family, weights, isCustom: true });
   }
 
@@ -182,7 +182,7 @@ export function getFontFamily(
 ): (RobloxFont & { isCustom?: boolean }) | undefined {
   // Cheap path first: user has no custom fonts → use the built-in map.
   const builtin = BUILTIN_BY_FAMILY.get(name);
-  if (builtin) return builtin;
+  if (builtin) {return builtin;}
   return getEffectiveFonts().byName.get(name);
 }
 
@@ -200,7 +200,7 @@ export class FontFamilyCompletionProvider
     const text = document.getText();
     const offset = document.offsetAt(position);
     const ctx = findFontFromNameStringArg(text, offset);
-    if (!ctx) return undefined;
+    if (!ctx) {return undefined;}
 
     // Range starts after the opening quote so VS Code's filter matches
     // the partial family name the user is typing — same approach as
@@ -251,30 +251,30 @@ function findFontFromNameStringArg(
   let quote: '"' | "'" | "`" | undefined;
   for (let i = cursor - 1; i >= 0; i--) {
     const c = text[i];
-    if (c === "\n") return undefined;
+    if (c === "\n") {return undefined;}
     if (c === '"' || c === "'" || c === "`") {
       stringStart = i;
       quote = c;
       break;
     }
   }
-  if (stringStart === -1 || !quote) return undefined;
+  if (stringStart === -1 || !quote) {return undefined;}
 
   // Inside the string up to the cursor must look like a family name.
   for (let i = stringStart + 1; i < cursor; i++) {
     const c = text[i];
-    if (!/[A-Za-z0-9_]/.test(c)) return undefined;
+    if (!/[A-Za-z0-9_]/.test(c)) {return undefined;}
   }
 
   // Forward scan for the closing quote.
   let stringEnd = -1;
   for (let i = cursor; i < text.length; i++) {
-    if (text[i] === "\n") break;
+    if (text[i] === "\n") {break;}
     if (text[i] === quote) {
       stringEnd = i;
       break;
     }
-    if (!/[A-Za-z0-9_]/.test(text[i])) return undefined;
+    if (!/[A-Za-z0-9_]/.test(text[i])) {return undefined;}
   }
 
   // The opening quote must be preceded by `Font.fromName(`.
@@ -350,6 +350,6 @@ function findFontFamilyInCurrentCall(
   while ((m = re.exec(slice)) !== null) {
     last = m;
   }
-  if (!last) return undefined;
+  if (!last) {return undefined;}
   return getFontFamily(last[1]);
 }

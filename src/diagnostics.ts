@@ -8,7 +8,6 @@ import {
   cornerRadiusConflicts,
 } from "./data";
 import {
-  AliasPartition,
   applyMask,
   buildCallTree,
   buildCodeMask,
@@ -17,15 +16,15 @@ import {
   extractColorLiterals,
   extractPropEntries,
   extractPropEntriesFromDocument,
-  findAllCreateElementCalls,
   scanDocument,
   collectLocalBindings,
 } from "./parser";
 import { getAutoImportConfig } from "./config";
 import { configChangeAffects, getConfig } from "./configCompat";
-import { findFrameworkForAlias, getAliasPartition } from "./frameworks";
+import { FRAMEWORKS, findFrameworkForAlias, getAliasPartition } from "./frameworks";
 import { WorkspaceIndex } from "./workspaceIndex";
 import { planUICornerRefactor } from "./uiCorner";
+import { findDocumentCalls } from "./documentCalls";
 
 export const DIAGNOSTIC_CODE = {
   ReservedName: "luix.reserved-name",
@@ -39,7 +38,6 @@ export const DIAGNOSTIC_CODE = {
   MissingRichText: "luix.missing-richtext",
   MissingAnchorPoint: "luix.missing-anchorpoint",
   NumericRange: "luix.numeric-range",
-  TextScaledGotcha: "luix.text-scaled-gotcha",
   LowContrast: "luix.low-contrast",
   UnusedProp: "luix.unused-prop",
   CornerRadiusConflict: "luix.corner-radius-conflict",
@@ -160,13 +158,13 @@ export class DiagnosticsManager implements vscode.Disposable {
       );
     }
     if (getConfig<boolean>("propValidation.enabled", true)) {
-      diagnostics.push(...computePropValidationDiagnostics(text, document));
+      diagnostics.push(...computePropValidationDiagnostics(text, document, this.workspaceIndex));
     }
     if (getConfig<boolean>("richText.enabled", true)) {
-      diagnostics.push(...computeMissingRichTextDiagnostics(text, document));
+      diagnostics.push(...computeMissingRichTextDiagnostics(text, document, this.workspaceIndex));
     }
     if (getConfig<boolean>("contrastWarnings.enabled", false)) {
-      diagnostics.push(...computeContrastDiagnostics(text, document));
+      diagnostics.push(...computeContrastDiagnostics(text, document, this.workspaceIndex));
     }
     if (getConfig<boolean>("unusedProps.enabled", true)) {
       diagnostics.push(...computeUnusedPropDiagnostics(text, document));
@@ -192,8 +190,7 @@ async function computeMissingImportDiagnostics(
   workspaceIndex: WorkspaceIndex
 ): Promise<vscode.Diagnostic[]> {
   const out: vscode.Diagnostic[] = [];
-  const aliases = getAliasPartition();
-  const calls = findAllCreateElementCalls(text, aliases);
+  const calls = findDocumentCalls(text, workspaceIndex);
 
   const localBindings = collectLocalBindings(text);
   const reported = new Set<string>();
@@ -298,13 +295,12 @@ function computeDeprecationDiagnostics(
 ): vscode.Diagnostic[] {
   const out: vscode.Diagnostic[] = [];
   const masked = applyMask(text, buildCodeMask(text));
-  const aliases = getAliasPartition();
 
   // Compute every props-table range *once* up front instead of doing a
   // backward brace-walk per regex match. The old `findEnclosingPropsCall`
   // dispatch inside the loop was O(matches × N) per keystroke on big
   // files; this is O(N + matches·log(C)).
-  const propsRanges = collectPropsRanges(text, aliases);
+  const propsRanges = collectPropsRanges(findDocumentCalls(text, workspaceIndex));
   const inProps = (offset: number) => containedIn(propsRanges, offset);
 
   // `Font` is deprecated in favour of `FontFace` — flag ANY assignment
@@ -314,9 +310,9 @@ function computeDeprecationDiagnostics(
   // — on other classes `Font` is genuinely unknown and the prop
   // validator handles it. The quick-fix only offers the auto-convert for
   // the `Enum.Font.X` form (see `DeprecationCodeActionProvider`).
-  for (const call of findAllCreateElementCalls(text, aliases)) {
+  for (const call of findDocumentCalls(text, workspaceIndex)) {
     if (
-      !call.isStringLiteralName ||
+      !(call.isStringLiteralName || call.isDirectInstanceCall) ||
       call.propsBraceStart === undefined ||
       call.propsBraceEnd === undefined ||
       !isDeprecatedValidProp(call.className, "Font")
@@ -388,11 +384,10 @@ interface PropsRange {
 }
 
 function collectPropsRanges(
-  text: string,
-  aliases: AliasPartition
+  calls: CreateElementCall[]
 ): PropsRange[] {
   const out: PropsRange[] = [];
-  for (const call of findAllCreateElementCalls(text, aliases)) {
+  for (const call of calls) {
     if (
       call.propsBraceStart === undefined ||
       call.propsBraceEnd === undefined
@@ -431,8 +426,8 @@ function containedIn(ranges: PropsRange[], offset: number): boolean {
   // depth) ≈ 5-10.
   for (let i = Math.min(lo, ranges.length - 1); i >= 0; i--) {
     const r = ranges[i];
-    if (r.start <= offset && offset <= r.end) return true;
-    if (r.end < offset && i < ranges.length - 1) break;
+    if (r.start <= offset && offset <= r.end) {return true;}
+    if (r.end < offset && i < ranges.length - 1) {break;}
   }
   return false;
 }
@@ -441,13 +436,14 @@ function containedIn(ranges: PropsRange[], offset: number): boolean {
 // Prop validation — unknown / duplicate / wrong-enum / overridden-by-component
 // ============================================================================
 
-function computePropValidationDiagnostics(
+export function computePropValidationDiagnostics(
   text: string,
-  document: vscode.TextDocument
+  document: vscode.TextDocument,
+  workspaceIndex?: WorkspaceIndex
 ): vscode.Diagnostic[] {
   const out: vscode.Diagnostic[] = [];
   const aliases = getAliasPartition();
-  const calls = findAllCreateElementCalls(text, aliases);
+  const calls = findDocumentCalls(text, workspaceIndex);
   const components = scanDocument(text, aliases);
 
   for (const call of calls) {
@@ -492,7 +488,7 @@ function computePropValidationDiagnostics(
     // `CornerRadius` sets all four corners and overrides the individual
     // `BottomLeftRadius` / … properties, so setting both is a mistake —
     // the individual ones silently do nothing. Flag each dead one.
-    if (call.isStringLiteralName && call.className === "UICorner") {
+    if ((call.isStringLiteralName || call.isDirectInstanceCall) && call.className === "UICorner") {
       const overridden = new Set(
         cornerRadiusConflicts(entries.map((e) => e.key))
       );
@@ -548,7 +544,7 @@ function computePropValidationDiagnostics(
     }
 
     // ---- Unknown / wrong-enum (Roblox host class only) ----
-    if (call.isStringLiteralName && defaultPropsMap[call.className]) {
+    if ((call.isStringLiteralName || call.isDirectInstanceCall) && defaultPropsMap[call.className]) {
       const known = new Set(flattenClassProps(call.className));
       // Frameworks that take events as plain table keys (Vide:
       // `Activated = function() … end`) put event names in the same
@@ -556,9 +552,8 @@ function computePropValidationDiagnostics(
       // `completion.ts`); mirror that here so they aren't flagged
       // "Unknown property" (issue #4). React/Roact/Fusion spell events
       // as computed keys, which the entry scanner never yields.
-      const framework = call.alias
-        ? findFrameworkForAlias(call.alias)
-        : undefined;
+      const framework = call.isDirectInstanceCall ? FRAMEWORKS.vide
+        : call.alias ? findFrameworkForAlias(call.alias) : undefined;
       if (framework?.eventsAsProps) {
         for (const event of flattenClassEvents(call.className)) {
           known.add(event);
@@ -638,12 +633,12 @@ function computePropValidationDiagnostics(
     // ---- Numeric-range warnings ----
     for (const entry of entries) {
       const range = NUMERIC_RANGES[entry.key];
-      if (!range) continue;
+      if (!range) {continue;}
       const value = propsBody
         .slice(entry.valueStart, entry.valueEnd)
         .trim();
       const num = Number(value);
-      if (!Number.isFinite(num)) continue;
+      if (!Number.isFinite(num)) {continue;}
       if (num < range.min || num > range.max) {
         const start = document.positionAt(bodyStart + entry.valueStart);
         const end = document.positionAt(bodyStart + entry.valueEnd);
@@ -655,44 +650,6 @@ function computePropValidationDiagnostics(
         d.code = DIAGNOSTIC_CODE.NumericRange;
         d.source = "luix";
         out.push(d);
-      }
-    }
-
-    // ---- TextScaled gotcha ----
-    // `TextScaled = true` requires at least one Size axis to be a
-    // fixed pixel offset (or `AutomaticSize` covering the other axis).
-    // When Size is `UDim2.fromScale(...)` only — or missing entirely
-    // — the text auto-scales toward zero and disappears.
-    {
-      const textScaledEntry = entries.find((e) => e.key === "TextScaled");
-      if (textScaledEntry) {
-        const value = propsBody
-          .slice(textScaledEntry.valueStart, textScaledEntry.valueEnd)
-          .trim();
-        if (value === "true") {
-          const sizeEntry = entries.find((e) => e.key === "Size");
-          const sizeValue = sizeEntry
-            ? propsBody
-                .slice(sizeEntry.valueStart, sizeEntry.valueEnd)
-                .trim()
-            : "";
-          if (looksScaleOnly(sizeValue) && !hasAutomaticSize(entries, propsBody)) {
-            const startPos = document.positionAt(
-              bodyStart + textScaledEntry.keyStart
-            );
-            const endPos = document.positionAt(
-              bodyStart + textScaledEntry.keyEnd
-            );
-            const d = new vscode.Diagnostic(
-              new vscode.Range(startPos, endPos),
-              "`TextScaled = true` needs a `Size` with at least one fixed-offset axis (e.g. `UDim2.new(0, X, 0, Y)`) or `AutomaticSize` to render text — pure-scale sizes can collapse to zero.",
-              vscode.DiagnosticSeverity.Warning
-            );
-            d.code = DIAGNOSTIC_CODE.TextScaledGotcha;
-            d.source = "luix";
-            out.push(d);
-          }
-        }
       }
     }
 
@@ -727,7 +684,7 @@ function computePropValidationDiagnostics(
     }
 
     // ---- Overridden-by-component ----
-    if (!call.isStringLiteralName) {
+    if (!call.isStringLiteralName && !call.isDirectInstanceCall) {
       const component = components.get(
         call.className.split(".").pop() ?? call.className
       );
@@ -818,35 +775,6 @@ const NUMERIC_RANGES: Record<string, { min: number; max: number }> = {
   LayoutOrder: { min: -1_000_000, max: 1_000_000 },
 };
 
-function looksScaleOnly(sizeValue: string): boolean {
-  // Empty / missing → also scale-only for our purposes.
-  if (!sizeValue) return true;
-  const e = sizeValue.replace(/\s+/g, "");
-  // `UDim2.fromScale(0.X, 0.Y)` or `(1, 1)` etc. — no offsets at all.
-  if (/^UDim2\.fromScale\([-\d.]+,[-\d.]+\)$/.test(e)) {
-    return true;
-  }
-  // `UDim2.new(s, 0, s, 0)` — explicit zero offsets.
-  const m = /^UDim2\.new\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\)$/.exec(e);
-  if (m) {
-    const xOffset = parseFloat(m[2]);
-    const yOffset = parseFloat(m[4]);
-    return xOffset === 0 && yOffset === 0;
-  }
-  return false;
-}
-
-function hasAutomaticSize(
-  entries: Array<{ key: string; valueStart: number; valueEnd: number }>,
-  body: string
-): boolean {
-  const entry = entries.find((e) => e.key === "AutomaticSize");
-  if (!entry) return false;
-  const v = body.slice(entry.valueStart, entry.valueEnd).trim();
-  // Any non-`None` value covers at least one axis.
-  return !/Enum\.AutomaticSize\.None\b/.test(v);
-}
-
 // ============================================================================
 // Color contrast warnings (WCAG)
 // ============================================================================
@@ -859,14 +787,14 @@ function hasAutomaticSize(
 
 const WCAG_AA_THRESHOLD = 4.5;
 
-function computeContrastDiagnostics(
+export function computeContrastDiagnostics(
   text: string,
-  document: vscode.TextDocument
+  document: vscode.TextDocument,
+  workspaceIndex?: WorkspaceIndex
 ): vscode.Diagnostic[] {
   const out: vscode.Diagnostic[] = [];
-  const aliases = getAliasPartition();
-  const calls = findAllCreateElementCalls(text, aliases);
-  if (calls.length === 0) return out;
+  const calls = findDocumentCalls(text, workspaceIndex);
+  if (calls.length === 0) {return out;}
   const tree = buildCallTree(calls);
 
   // Walk the tree, carrying the nearest ancestor `BackgroundColor3`
@@ -875,12 +803,20 @@ function computeContrastDiagnostics(
     node: CallTreeNode,
     inheritedBg: { r: number; g: number; b: number } | undefined
   ): void => {
+    const host = node.call.isStringLiteralName || node.call.isDirectInstanceCall;
     const ownBg = readColor3Prop(node.call, text, "BackgroundColor3");
-    const bgForChildren = ownBg ?? inheritedBg;
-    if (isTextClass(node.call.className)) {
+    const transparency = readTransparency(node.call, text, "BackgroundTransparency");
+    // Custom components and runtime opacity values hide the actual background.
+    // A fully transparent element carries the visible ancestor color through.
+    const bgForChildren = !host ? undefined
+      : transparency === 1 ? inheritedBg
+        : compositeColor(ownBg, inheritedBg, transparency);
+    if (host && isTextClass(node.call.className)) {
       const fg = readColor3Prop(node.call, text, "TextColor3");
-      if (fg && bgForChildren) {
-        const ratio = contrastRatio(fg, bgForChildren);
+      const textTransparency = readTransparency(node.call, text, "TextTransparency");
+      const visibleFg = compositeColor(fg, bgForChildren, textTransparency);
+      if (visibleFg && bgForChildren && textTransparency !== 1) {
+        const ratio = contrastRatio(visibleFg, bgForChildren);
         if (ratio < WCAG_AA_THRESHOLD) {
           const key = findKeyRange(node.call, text, "TextColor3");
           if (key) {
@@ -888,7 +824,7 @@ function computeContrastDiagnostics(
             const end = document.positionAt(key.end);
             const d = new vscode.Diagnostic(
               new vscode.Range(start, end),
-              `Low contrast: \`TextColor3\` vs ancestor \`BackgroundColor3\` = ${ratio.toFixed(2)}:1 (WCAG-AA requires ≥ 4.5:1 for normal text).`,
+              `Low contrast: text vs visible background = ${ratio.toFixed(2)}:1 (WCAG-AA requires ≥ 4.5:1 for normal text).`,
               vscode.DiagnosticSeverity.Warning
             );
             d.code = DIAGNOSTIC_CODE.LowContrast;
@@ -909,6 +845,34 @@ function computeContrastDiagnostics(
 }
 
 const TEXT_CLASSES = new Set(["TextLabel", "TextButton", "TextBox"]);
+
+type RGB = { r: number; g: number; b: number };
+
+function compositeColor(
+  foreground: RGB | undefined,
+  background: RGB | undefined,
+  transparency: number | undefined
+): RGB | undefined {
+  if (transparency === 1) {return background;}
+  if (!foreground || transparency === undefined) {return undefined;}
+  if (transparency === 0) {return foreground;}
+  if (!background) {return undefined;}
+  const channel = (key: keyof RGB) =>
+    foreground[key] * (1 - transparency) + background[key] * transparency;
+  return { r: channel("r"), g: channel("g"), b: channel("b") };
+}
+
+function readTransparency(call: CreateElementCall, text: string, key: string): number | undefined {
+  if (call.propsBraceStart === undefined || call.propsBraceEnd === undefined) {return undefined;}
+  const bodyStart = call.propsBraceStart + 1;
+  const entry = extractPropEntriesFromDocument(text, bodyStart, call.propsBraceEnd)
+    .find((value) => value.key === key);
+  if (!entry) {return 0;}
+  const value = text.slice(bodyStart + entry.valueStart, bodyStart + entry.valueEnd).trim();
+  if (!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(value)) {return undefined;}
+  const number = Number(value);
+  return number >= 0 && number <= 1 ? number : undefined;
+}
 function isTextClass(name: string): boolean {
   return TEXT_CLASSES.has(name);
 }
@@ -928,9 +892,9 @@ function readColor3Prop(
     call.propsBraceEnd
   );
   const entry = entries.find((e) => e.key === key);
-  if (!entry) return undefined;
+  if (!entry) {return undefined;}
   const value = body.slice(entry.valueStart, entry.valueEnd).trim();
-  if (!/^Color3\./.test(value)) return undefined;
+  if (!/^Color3\./.test(value)) {return undefined;}
   const masked = applyMask(value, buildCodeMask(value));
   const lits = extractColorLiterals(masked, value);
   if (lits[0]) {
@@ -953,7 +917,7 @@ function findKeyRange(
     call.propsBraceEnd
   );
   const entry = entries.find((e) => e.key === key);
-  if (!entry) return undefined;
+  if (!entry) {return undefined;}
   return {
     start: call.propsBraceStart + 1 + entry.keyStart,
     end: call.propsBraceStart + 1 + entry.keyEnd,
@@ -1058,13 +1022,13 @@ function levenshtein(a: string, b: string, limit: number): number {
 const RICH_TEXT_TAG_PATTERN =
   /<\s*\/?\s*(b|i|u|s|sc|smallcaps|uppercase|sub|sup|comment|br|font|stroke|mark)\b/i;
 
-function computeMissingRichTextDiagnostics(
+export function computeMissingRichTextDiagnostics(
   text: string,
-  document: vscode.TextDocument
+  document: vscode.TextDocument,
+  workspaceIndex?: WorkspaceIndex
 ): vscode.Diagnostic[] {
   const out: vscode.Diagnostic[] = [];
-  const aliases = getAliasPartition();
-  const calls = findAllCreateElementCalls(text, aliases);
+  const calls = findDocumentCalls(text, workspaceIndex);
   for (const call of calls) {
     if (
       call.propsBraceStart === undefined ||

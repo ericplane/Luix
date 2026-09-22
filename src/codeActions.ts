@@ -7,6 +7,7 @@ import {
 } from "./config";
 import { DIAGNOSTIC_CODE } from "./diagnostics";
 import { WorkspaceIndex } from "./workspaceIndex";
+import { analyzeLuaBindings } from "./editSyntax";
 
 // ============================================================================
 // Auto-import code action (opt-in)
@@ -510,7 +511,7 @@ function rgbToHsv(
       h = (r - g) / delta + 4;
     }
     h /= 6;
-    if (h < 0) h += 1;
+    if (h < 0) {h += 1;}
   }
   const s = max === 0 ? 0 : delta / max;
   return { h, s, v: max };
@@ -543,7 +544,7 @@ export class Color3PaletteExtractorProvider
     const literals = extractColorLiterals(masked, text);
     const cursor = document.offsetAt(range.start);
     const hit = literals.find((c) => cursor >= c.start && cursor <= c.end);
-    if (!hit) return undefined;
+    if (!hit) {return undefined;}
     const literalText = text.slice(hit.start, hit.end);
     const action = new vscode.CodeAction(
       `Save Color3 to \`luix.palette\`…`,
@@ -604,15 +605,15 @@ export class UDim2ConvertCodeActionProvider
       let yScale: number;
       let yOffset: number;
       if (kind === "new") {
-        if (args.length !== 4) return undefined;
+        if (args.length !== 4) {return undefined;}
         [xScale, xOffset, yScale, yOffset] = args;
       } else if (kind === "fromOffset") {
-        if (args.length !== 2) return undefined;
+        if (args.length !== 2) {return undefined;}
         [xOffset, yOffset] = args;
         xScale = 0;
         yScale = 0;
       } else {
-        if (args.length !== 2) return undefined;
+        if (args.length !== 2) {return undefined;}
         [xScale, yScale] = args;
         xOffset = 0;
         yOffset = 0;
@@ -761,6 +762,19 @@ export class WrapInCodeActionProvider
     // wrapped call used, or a Fusion 0.3 `scope:New` becomes a bare
     // `New` with no scope to construct into.
     const aliasName = (first.receiver ?? "") + aliasText;
+    // Preserve both constructor stages, including explicit Fusion scope
+    // arguments and optional parentheses around the props table.
+    const constructor = curried && first.propsBraceStart !== undefined && first.propsBraceEnd !== undefined
+      ? {
+        open: (className: string) => text.slice(first.aliasStart, first.classNameStart) +
+          (first.isStringLiteralName ? className : `"${className}"`) +
+          text.slice(first.classNameEnd, first.propsBraceStart) + "{",
+        close: text.slice(first.propsBraceEnd + 1, first.fullEnd),
+      }
+      : { open: (className: string) => `${aliasName} "${className}" {`, close: "" };
+    const childrenKey = spec?.id === "fusion"
+      ? childrenKeyForWrapper(text, first.aliasStart, spec.childrenKey)
+      : spec?.childrenKey;
 
     const innerText = text.slice(first.aliasStart, last.fullEnd);
     const replaceRange = new vscode.Range(
@@ -771,22 +785,18 @@ export class WrapInCodeActionProvider
     const baseIndent = /^[\s]*/.exec(line.text)?.[0] ?? "";
     const stepIndent = "\t";
 
-    // Only ONE extra step needs to be added — the lines that come after
-    // the slice's first line already carry their original indentation,
-    // and the wrap shifts them all down by exactly one level. The old
-    // `baseIndent + stepIndent` prefix double-indented every line.
-    const indented = indentLines(innerText, stepIndent);
-
     const actions: vscode.CodeAction[] = [];
     for (const kind of ["Frame", "ScrollingFrame", "ListContainer"] as WrapKind[]) {
       const wrapped = renderWrapper(
         kind,
         aliasName,
         curried,
-        spec?.childrenKey,
-        indented,
+        childrenKey,
+        innerText,
         baseIndent,
-        stepIndent
+        stepIndent,
+        constructor,
+        text.includes("\r\n") ? "\r\n" : "\n"
       );
       const action = new vscode.CodeAction(
         wrapTitle(kind),
@@ -798,6 +808,40 @@ export class WrapInCodeActionProvider
     }
     return actions;
   }
+}
+
+/** Reuse a visible Children alias or a qualified key already used in this
+ * scope. Do not invent a new scope or assume an unrelated function's alias. */
+function childrenKeyForWrapper(text: string, offset: number, fallback?: string): string | undefined {
+  try {
+    const parsed = analyzeLuaBindings(text);
+    const visible = parsed.bindings.filter(b => b.activeFrom <= offset && b.scope.start <= offset && b.scope.end >= offset)
+      .sort((a, b) => b.scope.start - a.scope.start || b.declaration.start - a.declaration.start);
+    const nearest = new Map<string, typeof visible[number]>();
+    for (const binding of visible) {
+      if (!nearest.has(binding.name)) {nearest.set(binding.name, binding);}
+    }
+    for (const binding of nearest.values()) {
+      if (/^\s*=\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\.Children(?=\s*(?:[;\r\n]|$))/.test(text.slice(binding.declaration.end))) {
+        return binding.name;
+      }
+    }
+    const tokens = parsed.tokens;
+    for (let i = 0; i < tokens.length; i++) {
+      if (tokens[i].value !== "[" || tokens[i + 1]?.kind !== "word") {continue;}
+      let j = i + 2;
+      while (tokens[j]?.value === "." && tokens[j + 1]?.kind === "word") {j += 2;}
+      if (tokens[j]?.value !== "]" || tokens[j + 1]?.value !== "=" || tokens[j - 1]?.value !== "Children") {continue;}
+      const base = tokens[i + 1];
+      const reference = parsed.references.find(r => r.token.start === base.start);
+      if (reference?.binding !== nearest.get(base.value)) {continue;}
+      return text.slice(base.start, tokens[j - 1].end);
+    }
+  } catch {
+    // The constructor can still be preserved in files with unsupported type
+    // syntax; keep the configured key instead of guessing lexical ownership.
+  }
+  return fallback;
 }
 
 function wrapTitle(kind: WrapKind): string {
@@ -818,7 +862,9 @@ function renderWrapper(
   childrenKey: string | undefined,
   inner: string,
   baseIndent: string,
-  step: string
+  step: string,
+  constructor: { open: (className: string) => string; close: string },
+  eol: string
 ): string {
   const lines: string[] = [];
   const wrapperClass = kind === "ScrollingFrame" ? "ScrollingFrame" : "Frame";
@@ -834,28 +880,29 @@ function renderWrapper(
   }
   const innerIndent = baseIndent + step;
   if (curried) {
-    lines.push(`${alias} "${wrapperClass}" {`);
+    lines.push(constructor.open(wrapperClass));
     for (const p of baseProps) {
       lines.push(innerIndent + p);
     }
-    if (kind === "ListContainer") {
-      lines.push(
-        innerIndent + `${alias} "UIListLayout" {`,
-        innerIndent + step + `FillDirection = Enum.FillDirection.Vertical,`,
-        innerIndent + step + `Padding = UDim.new(0, 8),`,
-        innerIndent + step + `SortOrder = Enum.SortOrder.LayoutOrder,`,
-        innerIndent + `},`
-      );
-    }
     if (childrenKey) {
       lines.push(innerIndent + `[${childrenKey}] = {`);
-      lines.push(innerIndent + step + inner.trimStart() + ",");
-      lines.push(innerIndent + `},`);
-    } else {
-      // Vide-style inline child.
-      lines.push(innerIndent + inner.trimStart() + ",");
     }
-    lines.push(baseIndent + `}`);
+    const childIndent = childrenKey ? innerIndent + step : innerIndent;
+    if (kind === "ListContainer") {
+      lines.push(
+        childIndent + constructor.open("UIListLayout"),
+        childIndent + step + `FillDirection = Enum.FillDirection.Vertical,`,
+        childIndent + step + `Padding = UDim.new(0, 8),`,
+        childIndent + step + `SortOrder = Enum.SortOrder.LayoutOrder,`,
+        childIndent + `}${constructor.close},`
+      );
+    }
+    // Preserve every byte of the selected call, including multiline strings.
+    lines.push(childIndent + inner.trimStart() + ",");
+    if (childrenKey) {
+      lines.push(innerIndent + `},`);
+    }
+    lines.push(baseIndent + `}${constructor.close}`);
   } else {
     // Parens form (e / React.createElement / Roact.createElement).
     lines.push(`${alias}("${wrapperClass}", {`);
@@ -875,12 +922,5 @@ function renderWrapper(
     lines.push(innerIndent + inner.trimStart() + ",");
     lines.push(`${baseIndent}})`);
   }
-  return lines.join("\n");
-}
-
-function indentLines(text: string, prefix: string): string {
-  return text
-    .split("\n")
-    .map((line, i) => (i === 0 ? line : prefix + line))
-    .join("\n");
+  return lines.join(eol);
 }

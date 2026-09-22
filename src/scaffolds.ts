@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { usesLegacyFusionSyntax } from "./fusionSnippets";
 
 const TEMPLATES = {
   react: (name: string) =>
@@ -44,17 +45,17 @@ const TEMPLATES = {
       ``,
     ].join("\n"),
 
-  fusion: (name: string) =>
+  fusion: (name: string, legacy = false) =>
     [
       `local ReplicatedStorage = game:GetService("ReplicatedStorage")`,
       ``,
       `local Fusion = require(ReplicatedStorage.Packages.Fusion)`,
       ``,
-      `local New = Fusion.New`,
+      ...(legacy ? [`local New = Fusion.New`] : []),
       `local Children = Fusion.Children`,
       ``,
-      `local function ${name}(props)`,
-      `\treturn New "Frame" {`,
+      legacy ? `local function ${name}(props)` : `local function ${name}(scope: Fusion.Scope<typeof(Fusion)>, props)`,
+      legacy ? `\treturn New "Frame" {` : `\treturn scope:New "Frame" {`,
       `\t\tSize = UDim2.fromScale(1, 1),`,
       `\t\tBackgroundTransparency = 1,`,
       `\t\t[Children] = {`,
@@ -186,7 +187,8 @@ export async function scaffoldComponent(
     // File doesn't exist — good.
   }
 
-  const body = TEMPLATES[framework](trimmed);
+  const legacyFusion = framework === "fusion" && await prefersLegacyFusion(targetDir);
+  const body = TEMPLATES[framework](trimmed, legacyFusion);
   const encoder = new TextEncoder();
   await vscode.workspace.fs.writeFile(fileUri, encoder.encode(body));
 
@@ -219,6 +221,26 @@ export async function pickFrameworkAndScaffold(
 }
 
 // Exported for tests.
-export function _renderTemplate(framework: Framework, name: string): string {
-  return TEMPLATES[framework](name);
+export function _renderTemplate(framework: Framework, name: string, legacyFusion = false): string {
+  return TEMPLATES[framework](name, legacyFusion);
+}
+
+async function prefersLegacyFusion(targetDir: vscode.Uri): Promise<boolean> {
+  const folder = vscode.workspace.getWorkspaceFolder(targetDir);
+  if (folder) {
+    try {
+      const manifest = new TextDecoder().decode(await vscode.workspace.fs.readFile(
+        vscode.Uri.joinPath(folder.uri, "wally.toml")
+      ));
+      const dependency = /^\s*[^#\n=]+\s*=\s*["'][^"'\n]*\/fusion@[^\d"'\n]*(0\.[23])(?:\.|["'])/im.exec(manifest);
+      if (dependency) {
+        return dependency[1] === "0.2";
+      }
+    } catch {
+      // A manifest is optional; use the active file's established syntax.
+    }
+  }
+  const active = vscode.window.activeTextEditor?.document;
+  return !!active && vscode.workspace.getWorkspaceFolder(active.uri)?.uri.toString() === folder?.uri.toString()
+    && usesLegacyFusionSyntax(active.getText());
 }
