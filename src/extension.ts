@@ -128,35 +128,23 @@ export function activate(context: vscode.ExtensionContext) {
     { language: "luau", scheme: "file" },
   ];
 
-  // Register the Luix output channel up-front so background failures
-  // (asset thumbnail fetches, API-dump downloads, persist writes) have
-  // somewhere visible to log. Users can open it via "Output: Show
-  // Output Channels…" → Luix.
+  // Register logging before starting background work.
   context.subscriptions.push(getOutputChannelDisposable());
 
   const workspaceIndex = new WorkspaceIndex(context);
 
-  // Kick off the optional Roblox API-dump fetch (no-op when the
-  // setting is off — see `apiDump.ts`).
   maybeAugmentFromApiDump(context);
   context.subscriptions.push(workspaceIndex);
 
-  // Active-framework status bar — the always-visible "Luix: React /
-  // Roact / Fusion / Vide / Auto" indicator. Click flips
-  // `luix.activeFramework`. The picker command is also exposed via
-  // the command palette ("Luix: Set active framework…").
   const statusBar = new ActiveFrameworkStatusBar();
   let frameworkRefreshVersion = 0;
   const refreshWorkspaceFallback = async () => {
     const refreshVersion = ++frameworkRefreshVersion;
-    const fw = await inferWorkspaceFramework(workspaceIndex.indexedUris());
-    // The infer call awaits up to 25 openTextDocument round-trips —
-    // can take hundreds of ms. If deactivate fired in the meantime,
-    // touching the disposed status bar throws "Illegal access to
-    // disposed object" in some VS Code versions. The disposed flag
-    // (added in statusBar.ts) makes both writes idempotent on a
-    // dead instance.
-    if (statusBar.isDisposed() || refreshVersion !== frameworkRefreshVersion) {return;}
+    // Stop sampling when a newer refresh supersedes this one.
+    const superseded = () =>
+      statusBar.isDisposed() || refreshVersion !== frameworkRefreshVersion;
+    const fw = await inferWorkspaceFramework(workspaceIndex, superseded);
+    if (superseded()) {return;}
     setWorkspaceFallback(fw);
     statusBar.refresh();
   };
@@ -166,24 +154,14 @@ export function activate(context: vscode.ExtensionContext) {
       PICK_ACTIVE_FRAMEWORK_COMMAND,
       pickActiveFrameworkCommand
     ),
-    // Workspace fallback for the framework detector: take the
-    // most-represented framework across indexed files and expose it
-    // via `setWorkspaceFallback`. Recomputed on every settled index
-    // change, so brand-new files inherit the project's convention
-    // even before they have their own imports / calls.
+    // Files without local framework signals inherit the workspace convention.
     workspaceIndex.onDidChangeIndex(() => {
       void refreshWorkspaceFallback();
     })
   );
-  // Initial inference at activation — non-blocking so the rest of
-  // activate() can finish without waiting on file reads.
   void refreshWorkspaceFallback();
 
-  // Props provider — `.` is needed for `[React.Event.|` and
-  // `[React.Change.|`; `{` makes the suggestion list open the moment you
-  // type the props brace so common props (`Name`, `Size`, …) appear
-  // without an extra Ctrl+Space. Space/newline are deliberately *not*
-  // triggers; that would steal Tab from GitHub Copilot's inline ghost text.
+  // Avoid space/newline triggers: they steal Tab from inline suggestions.
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       selector,
@@ -193,9 +171,6 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Class-name provider — fires inside the string-literal first arg of a
-  // factory call (`e("Fr|"`, `New "Fr|"`, …). Trigger chars are the
-  // quotes themselves so the list opens the instant the user types `e("`.
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       selector,
@@ -204,10 +179,6 @@ export function activate(context: vscode.ExtensionContext) {
       "'"
     )
   );
-  // Optional companion: fire the class picker on `(` so typing `e(`
-  // opens the list without needing to also type the opening quote.
-  // Off by default — many users won't want the trigger to fire on
-  // every function call. Suppression handled inside the provider.
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       selector,
@@ -216,12 +187,6 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Element-construction snippets (`eFrame`, `nFrame`, `cFrame`, etc.).
-  // Migrated from `snippets/luix.code-snippets` because the static
-  // snippet system had no awareness of strings or prop-key positions —
-  // typing `Fra` inside a string used to surface every `*Frame`
-  // snippet. The provider gates by code mask, prop-key position, and
-  // enabled frameworks (Fusion users don't see `eFrame`/`cFrame`, etc.).
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       selector,
@@ -229,14 +194,7 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Workspace-component completion inside `e(<partial>|`. Sidesteps
-  // luau-lsp's "insert function as call" behaviour, which expands an
-  // accepted `DailyQuestCard` into `DailyQuestCard(props)` rather than
-  // leaving it as a reference for React's factory call. No explicit
-  // trigger char — VS Code re-evaluates completions as identifier
-  // chars are typed, which is when this needs to fire. The provider
-  // self-gates on `<alias>(<partial>|` so it stays quiet outside the
-  // first-arg slot of a factory call.
+  // Insert component references without luau-lsp expanding them into calls.
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       selector,
@@ -244,8 +202,6 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Annotation provider — completes `---@extends <Class>` and
-  // `---@prop NAME <Type>`. Only fires inside `---` comment lines.
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       selector,
@@ -254,7 +210,6 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Color preview — gutter swatches and VS Code's color picker.
   context.subscriptions.push(
     vscode.languages.registerColorProvider(
       selector,
@@ -262,9 +217,6 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Hover docs — prop type, inherited-from class, Roblox docs link; also
-  // surfaces a "what is this custom component?" tooltip on the class slot
-  // of `e(MyButton, …)` style calls.
   context.subscriptions.push(
     vscode.languages.registerHoverProvider(
       selector,
@@ -272,15 +224,12 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Inlay hints — labels at the closing `)` of every multi-line
-  // createElement call.
   const inlayHints = new CreateElementInlayHintsProvider(workspaceIndex);
   context.subscriptions.push(
     inlayHints,
     vscode.languages.registerInlayHintsProvider(selector, inlayHints)
   );
 
-  // Document symbols — Outline panel, breadcrumbs, Go to Symbol.
   context.subscriptions.push(
     vscode.languages.registerDocumentSymbolProvider(
       selector,
@@ -288,11 +237,9 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Diagnostics — reserved-name, deprecations, opt-in missing imports.
   const diagnostics = new DiagnosticsManager(workspaceIndex);
   context.subscriptions.push(diagnostics);
 
-  // Code actions — Font → FontFace, TextColor → TextColor3, auto-import.
   context.subscriptions.push(
     vscode.languages.registerCodeActionsProvider(
       selector,
@@ -313,7 +260,6 @@ export function activate(context: vscode.ExtensionContext) {
       }
     )
   );
-  // Convert Color3 between fromRGB / fromHex / new / fromHSV.
   context.subscriptions.push(
     vscode.languages.registerCodeActionsProvider(
       selector,
@@ -324,8 +270,6 @@ export function activate(context: vscode.ExtensionContext) {
       }
     )
   );
-  // Convert UDim2 between new / fromOffset / fromScale (lossless,
-  // purely syntactic — only fires when scales OR offsets are zero).
   context.subscriptions.push(
     vscode.languages.registerCodeActionsProvider(
       selector,
@@ -336,9 +280,6 @@ export function activate(context: vscode.ExtensionContext) {
       }
     )
   );
-  // Convert fromScale ↔ fromOffset by deducing the parent element's
-  // pixel size from the source-order parent chain. Fires when the
-  // chain resolves to a concrete pixel value; otherwise stays hidden.
   context.subscriptions.push(
     vscode.languages.registerCodeActionsProvider(
       selector,
@@ -349,9 +290,6 @@ export function activate(context: vscode.ExtensionContext) {
       }
     )
   );
-  // "Calculate Size from children" — compute the parent's pixel size
-  // from its children's literal `UDim2.fromOffset` Sizes, plus any
-  // `UIListLayout` Padding + FillDirection and `UIPadding` margins.
   context.subscriptions.push(
     vscode.languages.registerCodeActionsProvider(
       selector,
@@ -362,9 +300,6 @@ export function activate(context: vscode.ExtensionContext) {
       }
     )
   );
-  // UICorner — collapse four equal individual corner radii into one
-  // `CornerRadius`, or expand a `CornerRadius` into the four individual
-  // props. Fires when the cursor is inside a `UICorner` element call.
   context.subscriptions.push(
     vscode.languages.registerCodeActionsProvider(
       selector,
@@ -375,7 +310,6 @@ export function activate(context: vscode.ExtensionContext) {
       }
     )
   );
-  // Wrap selection in Frame / ScrollingFrame / container w/ UIListLayout.
   context.subscriptions.push(
     vscode.languages.registerCodeActionsProvider(
       selector,
@@ -387,10 +321,6 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // `anchor:tl|t|tr|l|c|r|bl|b|br` typed completion inside props tables.
-  // Trigger char `:` overlaps with the Roblox-glyph completion (which only
-  // fires inside strings) — both providers context-check and return
-  // undefined when they aren't relevant.
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       selector,
@@ -399,10 +329,6 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Workspace-wide component rename — `F2` on a component identifier
-  // renames the definition + every createElement-style call site + every
-  // Vide/Fusion direct-call site (`MyComp({ … })`, `MyComp { … }`) across
-  // the workspace. Covers the call shapes luau-lsp's rename can't see.
   context.subscriptions.push(
     vscode.languages.registerRenameProvider(
       selector,
@@ -410,11 +336,7 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // "N references" CodeLens above every component definition.
-  // The lens displays a synchronous workspace-wide count; the actual
-  // call-site Locations are resolved lazily by the command below when
-  // the user clicks. This avoids opening every workspace file on every
-  // lens refresh — previously dominated CPU on large projects.
+  // Resolve reference locations on click to avoid reading files on every lens refresh.
   const referencesLens = new ComponentReferencesLensProvider(workspaceIndex);
   context.subscriptions.push(
     referencesLens,
@@ -439,17 +361,12 @@ export function activate(context: vscode.ExtensionContext) {
       }
     )
   );
-  // Frame-stats CodeLens — `▸ N descendants, D layers` above heavy
-  // subtrees. Off by default (visual noise).
   const frameStatsLens = new FrameStatsLensProvider();
   context.subscriptions.push(
     frameStatsLens,
     vscode.languages.registerCodeLensProvider(selector, frameStatsLens)
   );
 
-  // Gradient editor — CodeLens above each `ColorSequence.new(...)`, a
-  // hover-preview of the gradient strip, and a webview panel with
-  // draggable stops + per-stop colour picker.
   const gradientLens = new GradientCodeLensProvider();
   const gradientEditor = new GradientEditorManager(context);
   context.subscriptions.push(
@@ -460,7 +377,6 @@ export function activate(context: vscode.ExtensionContext) {
       selector,
       new GradientHoverProvider()
     ),
-    // Visual hover previews for TweenInfo, UIPadding, UICorner, UIStroke.
     vscode.languages.registerHoverProvider(
       selector,
       new UIHoverPreviewsProvider()
@@ -473,10 +389,6 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Rect editor — CodeLens "Edit sprite rect" above every
-  // ImageLabel/ImageButton whose Image prop is a literal rbxassetid.
-  // Opens a side-panel editor showing the actual thumbnail with a
-  // draggable rectangle for picking ImageRectOffset/ImageRectSize.
   const rectLens = new RectCodeLensProvider();
   const rectEditor = new RectEditorManager(context);
   context.subscriptions.push(
@@ -491,7 +403,6 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Color3-to-palette extractor — code action on any Color3 literal.
   context.subscriptions.push(
     vscode.languages.registerCodeActionsProvider(
       selector,
@@ -503,8 +414,6 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Sort props by category — code action, plus an opt-in on-save formatter
-  // (luix.sortProps.onSave, default off).
   context.subscriptions.push(
     vscode.languages.registerCodeActionsProvider(
       selector,
@@ -517,20 +426,12 @@ export function activate(context: vscode.ExtensionContext) {
     new SortPropsOnSaveListener()
   );
 
-  // Workspace-wide diagnostic aggregator. The summary surfaces through
-  // the sidebar; the provider does nothing while disabled.
   const workspaceValidation = new WorkspaceValidation();
   context.subscriptions.push(workspaceValidation);
 
-  // Gutter image previews next to `Image = "rbxassetid://..."` lines —
-  // downloads and caches a tiny thumbnail per asset under the
-  // extension's global storage (or `.luix/assetThumbs/` when the user
-  // has opted in to workspace-local caching).
   const imageGutter = new ImageGutterDecorator(context);
   context.subscriptions.push(imageGutter);
 
-  // Palette completion — triggers on `.` and only fires when the cursor
-  // is right after `Color3.`.
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       selector,
@@ -538,9 +439,6 @@ export function activate(context: vscode.ExtensionContext) {
       "."
     )
   );
-  // Design-token completion — `luix.spacing` shows after `UDim.`,
-  // `luix.fonts` after `Font.`. Both empty by default — opt-in via
-  // user config.
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       selector,
@@ -554,9 +452,6 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Roblox font catalogue — family names inside `Font.fromName("…")`,
-  // weight names after `Enum.FontWeight.`, filtered by the active
-  // family when we can detect it from the surrounding call.
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       selector,
@@ -572,11 +467,6 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // RichText completion — `<` inside any single-line string surfaces the
-  // Roblox tag list (`<b>`, `<font ...>`, `<stroke ...>`, …). The snippet
-  // also inserts the matching close tag. Paired with an auto-close handler
-  // so typing the `>` of an opening tag (`<font size="18">`) drops in the
-  // matching `</font>` after the cursor. Both gated by `luix.richText.enabled`.
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       selector,
@@ -592,11 +482,6 @@ export function activate(context: vscode.ExtensionContext) {
   );
   registerRichTextAutoClose(context);
 
-  // Roblox private-use-area glyph support — Robux / Premium / Verified /
-  // Roblox Plus render as missing-glyph boxes in VS Code's default fonts.
-  // Inlay hints name each occurrence; the hover gives codepoint + Luau
-  // escape; the `:slug:` completion lets users insert the literal glyph
-  // from inside a string. All gated by `luix.robloxGlyphs.enabled`.
   const robloxGlyphHints = new RobloxGlyphInlayHintsProvider();
   context.subscriptions.push(
     robloxGlyphHints,
@@ -612,12 +497,6 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Roblox content-URL autocomplete — `rbxthumb://` (dynamic thumbnails
-  // with per-type valid sizes) and `rbxasset://` (bundled content files
-  // scanned from the local install). The thumbnail diagnostic flags
-  // hand-typed unsupported sizes / types. All gated by
-  // `luix.robloxContent.enabled`; the content scan honours
-  // `luix.robloxContent.path`.
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       selector,
@@ -636,7 +515,6 @@ export function activate(context: vscode.ExtensionContext) {
       new RbxThumbHoverProvider()
     ),
     new RbxThumbDiagnostics(),
-    // Re-scan the content folder when the override path / toggle changes.
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("luix.robloxContent")) {
         resetContentCache();
@@ -644,7 +522,6 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // ---- Sidebar (Workspace + Components views) ----
   const workspaceTreeProvider = new WorkspaceTreeProvider(
     context,
     workspaceValidation
@@ -653,7 +530,6 @@ export function activate(context: vscode.ExtensionContext) {
     workspaceIndex,
     context
   );
-  // Seed the context key so the title-bar toggle shows the right icon.
   void vscode.commands.executeCommand(
     "setContext",
     "luix.componentsViewMode",
@@ -672,7 +548,6 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // ---- Commands wired up by the sidebar entries ----
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "luix.wally.regenerateTypes",
@@ -755,9 +630,7 @@ export function activate(context: vscode.ExtensionContext) {
             true,
             vscode.ConfigurationTarget.Global
           );
-        // The sidebar entry IS the disclosure — suppress the
-        // post-first-download notification so users don't get the
-        // same message twice.
+        // The sidebar already disclosed the cache location.
         await context.globalState.update(
           "luix.imageGutter.firstDownloadNotified",
           true
@@ -836,12 +709,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {}
 
-// ============================================================================
-// Re-exports for tests
-// ============================================================================
-//
-// The test file imports from `../extension`. To keep tests unchanged after
-// the refactor, re-export each helper/type from its new home.
+// Test-facing exports.
 
 export {
   buildCodeMask,

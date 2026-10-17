@@ -8,8 +8,7 @@ interface ProjectRoot {
 
 let nextRunId = 0;
 
-/** ProcessExecution keeps filenames out of shell grammar and gives each
- * task an explicit root, independent of a previously used terminal's cwd. */
+// Pass arguments directly and set cwd explicitly; filenames must not enter shell grammar.
 async function runTask(
   folder: vscode.WorkspaceFolder,
   command: string,
@@ -131,7 +130,6 @@ export async function regenerateWallyTypes(): Promise<void> {
   await runTask(root.folder, "wally-package-types", ["--sourcemap", "sourcemap.json", "Packages/"]);
 }
 
-/** Used by the sidebar to show actions available in any workspace root. */
 export interface WorkspaceCapabilities {
   hasWally: boolean;
   hasRojoProject: boolean;

@@ -15,19 +15,7 @@ import {
   splitTopLevelArgs,
 } from "./textUtils";
 
-// ============================================================================
-// ColorSequence parsing
-//
-// Three call shapes are recognised:
-//   ColorSequence.new(c1)                     → solid colour
-//   ColorSequence.new(c1, c2)                 → two-stop
-//   ColorSequence.new({ CSK.new(t, c), ... }) → N-stop
-//
-// Each `c` is a `Color3.fromRGB / new / fromHex / fromHSV` call. Anything
-// non-literal (a variable, function call, etc.) makes the whole gradient
-// unparseable — in that case we return `undefined` so callers can leave
-// the literal alone.
-// ============================================================================
+// Parse literal sequences only; leave expressions untouched.
 
 export interface GradientStop {
   t: number; // offset, 0..1
@@ -37,9 +25,8 @@ export interface GradientStop {
 }
 
 export interface GradientLiteral {
-  /** Offset of `ColorSequence`. */
   start: number;
-  /** Offset just after the matching `)`. */
+  /** Exclusive end offset. */
   end: number;
   stops: GradientStop[];
 }
@@ -54,14 +41,7 @@ interface GradientCacheEntry {
 const gradientCache: GradientCacheEntry[] = [];
 const GRADIENT_CACHE_MAX = 4;
 
-/**
- * Find every `ColorSequence.new(...)` literal whose arguments are all
- * Color3 literals (and, for the keypoint form, numeric offsets). Returns
- * an empty array if none parse cleanly.
- *
- * Cached by document text identity — CodeLens + hover both call this on
- * every refresh, so the cache keeps the hot path free.
- */
+/** Cache literal sequences by document text for CodeLens and hover. */
 export function findGradientLiterals(text: string): GradientLiteral[] {
   for (let i = gradientCache.length - 1; i >= 0; i--) {
     if (gradientCache[i].text === text) {
@@ -71,8 +51,7 @@ export function findGradientLiterals(text: string): GradientLiteral[] {
     }
   }
 
-  // Fast scan: if the substring isn't present at all, skip the masking
-  // step (which builds an N-length array).
+  // Skip masking files without a sequence constructor.
   if (!text.includes("ColorSequence.new")) {
     const empty: GradientLiteral[] = [];
     gradientCache.push({ text, result: empty });
@@ -120,13 +99,9 @@ function parseGradientArgs(
   argsStart: number,
   argsEnd: number
 ): GradientStop[] | undefined {
-  // Distinguish keypoint-table form from the (c) / (c1, c2) forms by
-  // looking for an opening `{` before the first comma.
   const trimmedStart = skipWs(masked, argsStart, argsEnd);
   if (trimmedStart >= argsEnd) {
-    // Empty `ColorSequence.new()` — surface the editor anyway with a
-    // sensible black→white placeholder, so the user can populate it
-    // visually instead of having to type a Color3 first.
+    // Seed empty sequences with black-to-white stops.
     return [
       { t: 0, r: 0, g: 0, b: 0 },
       { t: 1, r: 1, g: 1, b: 1 },
@@ -144,7 +119,6 @@ function parseGradientArgs(
       closeBrace
     );
   }
-  // (c) or (c1, c2)
   const args = splitTopLevelArgs(masked, argsStart, argsEnd);
   if (args.length === 0 || args.length > 2) {
     return undefined;
@@ -290,18 +264,7 @@ function parseHex(s: string): { r: number; g: number; b: number } | undefined {
   return { r: ((n >> 16) & 0xff) / 255, g: ((n >> 8) & 0xff) / 255, b: (n & 0xff) / 255 };
 }
 
-// ============================================================================
-// NumberSequence parsing
-//
-// Same three call shapes as ColorSequence:
-//   NumberSequence.new(v)
-//   NumberSequence.new(v1, v2)
-//   NumberSequence.new({ NumberSequenceKeypoint.new(t, v, env?), ... })
-//
-// NumberSequenceKeypoint's third arg (envelope) is optional and defaults
-// to 0. Each value is expected to be a literal number; expressions
-// referencing variables make the literal unparseable and we skip it.
-// ============================================================================
+// NumberSequence envelopes default to zero; skip non-literal values.
 
 export interface NumberStop {
   t: number; // 0..1
@@ -310,9 +273,8 @@ export interface NumberStop {
 }
 
 export interface NumberSequenceLiteral {
-  /** Offset of `NumberSequence`. */
   start: number;
-  /** Offset just after the matching `)`. */
+  /** Exclusive end offset. */
   end: number;
   stops: NumberStop[];
 }
@@ -387,7 +349,7 @@ function parseNumberSequenceArgs(
 ): NumberStop[] | undefined {
   const trimmedStart = skipWs(masked, argsStart, argsEnd);
   if (trimmedStart >= argsEnd) {
-    // Empty `NumberSequence.new()` → placeholder 0→0 (opaque to opaque).
+    // Seed empty sequences with two opaque stops.
     return [
       { t: 0, v: 0, env: 0 },
       { t: 1, v: 0, env: 0 },
@@ -506,20 +468,13 @@ function hsvToRgb(h: number, s: number, v: number): { r: number; g: number; b: n
   }
 }
 
-// Tiny bracket/range helpers live in `./textUtils` — same implementations
-// formerly duplicated here, now shared with rect.ts and hoverPreviews.ts.
-
-// ============================================================================
-// Lua code generation — render a stop array back into a `ColorSequence.new`
-// expression matching the user's preferred Color3 format setting.
-// ============================================================================
 export function renderColorSequence(
   stops: GradientStop[],
   outerIndent = "",
   innerStep = "\t"
 ): string {
   const sorted = [...stops].sort((a, b) => a.t - b.t);
-  // Collapse identical-color endpoints into the shortest form.
+  // Use the short form for identical endpoints.
   if (
     sorted.length === 2 &&
     sorted[0].t === 0 &&
@@ -530,10 +485,6 @@ export function renderColorSequence(
     }
     return `ColorSequence.new(${renderColor3(sorted[0])}, ${renderColor3(sorted[1])})`;
   }
-  // Multi-stop: indent inner lines by `outerIndent + innerStep` and put the
-  // closing `})` at `outerIndent` so it lines up with whatever introduced
-  // the call (e.g. `        Color = ColorSequence.new({` → keypoints at
-  // `        \t`, closing brace at `        `).
   const lines = sorted
     .map(
       (s) =>
@@ -555,7 +506,6 @@ function renderColor3(c: { r: number; g: number; b: number }): string {
   if (format === "new") {
     return `Color3.new(${formatNum(c.r)}, ${formatNum(c.g)}, ${formatNum(c.b)})`;
   }
-  // fromRGB default
   return `Color3.fromRGB(${Math.round(c.r * 255)}, ${Math.round(c.g * 255)}, ${Math.round(c.b * 255)})`;
 }
 
@@ -572,12 +522,7 @@ function formatNum(n: number): string {
   return Number(n.toFixed(3)).toString();
 }
 
-/**
- * Render a `NumberSequence.new(...)` call from its stops. Mirrors the
- * collapsing rules of `renderColorSequence` — two-endpoint constants use
- * the short form, otherwise we emit the keypoint-table form. The third
- * `envelope` argument is omitted when zero (Roblox's default).
- */
+/** Use the short form for constants; omit zero envelopes. */
 export function renderNumberSequence(
   stops: NumberStop[],
   outerIndent = "",
@@ -608,35 +553,21 @@ export function renderNumberSequence(
   return `NumberSequence.new({\n${lines}\n${outerIndent}})`;
 }
 
-// ============================================================================
-// UIGradient sibling-prop context
-//
-// When a Color/NumberSequence literal sits inside an `e("UIGradient", { … })`
-// props table, the editor's preview should reflect the OTHER channel and
-// the Rotation prop too — so a user editing the colour ramp can see the
-// final element. `findUIGradientContext` returns whatever it can parse
-// without applying any side effects to the document.
-// ============================================================================
+// Preview gradients with sibling channels, rotation and the parent background.
 
 export interface UIGradientContext {
-  /** Range of the `e("UIGradient", { … })` props brace `{ … }`. */
+  /** Props table range. */
   propsBraceStart: number;
   propsBraceEnd: number;
   colorStops?: GradientStop[];
   transparencyStops?: NumberStop[];
   rotation?: number;
-  /** Range of the sibling Color/Transparency literal, if any — so callers
-   *  can omit it from preview rendering when the user is currently editing it. */
+  /** Sibling sequence range, excluded while that channel is being edited. */
   colorLiteral?: { start: number; end: number };
   transparencyLiteral?: { start: number; end: number };
 }
 
-/**
- * Find every `e("UIGradient", { … })` element call in the document, so
- * we can hang a single "Edit UIGradient" CodeLens above each one
- * (instead of separate lenses for the Color and Transparency literals
- * inside).
- */
+/** One lens handles all UIGradient channels. */
 export function findUIGradientCalls(
   text: string
 ): Array<{
@@ -645,8 +576,6 @@ export function findUIGradientCalls(
   propsBraceStart: number;
   propsBraceEnd: number;
 }> {
-  // Fast reject: most files have no UIGradient at all, and this fires
-  // from the CodeLens provider on every refresh.
   if (!text.includes("UIGradient")) {
     return [];
   }
@@ -676,12 +605,7 @@ export function findUIGradientCalls(
   return out;
 }
 
-/**
- * Find the `BackgroundColor3` of the element that *contains* the given
- * UIGradient call — the gradient is rendered over that color in Roblox,
- * so the preview should reflect it. Returns `undefined` when the parent
- * doesn't set BackgroundColor3 (callers default to Roblox's white).
- */
+/** Preview the gradient over its parent's background; default to white. */
 export function findParentBackgroundColor3(
   text: string,
   uigradientStart: number,
@@ -689,8 +613,6 @@ export function findParentBackgroundColor3(
 ): { r: number; g: number; b: number } | undefined {
   const aliases = getAliasPartition();
   const calls = findAllCreateElementCalls(text, aliases);
-  // Smallest call strictly containing the UIGradient (and that isn't the
-  // UIGradient itself) is its immediate parent in the tree.
   let parent: typeof calls[number] | undefined;
   for (const c of calls) {
     if (c.aliasStart === uigradientStart && c.fullEnd === uigradientEnd) {
@@ -737,7 +659,6 @@ export function findUIGradientContext(
 ): UIGradientContext | undefined {
   const aliases = getAliasPartition();
   const calls = findAllCreateElementCalls(text, aliases);
-  // Find the smallest call whose props brace strictly contains the literal.
   let host: { propsBraceStart: number; propsBraceEnd: number } | undefined;
   for (const call of calls) {
     if (
@@ -782,7 +703,6 @@ export function findUIGradientContext(
   for (const entry of entries) {
     const valueText = propsBody.slice(entry.valueStart, entry.valueEnd).trim();
     if (entry.key === "Color") {
-      // Reuse the color-sequence parser by passing a single-literal slice.
       const literals = findGradientLiterals(text);
       const absValueStart = bodyStart + entry.valueStart;
       const absValueEnd = bodyStart + entry.valueEnd;
@@ -814,9 +734,6 @@ export function findUIGradientContext(
   return ctx;
 }
 
-// ============================================================================
-// Inline preview: SVG data URI for hover markdown
-// ============================================================================
 export function gradientSvgDataUri(
   stops: GradientStop[],
   width = 220,
@@ -835,10 +752,6 @@ export function gradientSvgDataUri(
   return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
 }
 
-/**
- * Render a NumberSequence preview as a horizontal value-curve strip —
- * useful in the hover tooltip when there's no colour to display.
- */
 export function numberSequenceSvgDataUri(
   stops: NumberStop[],
   width = 220,
@@ -868,9 +781,6 @@ export function numberSequenceSvgDataUri(
   return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
 }
 
-// ============================================================================
-// CodeLens — "Edit gradient" above any literal
-// ============================================================================
 export class GradientCodeLensProvider
   implements vscode.CodeLensProvider, vscode.Disposable
 {
@@ -895,9 +805,7 @@ export class GradientCodeLensProvider
     const text = document.getText();
     const out: vscode.CodeLens[] = [];
 
-    // 1) Single "Edit UIGradient" lens for every `e("UIGradient", {...})`
-    //    call. This combined editor handles Color, Transparency, and
-    //    Rotation together — no separate lenses for the inner literals.
+    // Combined UIGradient lenses replace the inner sequence lenses.
     const uigradients = findUIGradientCalls(text);
     for (const ui of uigradients) {
       const range = new vscode.Range(
@@ -913,7 +821,6 @@ export class GradientCodeLensProvider
       );
     }
 
-    // Helper: is a literal at [start, end) inside any UIGradient props brace?
     const insideUIGradient = (start: number, end: number) =>
       uigradients.some(
         (ui) =>
@@ -921,7 +828,6 @@ export class GradientCodeLensProvider
           end <= ui.propsBraceEnd
       );
 
-    // 2) Standalone ColorSequence literals (NOT inside a UIGradient).
     for (const lit of findGradientLiterals(text)) {
       if (insideUIGradient(lit.start, lit.end)) {
         continue;
@@ -939,7 +845,6 @@ export class GradientCodeLensProvider
       );
     }
 
-    // 3) Standalone NumberSequence literals (NOT inside a UIGradient).
     for (const lit of findNumberSequenceLiterals(text)) {
       if (insideUIGradient(lit.start, lit.end)) {
         continue;
@@ -967,9 +872,6 @@ export class GradientCodeLensProvider
   }
 }
 
-// ============================================================================
-// Hover — inline gradient strip preview
-// ============================================================================
 export class GradientHoverProvider implements vscode.HoverProvider {
   provideHover(
     document: vscode.TextDocument,
@@ -1027,9 +929,6 @@ export class GradientHoverProvider implements vscode.HoverProvider {
   }
 }
 
-// ============================================================================
-// Webview editor
-// ============================================================================
 export type GradientMode = "color" | "number" | "uigradient";
 
 export class GradientEditorManager implements vscode.Disposable {
@@ -1058,10 +957,6 @@ export class GradientEditorManager implements vscode.Disposable {
     const startOff = document.offsetAt(range.start);
     const endOff = document.offsetAt(range.end);
 
-    // Per-mode resolution. The webview gets just the data it needs: a
-    // ColorSequence editor sees colour stops only, a NumberSequence editor
-    // sees number stops only, and the UIGradient editor gets everything
-    // (both channels + rotation + parent BG colour).
     let colorHit: GradientLiteral | undefined;
     let numberHit: NumberSequenceLiteral | undefined;
     let uiGradientCall:
@@ -1095,8 +990,6 @@ export class GradientEditorManager implements vscode.Disposable {
       }
       initNumberStops = numberHit.stops;
     } else {
-      // uigradient — look up the UIGradient call at this range and read
-      // its Color / Transparency / Rotation props from inside.
       uiGradientCall = findUIGradientCalls(text).find(
         (c) => c.aliasStart === startOff && c.fullEnd === endOff
       );
@@ -1169,7 +1062,6 @@ export class GradientEditorManager implements vscode.Disposable {
       vscode.ViewColumn.Beside,
       { enableScripts: true, retainContextWhenHidden: true }
     );
-    // Show the Luix logo in the tab instead of the default `?` icon.
     panel.iconPath = vscode.Uri.joinPath(
       this.context.extensionUri,
       "assets",
@@ -1182,10 +1074,7 @@ export class GradientEditorManager implements vscode.Disposable {
       this.panels.delete(key);
     });
 
-    // Register message handler BEFORE assigning HTML — the webview's
-    // iframe begins loading immediately on assignment and can fire its
-    // `ready` message before a handler attached afterward would catch
-    // it, leaving the editor stuck on "Loading…".
+    // Attach the message handler before HTML can send ready.
     panel.webview.onDidReceiveMessage(async (msg) => {
       if (disposed) {return;}
       if (msg?.type === "ready") {
@@ -1234,9 +1123,7 @@ export class GradientEditorManager implements vscode.Disposable {
   }
 }
 
-// Re-locate a literal's range in the (possibly edited) document. We try
-// exact-offset match first, then fall back to whatever literal lives on
-// the same line. Returns `undefined` if the literal can't be found at all.
+// Relocate by exact range, then by line.
 function relocateLiteral<T extends { start: number; end: number }>(
   document: vscode.TextDocument,
   literals: T[],
@@ -1326,12 +1213,7 @@ async function applyNumberEdit(
   await vscode.workspace.applyEdit(edit);
 }
 
-/**
- * Apply a combined UIGradient edit: rewrite the Color / Transparency
- * literals (creating them if they don't exist) and set the Rotation
- * value. All three changes are queued onto a single WorkspaceEdit so
- * they apply atomically.
- */
+/** Update all UIGradient properties in one WorkspaceEdit. */
 async function applyUIGradientEdit(
   uri: vscode.Uri,
   original: { aliasStart: number; fullEnd: number; propsBraceStart: number; propsBraceEnd: number },
@@ -1362,9 +1244,6 @@ async function applyUIGradientEdit(
     uri,
     call.aliasStart
   );
-  // Each prop sits one indent level *inside* the table opening. We pass
-  // outerIndent + innerStep to the sequence renderers so their multi-line
-  // form (Color/Transparency keypoint arrays) lines up correctly.
   const propIndent = outerIndent + innerStep;
   const colorLiteral = renderColorSequence(
     newColorStops,
@@ -1378,10 +1257,7 @@ async function applyUIGradientEdit(
   );
   const rotationLiteral = formatNum(newRotation);
 
-  // Detect "default" UIGradient values. Writing these out is noise —
-  // Roblox already applies them when the prop is absent. If the user
-  // edited a prop to a default, DELETE the existing entry; if it
-  // wasn't there to begin with, skip the insert entirely.
+  // Remove default values instead of writing redundant props.
   const isDefaultColor =
     newColorStops.length === 2 &&
     newColorStops.every((s) => s.r === 1 && s.g === 1 && s.b === 1);
@@ -1475,7 +1351,6 @@ function renderGradientWebviewHtml(): string {
     grid-template-columns: 1fr;
   }
 
-  /* Sections — visible per mode */
   .section {
     background: var(--panel-bg);
     border: 1px solid var(--panel-border);
@@ -1496,7 +1371,6 @@ function renderGradientWebviewHtml(): string {
   body[data-mode="number"] .color-section,
   body[data-mode="number"] .rotation-section { display: none; }
 
-  /* ---- Colour ramp ---- */
   .strip {
     position: relative;
     height: 42px;
@@ -1506,8 +1380,6 @@ function renderGradientWebviewHtml(): string {
     touch-action: none;
     overflow: visible;
   }
-  /* Hover indicator on the colour strip — a thin vertical line + a small
-     pill label showing the t value at the cursor position. */
   .strip-hover {
     position: absolute;
     top: -3px;
@@ -1544,8 +1416,7 @@ function renderGradientWebviewHtml(): string {
     height: 28px;
     margin-top: 8px;
   }
-  /* Triangular colour stop — base on top pointing UP at the strip,
-     matching Roblox Studio's ColorSequence editor. */
+  /* Border triangles form the draggable color stops. */
   .cstop {
     position: absolute;
     top: 0;
@@ -1565,7 +1436,6 @@ function renderGradientWebviewHtml(): string {
     transform: translateX(-50%) scale(1.18);
   }
   .cstop::after {
-    /* Inner triangle showing the stop's actual colour */
     content: "";
     position: absolute;
     top: 3px;
@@ -1578,7 +1448,6 @@ function renderGradientWebviewHtml(): string {
   }
   .cstop.dragging { cursor: grabbing; }
 
-  /* ---- Transparency / NumberSequence curve ---- */
   .curve-wrap {
     position: relative;
     width: 100%;
@@ -1589,7 +1458,6 @@ function renderGradientWebviewHtml(): string {
     cursor: copy;
     touch-action: none;
   }
-  /* Crosshair indicator on the curve — shows where a new stop would land */
   .curve-hover-v, .curve-hover-h {
     position: absolute;
     background: rgba(255, 255, 255, 0.4);
@@ -1648,7 +1516,6 @@ function renderGradientWebviewHtml(): string {
   }
   .nstop.dragging { cursor: grabbing; }
 
-  /* ---- Rotation slider ---- */
   .rotation-row {
     display: grid;
     grid-template-columns: 1fr auto auto;
@@ -1664,7 +1531,6 @@ function renderGradientWebviewHtml(): string {
     width: 56px;
   }
 
-  /* ---- Preview square (uigradient only) ---- */
   .preview-col {
     width: 256px;
     position: sticky;
@@ -1705,7 +1571,6 @@ function renderGradientWebviewHtml(): string {
     box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
   }
 
-  /* ---- Controls strip (Time / Color / Value / Envelope / Delete) ---- */
   .controls {
     display: flex;
     gap: 14px;
@@ -1757,7 +1622,6 @@ function renderGradientWebviewHtml(): string {
   button:hover { filter: brightness(1.1); }
   button:disabled { opacity: 0.4; cursor: not-allowed; }
 
-  /* ---- Code preview + actions ---- */
   .preview-code {
     padding: 10px 12px;
     border-radius: 6px;
@@ -1859,7 +1723,6 @@ function renderGradientWebviewHtml(): string {
   let rotation = 0;
   let parentBg = { r: 1, g: 1, b: 1 };
 
-  /** "color" | "number" — which channel the selection refers to */
   let selectedKind = "color";
   let selectedIdx = 0;
 
@@ -1888,7 +1751,6 @@ function renderGradientWebviewHtml(): string {
   const clampV = (n) => Math.max(0, Math.min(1, n));
   const formatNum = (n) =>
     Number.isInteger(n) ? String(n) : Number(n.toFixed(3)).toString();
-  /** Snap a 0..1 number to nearest 0.05 when shift is held, else leave continuous. */
   const maybeSnap = (n, shift) => (shift ? Math.round(n * 20) / 20 : n);
   const rgbToHex = (r, g, b) => {
     const h = (n) => Math.round(n * 255).toString(16).padStart(2, "0");
@@ -1902,7 +1764,6 @@ function renderGradientWebviewHtml(): string {
   const color3Str = (s) =>
     "Color3.fromRGB(" + Math.round(s.r * 255) + ", " + Math.round(s.g * 255) + ", " + Math.round(s.b * 255) + ")";
 
-  // --- Sampling ---
   function sampleColor(arr, t) {
     if (!arr || arr.length === 0) return { r: 1, g: 1, b: 1 };
     const sorted = [...arr].sort((a, b) => a.t - b.t);
@@ -1934,7 +1795,6 @@ function renderGradientWebviewHtml(): string {
     return last.v;
   }
 
-  // --- Strip (color band) ---
   function paintStrip() {
     if (mode === "number") return;
     const sorted = [...colorStops].sort((a, b) => a.t - b.t);
@@ -1966,11 +1826,9 @@ function renderGradientWebviewHtml(): string {
     });
   }
 
-  // --- Curve (number sequence) ---
   function paintCurve() {
     if (mode === "color") return;
     const sorted = [...numberStops].sort((a, b) => a.t - b.t);
-    // Build grid + polyline
     const gridLines = [];
     for (let i = 1; i < 10; i++) {
       gridLines.push('<line x1="' + (i * 10) + '" y1="0" x2="' + (i * 10) + '" y2="60" stroke="rgba(255,255,255,0.05)" stroke-width="0.3"/>');
@@ -1979,7 +1837,7 @@ function renderGradientWebviewHtml(): string {
       gridLines.push('<line x1="0" y1="' + (i * 10) + '" x2="100" y2="' + (i * 10) + '" stroke="rgba(255,255,255,0.05)" stroke-width="0.3"/>');
     }
     const pts = sorted.map((s) => (s.t * 100).toFixed(2) + "," + (s.v * 60).toFixed(2)).join(" ");
-    // Envelope shading: vertical band from (v-env) to (v+env) at each stop, connected
+    // Shade the value +/- envelope range.
     let envelopePoly = "";
     if (sorted.some((s) => s.env > 0)) {
       const upper = sorted.map((s) => (s.t * 100).toFixed(2) + "," + (clampV(s.v - s.env) * 60).toFixed(2));
@@ -2012,16 +1870,10 @@ function renderGradientWebviewHtml(): string {
     });
   }
 
-  // --- Controls (Time / Color / Value / Envelope / Delete) ---
-  // Block any keypress / paste that would put a non-numeric character
-  // into a numeric text field. Caller decides whether negatives or
-  // decimals are allowed via the allowedChar regex. We also enforce a
-  // maxlength here so the user can't type a 30-digit number.
   function attachNumericFilter(el, allowedChar, maxLen) {
     el.setAttribute("maxlength", String(maxLen));
     el.addEventListener("beforeinput", (ev) => {
-      if (!ev.data) return; // deletion, navigation, etc.
-      // Reject if any char in the inserted text isn't allowed.
+      if (!ev.data) return;
       for (const ch of ev.data) {
         if (!allowedChar.test(ch)) {
           ev.preventDefault();
@@ -2029,7 +1881,7 @@ function renderGradientWebviewHtml(): string {
         }
       }
     });
-    // Drop any forbidden chars that slip past (e.g. from undo/redo).
+    // Undo/redo can bypass beforeinput filtering.
     el.addEventListener("input", () => {
       const cleaned = el.value
         .split("")
@@ -2039,10 +1891,7 @@ function renderGradientWebviewHtml(): string {
     });
   }
 
-  // Wire a text input to scroll-wheel and arrow-key stepping. We use
-  // type="text" instead of type="number" for these fields so the display
-  // always uses "." regardless of OS locale — at the cost of losing the
-  // native up/down arrow stepping, which this helper replaces.
+  // Text inputs preserve decimal dots; provide numeric stepping manually.
   function attachScroll(el, step, onCommit) {
     const apply = (dir, shift) => {
       const useStep = shift ? step * 5 : step;
@@ -2066,12 +1915,7 @@ function renderGradientWebviewHtml(): string {
     });
   }
 
-  // Key identifying the CURRENT controls structure. We only rebuild
-  // controls.innerHTML when this key changes (different stop kind or
-  // different selected index). Otherwise the existing inputs get their
-  // values updated in place — that preserves focus + caret position so
-  // pressing ArrowUp/ArrowDown multiple times in a row works, and the
-  // input doesn't blink while you type.
+  // Rebuild only when the selection changes to preserve input focus and caret.
   let lastControlsKey = "";
 
   function paintControls() {
@@ -2092,8 +1936,7 @@ function renderGradientWebviewHtml(): string {
     }
     const key = selectedKind + "|" + selectedIdx + "|" + arr.length;
     if (key === lastControlsKey) {
-      // Same structure — just refresh field values for fields the user
-      // isn't actively editing. This is what keeps focus stable.
+      // Leave the active input untouched while updating other fields.
       const updateText = (id, value) => {
         const el = document.getElementById(id);
         if (el && document.activeElement !== el) el.value = value;
@@ -2113,10 +1956,7 @@ function renderGradientWebviewHtml(): string {
     }
     lastControlsKey = key;
 
-    // Use type=text + inputmode=decimal instead of type=number. Browsers
-    // format type=number values using the OS locale even with lang=en
-    // (so EU systems display "0,5" regardless), and there's no portable
-    // way to override that. Text inputs leave our value string alone.
+    // Text inputs avoid locale-dependent decimal formatting.
     let html = "";
     if (selectedKind === "color") {
       html =
@@ -2141,24 +1981,19 @@ function renderGradientWebviewHtml(): string {
     const nEnv = document.getElementById("nEnv");
     const nDel = document.getElementById("nDel");
 
-    // Allowed-char regex for unsigned decimals (Time / Value / Envelope).
     const unsignedDecimal = /[0-9.]/;
-    const maxDecLen = 6; // "0.0001" or "-0.001"
-    // Revert helper: on blur, restore the input from the model so any
-    // unparseable junk vanishes and the formatting is normalised.
+    const maxDecLen = 6;
     const wireField = (el, read, commit, allowed, maxLen) => {
       attachNumericFilter(el, allowed, maxLen);
       el.addEventListener("input", () => {
         const v = Number(el.value.replace(",", "."));
         if (!Number.isFinite(v)) return;
         commit(v);
-        // Don't trigger paintControls' value-overwrite — paint() does that
-        // and our updateText() check (activeElement !== el) keeps the text.
+        // paint() preserves the active input while refreshing other controls.
         paint();
       });
       el.addEventListener("blur", () => {
-        // If invalid (e.g. user typed just "." or "-"), snap back to the
-        // last good value from the model.
+        // Restore the last valid value on blur.
         const v = Number(el.value.replace(",", "."));
         if (!Number.isFinite(v)) {
           el.value = read();
@@ -2238,7 +2073,6 @@ function renderGradientWebviewHtml(): string {
     });
   }
 
-  // --- Preview square ---
   function paintPreview() {
     if (mode !== "uigradient") {
       previewSvg.innerHTML = "";
@@ -2251,7 +2085,7 @@ function renderGradientWebviewHtml(): string {
     if (ts.length === 0 || ts[0] !== 0) ts.unshift(0);
     if (ts[ts.length - 1] !== 1) ts.push(1);
 
-    // Multiply gradient colour by parent BG (Roblox semantics).
+    // Roblox multiplies the gradient by the parent background color.
     const bg = parentBg;
     const stopsXml = ts.map((t) => {
       const c = sampleColor(colorStops, t);
@@ -2277,9 +2111,7 @@ function renderGradientWebviewHtml(): string {
     } else if (mode === "number") {
       preview.textContent = renderNumberSequenceJS(numberStops);
     } else {
-      // UIGradient — only show props that aren't at Roblox defaults, to
-      // match the write-back behaviour. Otherwise the preview pretends
-      // it'll emit a line that Apply would actually delete.
+      // Omit defaults to match the properties written on Apply.
       const isDefColor = colorStops.length === 2 &&
         colorStops.every((s) => s.r === 1 && s.g === 1 && s.b === 1);
       const isDefTrans = numberStops.length === 2 &&
@@ -2335,7 +2167,6 @@ function renderGradientWebviewHtml(): string {
     paintCode();
   }
 
-  // --- Drag handling (shared for both stop kinds) ---
   function onStopDown(ev, kind, idx) {
     if (ev.button !== 0) return;
     ev.stopPropagation();
@@ -2380,7 +2211,6 @@ function renderGradientWebviewHtml(): string {
     paint();
   }
 
-  // --- Click-to-add stop on the strip ---
   strip.addEventListener("pointerdown", (ev) => {
     if (ev.button !== 0) return;
     const rect = strip.getBoundingClientRect();
@@ -2399,9 +2229,8 @@ function renderGradientWebviewHtml(): string {
     newEl.addEventListener("pointercancel", onStopEnd);
   });
 
-  // --- Hover indicator on the strip ---
   strip.addEventListener("pointermove", (ev) => {
-    if (drag) return; // suppressed while dragging — the stop itself is the indicator
+    if (drag) return;
     const rect = strip.getBoundingClientRect();
     const t = maybeSnap(clampT((ev.clientX - rect.left) / rect.width), ev.shiftKey);
     const pct = (t * 100).toFixed(2) + "%";
@@ -2416,7 +2245,6 @@ function renderGradientWebviewHtml(): string {
     stripHoverLabel.classList.remove("visible");
   });
 
-  // --- Click-to-add stop on the curve ---
   curveWrap.addEventListener("pointerdown", (ev) => {
     if (ev.button !== 0) return;
     const rect = curveWrap.getBoundingClientRect();
@@ -2435,7 +2263,6 @@ function renderGradientWebviewHtml(): string {
     newEl.addEventListener("pointercancel", onStopEnd);
   });
 
-  // --- Hover crosshair on the curve ---
   curveWrap.addEventListener("pointermove", (ev) => {
     if (drag) return;
     const rect = curveWrap.getBoundingClientRect();
@@ -2458,7 +2285,6 @@ function renderGradientWebviewHtml(): string {
     curveHoverLabel.classList.remove("visible");
   });
 
-  // --- Rotation ---
   function setRotation(deg) {
     rotation = Math.max(-180, Math.min(180, Math.round(deg)));
     if (document.activeElement !== rotationSlider) rotationSlider.value = String(rotation);
@@ -2467,7 +2293,6 @@ function renderGradientWebviewHtml(): string {
     paintCode();
   }
   rotationSlider.addEventListener("input", () => setRotation(Number(rotationSlider.value)));
-  // Rotation accepts a leading minus plus digits (-180..180). 4-char max.
   attachNumericFilter(rotationInput, /[0-9-]/, 4);
   rotationInput.addEventListener("input", () => {
     const v = Number(rotationInput.value.replace(",", "."));
@@ -2476,7 +2301,6 @@ function renderGradientWebviewHtml(): string {
   rotationInput.addEventListener("blur", () => {
     rotationInput.value = String(rotation);
   });
-  // Wheel/Arrow stepping for the rotation field. Step = 1°, Shift = 15°.
   rotationInput.addEventListener("wheel", (ev) => {
     ev.preventDefault();
     const dir = ev.deltaY > 0 ? -1 : 1;
@@ -2493,7 +2317,6 @@ function renderGradientWebviewHtml(): string {
     }
   });
 
-  // --- Actions ---
   document.getElementById("apply").addEventListener("click", () => {
     vscode.postMessage({
       type: "apply",
@@ -2504,7 +2327,6 @@ function renderGradientWebviewHtml(): string {
     vscode.postMessage({ type: "cancel" });
   });
 
-  // --- Keyboard ---
   window.addEventListener("keydown", (ev) => {
     const tag = (document.activeElement && document.activeElement.tagName) || "";
     if (tag === "INPUT" || tag === "TEXTAREA") return;
@@ -2537,7 +2359,6 @@ function renderGradientWebviewHtml(): string {
     }
   });
 
-  // --- Init ---
   window.addEventListener("message", (ev) => {
     const msg = ev.data;
     if (msg?.type !== "init") return;
@@ -2554,7 +2375,6 @@ function renderGradientWebviewHtml(): string {
         ? "NumberSequence editor"
         : "UIGradient editor";
 
-    // Default selection per mode
     if (mode === "color") {
       selectedKind = "color";
     } else if (mode === "number") {

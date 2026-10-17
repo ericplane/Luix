@@ -1,18 +1,19 @@
 import * as assert from "assert";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import * as vm from "vm";
 import * as vscode from "vscode";
 import type { WorkspaceIndex } from "../workspaceIndex";
+import { decodeFileText, normalizeLineEndings, positionsInText, _internal as indexInternals } from "../workspaceIndex";
 
-/** Run real compiled modules against isolated in-memory VS Code services.
- * No workspace files, settings, terminals, or network requests are changed. */
+/** Load compiled modules with in-memory VS Code services. */
 function load<T>(name: string, stubs: Record<string, unknown>, globals: Record<string, unknown> = {}): T {
   const filename = path.join(__dirname, "..", `${name}.js`);
   const module = { exports: {} };
   vm.runInNewContext(fs.readFileSync(filename, "utf8"), {
     module, exports: module.exports, Buffer, TextEncoder, TextDecoder,
-    setTimeout, clearTimeout, process, AbortSignal,
+    setTimeout, clearTimeout, setImmediate, process, AbortSignal,
     require: (id: string) => Object.prototype.hasOwnProperty.call(stubs, id)
       ? stubs[id] : require(require.resolve(id, { paths: [path.dirname(filename)] })),
     ...globals,
@@ -41,19 +42,23 @@ function clock() {
   };
 }
 
-function indexHarness() {
-  const root = vscode.Uri.file(path.resolve("luix-regression-root"));
+function indexHarness(rootPath = "luix-regression-root") {
+  const root = vscode.Uri.file(path.resolve(rootPath));
   const source = vscode.Uri.joinPath(root, "Button.luau");
   const folder = { uri: root, name: "project", index: 0 };
   const sourceFiles = new Map<string, string>();
   const storage = new Map<string, Uint8Array>();
   const docs = new Map<string, { uri: vscode.Uri; version: number; isDirty: boolean; isClosed: boolean; getText(): string }>();
   const changed = new vscode.EventEmitter<vscode.TextDocumentChangeEvent>();
+  const closed = new vscode.EventEmitter<vscode.TextDocument>();
   const deleted = new vscode.EventEmitter<vscode.Uri>();
   const configuration = new vscode.EventEmitter<vscode.ConfigurationChangeEvent>();
   const timers = clock();
   let aliases = { parens: ["e"], curried: [] as string[] };
   let excluded: string[] = [];
+  let reads = 0;
+  let readsInFlight = 0;
+  let maxReadsInFlight = 0;
   let opens = 0;
   const fakeWorkspace = {
     workspaceFolders: [folder],
@@ -61,11 +66,16 @@ function indexHarness() {
     getWorkspaceFolder: (uri: vscode.Uri) => uri.toString().startsWith(`${root.toString()}/`) ? folder : undefined,
     createFileSystemWatcher: () => ({ dispose() {}, onDidChange: noopEvent, onDidCreate: noopEvent, onDidDelete: deleted.event }),
     onDidChangeTextDocument: changed.event, onDidChangeConfiguration: configuration.event,
-    onDidSaveTextDocument: noopEvent, onDidCloseTextDocument: noopEvent, onDidChangeWorkspaceFolders: noopEvent,
+    onDidSaveTextDocument: noopEvent, onDidCloseTextDocument: closed.event, onDidChangeWorkspaceFolders: noopEvent,
     findFiles: async () => [...sourceFiles.keys()].map((key) => vscode.Uri.parse(key))
       .filter((uri) => !excluded.some((name) => uri.path.split("/").includes(name))),
     fs: {
       readFile: async (uri: vscode.Uri) => {
+        const source = sourceFiles.get(uri.toString());
+        if (source !== undefined) {
+          reads++; readsInFlight++; maxReadsInFlight = Math.max(maxReadsInFlight, readsInFlight);
+          try { await tick(); return new TextEncoder().encode(source); } finally { readsInFlight--; }
+        }
         const bytes = storage.get(uri.toString()); if (!bytes) {throw Error("missing cache");} return bytes;
       },
       writeFile: async (uri: vscode.Uri, bytes: Uint8Array) => { storage.set(uri.toString(), bytes); },
@@ -93,15 +103,18 @@ function indexHarness() {
   }, timers.globals);
   const instances: WorkspaceIndex[] = [];
   return {
-    source, root, sourceFiles, storage, docs, deleted, changed, timers, configuration,
+    source, root, sourceFiles, storage, docs, deleted, changed, closed, timers, configuration,
     create: () => {
       const index = new Index({ globalStorageUri: vscode.Uri.joinPath(root, "storage") } as vscode.ExtensionContext);
       instances.push(index); return index;
     },
     setAliases: (names: string[]) => { aliases = { parens: names, curried: [] }; },
     setExcluded: (names: string[]) => { excluded = names; },
+    reads: () => reads,
+    maxReadsInFlight: () => maxReadsInFlight,
+    /** Opening documents here would trigger other extensions. */
     opens: () => opens,
-    dispose: () => { instances.forEach((index) => index.dispose()); changed.dispose(); deleted.dispose(); configuration.dispose(); },
+    dispose: () => { instances.forEach((index) => index.dispose()); changed.dispose(); closed.dispose(); deleted.dispose(); configuration.dispose(); },
   };
 }
 const button = 'local function Button(props)\n return e("Frame", props)\nend';
@@ -114,13 +127,14 @@ suite("Workspace lifecycle regressions", () => {
     try {
       h.sourceFiles.set(h.source.toString(), button);
       const first = h.create(); await componentNames(first); await persist(first); first.dispose();
-      const opens = h.opens();
+      const reads = h.reads();
       const restored = h.create();
       assert.strictEqual(restored.knownComponentNames().size, 0);
       let events = 0; restored.onDidChangeIndex(() => events++);
       assert.deepStrictEqual(await componentNames(restored), ["Button"]);
       assert.deepStrictEqual([...restored.knownComponentNames()], ["Button"]);
-      assert.strictEqual(h.opens(), opens, "unchanged files should retain the warm-start saving");
+      assert.strictEqual(h.reads(), reads, "unchanged files should retain the warm-start saving");
+      assert.strictEqual(h.opens(), 0, "indexing must not open documents");
       h.timers.fire(200); assert.ok(events > 0);
     } finally { h.dispose(); }
   });
@@ -146,7 +160,8 @@ suite("Workspace lifecycle regressions", () => {
       h.setAliases(["newAlias"]);
       h.configuration.fire({ affectsConfiguration: (key: string) => key === "react.aliases" } as vscode.ConfigurationChangeEvent);
       assert.deepStrictEqual(await componentNames(index), []);
-      assert.strictEqual(h.opens(), 2);
+      assert.strictEqual(h.reads(), 2);
+      assert.strictEqual(h.opens(), 0);
     } finally { h.dispose(); }
   });
 
@@ -177,6 +192,241 @@ suite("Workspace lifecycle regressions", () => {
       const saved = JSON.parse(new TextDecoder().decode([...h.storage.values()][0]));
       assert.strictEqual(Object.keys(saved.files).length, 0);
     } finally { h.dispose(); }
+  });
+
+  test("closing a document rescans only an entry that came from its buffer", async () => {
+    const h = indexHarness();
+    try {
+      h.sourceFiles.set(h.source.toString(), button);
+      const index = h.create(); await componentNames(index);
+      const reads = h.reads();
+      // A clean close must not reopen files and trigger another close.
+      h.closed.fire({ uri: h.source } as vscode.TextDocument);
+      await settle(() => false, 5);
+      assert.strictEqual(h.reads(), reads, "a clean close leaves the disk entry alone");
+      const document = { uri: h.source, languageId: "luau", version: 2, isDirty: true, isClosed: false, getText: () => button.replace("Button", "Unsaved") };
+      h.docs.set(h.source.toString(), document);
+      h.changed.fire({ document, contentChanges: [{}] } as unknown as vscode.TextDocumentChangeEvent);
+      h.timers.fire(200);
+      assert.deepStrictEqual(await componentNames(index), ["Unsaved"]);
+      h.docs.clear();
+      h.closed.fire(document as unknown as vscode.TextDocument);
+      await settle(async () => (await componentNames(index))[0] === "Button");
+      assert.deepStrictEqual(await componentNames(index), ["Button"], "a discarded buffer stops shadowing the file");
+      assert.strictEqual(h.reads(), reads + 1);
+      assert.strictEqual(h.opens(), 0);
+    } finally { h.dispose(); }
+  });
+
+  test("tool folders inside the workspace are never read; other dot-folders are", async () => {
+    const h = indexHarness();
+    try {
+      h.sourceFiles.set(h.source.toString(), button);
+      for (const dir of [".claude/worktrees/agent", ".cache/copy", ".git/modules", ".history/src", ".vscode"]) {
+        h.sourceFiles.set(vscode.Uri.joinPath(h.root, dir, "Copy.luau").toString(), button.replace("Button", "Copy"));
+      }
+      h.sourceFiles.set(vscode.Uri.joinPath(h.root, ".storybook", "Story.luau").toString(), button.replace("Button", "Story"));
+      const index = h.create();
+      assert.deepStrictEqual((await componentNames(index)).sort(), ["Button", "Story"]);
+      assert.strictEqual(h.reads(), 2);
+    } finally { h.dispose(); }
+  });
+
+  test("a project opened from inside a tool folder (an agent's worktree) is indexed", async () => {
+    const h = indexHarness(path.join(".claude", "worktrees", "agent", "luix-regression-root"));
+    try {
+      h.sourceFiles.set(h.source.toString(), button);
+      h.sourceFiles.set(vscode.Uri.joinPath(h.root, ".claude", "worktrees", "nested", "Copy.luau").toString(), button.replace("Button", "Copy"));
+      const index = h.create();
+      assert.deepStrictEqual(await componentNames(index), ["Button"]);
+      assert.strictEqual(h.reads(), 1);
+      assert.strictEqual(indexInternals.isIgnored(h.source, indexInternals.DEFAULT_EXCLUDED_DIRS), false);
+    } finally { h.dispose(); }
+  });
+
+  test("a file too big to parse in one go is left out", async () => {
+    const h = indexHarness();
+    try {
+      h.sourceFiles.set(h.source.toString(), button);
+      const generated = vscode.Uri.joinPath(h.root, "Generated.luau");
+      const big = button.replace("Button", "Generated") + "\n--" + "x".repeat(indexInternals.MAX_INDEXED_FILE_BYTES);
+      h.sourceFiles.set(generated.toString(), big);
+      const index = h.create();
+      assert.deepStrictEqual(await componentNames(index), ["Button"]);
+      assert.strictEqual(h.reads(), 1, "its size is checked before reading it");
+    } finally { h.dispose(); }
+  });
+
+  test("call sites in a file with mixed line endings point at the call, open or not", async () => {
+    const h = indexHarness();
+    try {
+      // Mixed line endings normalize to LF when VS Code opens this file.
+      const disk = "local e = require(script.Parent.e)\r\nlocal function Page()\n\treturn e(Button, {})\nend\nreturn Page\n";
+      const page = vscode.Uri.joinPath(h.root, "Page.luau");
+      h.sourceFiles.set(h.source.toString(), button);
+      h.sourceFiles.set(page.toString(), disk);
+      const index = h.create(); await componentNames(index);
+      const unopened = await index.findCallSites("Button");
+      assert.strictEqual(unopened.map((site) => `${site.range.start.line}:${site.range.start.character}-${site.range.end.character}`).join(), "2:10-16");
+      const shown = disk.replace(/\r\n/g, "\n");
+      const positionAt = positionsInText(shown);
+      h.docs.set(page.toString(), {
+        uri: page, version: 1, isDirty: false, isClosed: false, getText: () => shown,
+        positionAt, offsetAt: () => 0,
+      } as unknown as { uri: vscode.Uri; version: number; isDirty: boolean; isClosed: boolean; getText(): string });
+      const opened = await index.findCallSites("Button");
+      const range = opened[0].range;
+      const lines = shown.split("\n");
+      assert.strictEqual(lines[range.start.line].slice(range.start.character, range.end.character), "Button");
+      assert.strictEqual(h.opens(), 0);
+    } finally { h.dispose(); }
+  });
+
+  test("a large workspace is read a few files at a time", async () => {
+    const h = indexHarness();
+    try {
+      for (let i = 0; i < 40; i++) {
+        h.sourceFiles.set(vscode.Uri.joinPath(h.root, `C${i}.luau`).toString(), button.replace("Button", `C${i}`));
+      }
+      const index = h.create();
+      assert.strictEqual((await componentNames(index)).length, 40);
+      assert.ok(h.maxReadsInFlight() > 1, "reads overlap");
+      assert.ok(h.maxReadsInFlight() <= 6, `at most 6 reads in flight, saw ${h.maxReadsInFlight()}`);
+      assert.strictEqual(h.opens(), 0);
+    } finally { h.dispose(); }
+  });
+
+  test("disposing writes index changes still waiting to be saved", async () => {
+    const h = indexHarness();
+    try {
+      h.sourceFiles.set(h.source.toString(), button);
+      const first = h.create(); await componentNames(first);
+      assert.ok(h.timers.has(5000), "the warmup's write is still pending");
+      first.dispose(); await tick();
+      assert.strictEqual(h.storage.size, 1);
+      const reads = h.reads();
+      assert.deepStrictEqual(await componentNames(h.create()), ["Button"]);
+      assert.strictEqual(h.reads(), reads, "the next window load reuses the saved parse");
+    } finally { h.dispose(); }
+  });
+
+  test("an exclude change keeps unchanged parses instead of reading every file again", async () => {
+    const h = indexHarness();
+    try {
+      h.sourceFiles.set(h.source.toString(), button);
+      h.sourceFiles.set(vscode.Uri.joinPath(h.root, "Tests", "Spec.luau").toString(), button.replace("Button", "Spec"));
+      const index = h.create();
+      assert.deepStrictEqual((await componentNames(index)).sort(), ["Button", "Spec"]);
+      const reads = h.reads();
+      h.setExcluded(["Tests"]);
+      h.configuration.fire({ affectsConfiguration: (key: string) => key === "exclude" } as vscode.ConfigurationChangeEvent);
+      assert.deepStrictEqual(await componentNames(index), ["Button"]);
+      assert.strictEqual(h.reads(), reads);
+    } finally { h.dispose(); }
+  });
+
+  test("call-site counts match a walk over every indexed file", async () => {
+    const h = indexHarness();
+    try {
+      const caller = 'local function Page(props)\n return e("Frame", {}, { e(Button, {}), e(Button, {}), e(Card, {}) })\nend';
+      h.sourceFiles.set(h.source.toString(), button);
+      h.sourceFiles.set(vscode.Uri.joinPath(h.root, "Page.luau").toString(), caller);
+      h.sourceFiles.set(vscode.Uri.joinPath(h.root, "Other.luau").toString(), 'return e(Button, {})');
+      const index = h.create(); await componentNames(index);
+      assert.strictEqual(index.countCallSites("Button"), 3);
+      assert.strictEqual(index.countCallSites("Components.Card"), 1);
+      assert.strictEqual(index.countCallSites("Missing"), 0);
+      h.sourceFiles.delete(vscode.Uri.joinPath(h.root, "Other.luau").toString());
+      h.deleted.fire(vscode.Uri.joinPath(h.root, "Other.luau"));
+      assert.strictEqual(index.countCallSites("Button"), 2);
+    } finally { h.dispose(); }
+  });
+});
+
+/** Wait for pending reads and parses, up to rounds event-loop turns. */
+async function settle(done: () => boolean | Promise<boolean>, rounds = 50): Promise<void> {
+  for (let i = 0; i < rounds && !(await done()); i++) {
+    await tick();
+  }
+}
+
+suite("Positions in files read from disk", () => {
+  test("count line breaks like a TextDocument: \\n, \\r\\n and a lone \\r", () => {
+    const positionAt = positionsInText("a\nbc\r\ndef\rg");
+    const expected: Array<[number, number, number]> = [
+      [0, 0, 0], [1, 0, 1], [2, 1, 0], [3, 1, 1], [4, 1, 2], [6, 2, 0],
+      [8, 2, 2], [9, 2, 3], [10, 3, 0], [11, 3, 1], [99, 3, 1], [-1, 0, 0],
+    ];
+    for (const [offset, line, character] of expected) {
+      const position = positionAt(offset);
+      assert.deepStrictEqual([position.line, position.character], [line, character], `offset ${offset}`);
+    }
+  });
+
+  test("agree with a CRLF document", async () => {
+    const text = "local a = 1\r\nreturn e(Button, {})\r\n\r\nend";
+    const doc = await vscode.workspace.openTextDocument({ content: text, language: "luau" });
+    assert.strictEqual(doc.getText(), text);
+    const positionAt = positionsInText(text);
+    for (let offset = 0; offset <= text.length; offset++) {
+      if (text[offset - 1] === "\r") {continue;}
+      const expected = doc.positionAt(offset);
+      const actual = positionAt(offset);
+      assert.deepStrictEqual([actual.line, actual.character], [expected.line, expected.character], `offset ${offset}`);
+    }
+  });
+
+  test("decode files the way VS Code shows them", () => {
+    const utf8Bom = new Uint8Array([0xef, 0xbb, 0xbf, 0x61, 0xc3, 0xa9]);
+    assert.strictEqual(decodeFileText(utf8Bom), "aé");
+    const utf16le = new Uint8Array([0xff, 0xfe, 0x61, 0x00, 0x62, 0x00]);
+    assert.strictEqual(decodeFileText(utf16le), "ab");
+    assert.strictEqual(decodeFileText(new TextEncoder().encode("return {}\n")), "return {}\n");
+    assert.strictEqual(decodeFileText(new TextEncoder().encode("a\r\nb\nc\r\n")), "a\r\nb\r\nc\r\n");
+  });
+
+  test("make line endings uniform the way VS Code loads a file", () => {
+    const cases: Array<[string, string]> = [
+      ["", ""],
+      ["no breaks", "no breaks"],
+      ["a\nb\n", "a\nb\n"],
+      ["a\r\nb\r\n", "a\r\nb\r\n"],
+      // Lone CR normalizes to CRLF.
+      ["a\rb\r", "a\r\nb\r\n"],
+      // A CRLF majority normalizes every break to CRLF.
+      ["a\r\nb\r\nc\nd", "a\r\nb\r\nc\r\nd"],
+      ["a\rb\r\nc\n", "a\r\nb\r\nc\r\n"],
+      // LF wins ties.
+      ["a\r\nb\nc\n", "a\nb\nc\n"],
+      ["a\r\nb\n", "a\nb\n"],
+      ["a\rb\n", "a\nb\n"],
+      ["-- c\rlocal x = 1\nlocal y = 2\n", "-- c\nlocal x = 1\nlocal y = 2\n"],
+    ];
+    for (const [input, expected] of cases) {
+      assert.strictEqual(normalizeLineEndings(input), expected, JSON.stringify(input));
+    }
+  });
+
+  test("decoded text is what VS Code holds for the same file", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "luix-eol-"));
+    try {
+      const samples = [
+        "local e = require(script.Parent.e)\r\nlocal function Page()\n\treturn e(Button, {})\nend\nreturn Page\n",
+        "a\r\nb\r\nc\nd\r\n",
+        "-- lone\rlocal x = 1\nreturn x\n",
+        "x\r\ny\n",
+        "a\rb\r",
+        "\uFEFFlocal a = 1\r\nreturn a\n",
+      ];
+      for (let i = 0; i < samples.length; i++) {
+        const file = path.join(dir, `sample-${i}.luau`);
+        fs.writeFileSync(file, samples[i], "utf8");
+        const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
+        assert.strictEqual(decodeFileText(fs.readFileSync(file)), document.getText(), `sample ${i}`);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+    }
   });
 });
 

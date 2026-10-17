@@ -1,25 +1,11 @@
 import * as vscode from "vscode";
 import { configChangeAffects, getConfig } from "./configCompat";
 
-// ============================================================================
-// Roblox Private-Use-Area glyphs
-// ============================================================================
-//
-// Roblox places its custom icon set in the Unicode Private Use Area
-// starting at U+E000. VS Code's default fonts have no glyphs for these
-// codepoints, so they render as empty boxes (`[]`). We can't change the
-// font, but we can:
-//   1. Annotate each occurrence with an inlay hint that names it.
-//   2. Surface a hover tooltip with the name + codepoint.
-//   3. Offer a completion (`:robux:`, `:premium:`, …) inside strings so
-//      users can insert the literal char without paste-from-docs gymnastics.
+// Name Roblox's private-use glyphs when editor fonts cannot render them.
 
 export interface RobloxGlyph {
-  /** Codepoint, e.g. 0xE002. */
   codepoint: number;
-  /** Display name (used by hover + inlay hint). */
   name: string;
-  /** Slug used by the `:` completion trigger. */
   slug: string;
 }
 
@@ -34,10 +20,6 @@ const BY_CODEPOINT = new Map<number, RobloxGlyph>(
   ROBLOX_GLYPHS.map((g) => [g.codepoint, g])
 );
 
-// Single regex that matches any of our glyph codepoints. Used as a
-// fast reject in `findGlyphOccurrences` — most Luau files contain no
-// PUA glyphs at all, and `text.search(...)` short-circuits at the first
-// non-match without iterating every character.
 const ANY_GLYPH_RE = new RegExp(
   "[" +
     ROBLOX_GLYPHS.map((g) => `\\u{${g.codepoint.toString(16)}}`).join("") +
@@ -61,23 +43,15 @@ function formatHoverMarkdown(glyph: RobloxGlyph): vscode.MarkdownString {
   return md;
 }
 
-/**
- * Scan a document for codepoints in our glyph set. Returns one entry per
- * occurrence with its document offset.
- */
 function findGlyphOccurrences(
   document: vscode.TextDocument
 ): Array<{ glyph: RobloxGlyph; offset: number; length: number }> {
   const text = document.getText();
-  // Fast reject: files with no PUA glyph chars at all skip the
-  // per-character scan entirely.
   if (!ANY_GLYPH_RE.test(text)) {
     return [];
   }
   const out: Array<{ glyph: RobloxGlyph; offset: number; length: number }> = [];
-  // We need to handle surrogate pairs correctly. The PUA codepoints we
-  // care about are all in the BMP (≤ 0xFFFF), so a simple per-code-unit
-  // scan is sufficient and avoids the cost of full UTF-16 decoding.
+  // All supported codepoints are in the BMP; code-unit scanning is sufficient.
   for (let i = 0; i < text.length; i++) {
     const cp = text.charCodeAt(i);
     const glyph = BY_CODEPOINT.get(cp);
@@ -87,10 +61,6 @@ function findGlyphOccurrences(
   }
   return out;
 }
-
-// ============================================================================
-// Inlay hints — labels at each glyph position
-// ============================================================================
 
 export class RobloxGlyphInlayHintsProvider
   implements vscode.InlayHintsProvider, vscode.Disposable
@@ -150,10 +120,6 @@ export class RobloxGlyphInlayHintsProvider
   }
 }
 
-// ============================================================================
-// Hover — name + codepoint when the user hovers any glyph
-// ============================================================================
-
 export class RobloxGlyphHoverProvider implements vscode.HoverProvider {
   provideHover(
     document: vscode.TextDocument,
@@ -162,9 +128,6 @@ export class RobloxGlyphHoverProvider implements vscode.HoverProvider {
     if (!getConfig<boolean>("robloxGlyphs.enabled", true)) {
       return undefined;
     }
-    // We only need the single character under the cursor — reading the
-    // full document text (potentially hundreds of KB) just to inspect
-    // one code point allocates a fresh string on every hover.
     const line = document.lineAt(position.line).text;
     if (position.character >= line.length) {
       return undefined;
@@ -182,10 +145,6 @@ export class RobloxGlyphHoverProvider implements vscode.HoverProvider {
   }
 }
 
-// ============================================================================
-// Completion — `:robux`, `:premium`, … inside a string inserts the glyph
-// ============================================================================
-
 export class RobloxGlyphCompletionProvider
   implements vscode.CompletionItemProvider
 {
@@ -198,8 +157,6 @@ export class RobloxGlyphCompletionProvider
     }
     const text = document.getText();
     const offset = document.offsetAt(position);
-    // Find the `:` that opens the trigger sequence and verify there's
-    // nothing weird between it and the cursor.
     let i = offset - 1;
     while (i >= 0 && /[a-zA-Z0-9-]/.test(text[i])) {
       i--;
@@ -208,8 +165,6 @@ export class RobloxGlyphCompletionProvider
       return undefined;
     }
     const colonOffset = i;
-    // Only fire inside a single-line string (the same rule the RichText
-    // provider uses — keeps `:` in code paths like `obj:method()` alone).
     if (!isInsideSingleLineString(text, colonOffset)) {
       return undefined;
     }
@@ -231,15 +186,12 @@ export class RobloxGlyphCompletionProvider
       item.filterText = `:${glyph.slug}`;
       item.sortText = String(index).padStart(4, "0");
       item.range = range;
-      // Insert the literal codepoint so it works in any Lua/Luau string,
-      // not just Luau-with-\u{…} escapes.
+      // Insert literal characters so ordinary Lua strings work too.
       item.insertText = String.fromCharCode(glyph.codepoint);
       return item;
     });
 
-    // User-defined entries from `luix.robloxGlyphs.custom`. Reserved
-    // slugs from the built-in set are skipped so users can't accidentally
-    // shadow `:robux:` etc.
+    // Custom slugs cannot shadow built-in glyphs.
     const custom = getCustomGlyphs();
     const builtinSlugs = new Set(ROBLOX_GLYPHS.map((g) => g.slug));
     const customItems: vscode.CompletionItem[] = [];

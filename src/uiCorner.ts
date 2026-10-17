@@ -7,26 +7,11 @@ import {
 import { getAliasPartition } from "./frameworks";
 import { UICORNER_INDIVIDUAL_RADII } from "./data";
 
-// ============================================================================
-// UICorner refactors — collapse ↔ expand corner radii
-// ============================================================================
-//
-// `UICorner` gained per-corner radius properties (`BottomLeftRadius`,
-// `BottomRightRadius`, `TopLeftRadius`, `TopRightRadius`) alongside the
-// uniform `CornerRadius`. Two refactors:
-//
-//   • Collapse — all four individual radii set to the SAME value and no
-//     `CornerRadius` → replace them with a single `CornerRadius = …`.
-//   • Expand — a lone `CornerRadius = …` → the four individual props,
-//     each set to that value (a starting point for per-corner tweaks).
-//
-// The conflict case (both `CornerRadius` and individual radii present)
-// gets neither action — that's a mistake the diagnostic flags, not a
-// shape to refactor between.
+// Collapse equal per-corner radii or expand a uniform radius; skip conflicts.
 
 interface CornerEntry {
   key: string;
-  /** Trimmed value text. */
+  /** Trimmed value. */
   valueText: string;
   /** Absolute document offsets. */
   keyStart: number;
@@ -37,11 +22,6 @@ export type UICornerPlan =
   | { kind: "collapse"; value: string }
   | { kind: "expand"; value: string };
 
-/**
- * Decide which refactor (if any) applies to a `UICorner`'s prop
- * entries. Pure — unit-tested. `entries` carries each prop's key and
- * its trimmed value text.
- */
 export function planUICornerRefactor(
   entries: { key: string; valueText: string }[]
 ): UICornerPlan | undefined {
@@ -51,15 +31,12 @@ export function planUICornerRefactor(
     byKey.has(k)
   );
 
-  // Expand: exactly one `CornerRadius`, no individual corners.
   if (cornerValue !== undefined && individualPresent.length === 0) {
     if (cornerValue.length === 0) {return undefined;}
     return { kind: "expand", value: cornerValue };
   }
 
-  // Collapse: all four individual corners present and textually equal,
-  // no `CornerRadius`, and they're the ONLY props (so the replacement
-  // span is unambiguous — UICorner carries no other props in practice).
+  // Collapse only when the four equal radii are the entire prop table.
   if (
     cornerValue === undefined &&
     individualPresent.length === 4 &&
@@ -75,7 +52,6 @@ export function planUICornerRefactor(
   return undefined;
 }
 
-/** Smallest enclosing string-literal `UICorner` call at `offset`. */
 function findEnclosingUICorner(
   calls: readonly CreateElementCall[],
   offset: number
@@ -95,7 +71,6 @@ function findEnclosingUICorner(
   return best;
 }
 
-/** Leading whitespace of the line containing `offset`. */
 function lineIndentAt(text: string, offset: number): string {
   let lineStart = offset;
   while (lineStart > 0 && text[lineStart - 1] !== "\n") {lineStart--;}
@@ -147,11 +122,7 @@ export class UICornerCodeActionProvider implements vscode.CodeActionProvider {
     );
     if (!plan) {return [];}
 
-    // Only the EXPAND direction is a cursor-driven refactor here. The
-    // COLLAPSE direction is surfaced as a diagnostic
-    // (`CornerRadiusCollapsible`) plus its quick-fix, so it shows a
-    // visible nudge rather than hiding behind the lightbulb — and we
-    // avoid a duplicate "Collapse…" entry in the action menu.
+    // Collapse is a diagnostic quick fix; offer only expansion here.
     if (plan.kind !== "expand") {return [];}
 
     const corner = entries.find((e) => e.key === "CornerRadius");

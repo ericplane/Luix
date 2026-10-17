@@ -29,10 +29,6 @@ import { WorkspaceIndex } from "./workspaceIndex";
 import { fetchAssetThumbnail } from "./assetThumbnails";
 import { documentDirectCalls, findDocumentCalls } from "./documentCalls";
 
-// ============================================================================
-// Color preview — DocumentColorProvider
-// ============================================================================
-
 export class Color3DocumentColorProvider
   implements vscode.DocumentColorProvider
 {
@@ -43,8 +39,6 @@ export class Color3DocumentColorProvider
       return [];
     }
     const text = document.getText();
-    // Fast reject: files that don't reference Color3 at all skip the
-    // masking step (which builds an N-length boolean array) entirely.
     if (!text.includes("Color3.")) {
       return [];
     }
@@ -88,7 +82,7 @@ export class Color3DocumentColorProvider
       ),
     };
 
-    // Put the user's existing form first so the round-trip preserves it.
+    // Prefer the existing Color3 form to preserve it through edits.
     const original = context.document.getText(context.range);
     const order: Array<keyof typeof presentations> = (() => {
       if (/Color3\.fromHex/.test(original)) {
@@ -132,10 +126,6 @@ function rgbToHsv(
   return { h, s, v: max };
 }
 
-// ============================================================================
-// Hover — type/class/docs tooltips for props inside e(...) tables
-// ============================================================================
-
 export class PropHoverProvider implements vscode.HoverProvider {
   constructor(private readonly workspaceIndex?: WorkspaceIndex) {}
 
@@ -147,13 +137,11 @@ export class PropHoverProvider implements vscode.HoverProvider {
     const cursorOffset = document.offsetAt(position);
     const aliases = getAliasPartition();
 
-    // ---- 0. Hovering an `Image = "rbxassetid://NNNN"` value? ----
     const assetHover = await tryAssetHover(document, position, text);
     if (assetHover) {
       return assetHover;
     }
 
-    // ---- 1. Hovering the class/component slot of a factory call? ----
     const calls = findDocumentCalls(text, this.workspaceIndex);
     for (const call of calls) {
       if (
@@ -174,7 +162,6 @@ export class PropHoverProvider implements vscode.HoverProvider {
       }
     }
 
-    // ---- 2. Hovering a prop inside a props table? ----
     const directCalls = documentDirectCalls(text, this.workspaceIndex);
     const detected = findEnclosingPropsCall(
       text,
@@ -202,10 +189,7 @@ export class PropHoverProvider implements vscode.HoverProvider {
         const md = buildPropHoverMarkdown(detected.className, word);
         return new vscode.Hover(md, wordRange);
       }
-      // Vide takes events (`Activated = …`) and Fusion/Vide take
-      // `Parent = …` as plain keys in the same table; attribute a direct
-      // instance call (`TextButton({ … })`) to Vide the way completion
-      // does so those keys get a hover too.
+      // Treat direct instance calls as Vide so plain event and Parent keys get hovers.
       let framework = detected.alias
         ? findFrameworkForAlias(detected.alias)
         : undefined;
@@ -236,7 +220,6 @@ export class PropHoverProvider implements vscode.HoverProvider {
       return undefined;
     }
 
-    // Custom component — show inferred prop info.
     const component = await this.findComponent(document, detected.className);
     if (!component) {
       return undefined;
@@ -335,22 +318,13 @@ function buildCustomPropHover(
   return md;
 }
 
-/**
- * Hovering an `Image = "rbxassetid://NNNN"` or any bare
- * `"rbxassetid://NNNN"` string shows Roblox's thumbnail for that asset
- * so you can verify visually. We hit Roblox's public thumbnails API
- * (`thumbnails.roblox.com/v1/assets`) which returns the actual CDN URL
- * to render — the old `asset-thumbnail/image?assetId=…` redirect
- * endpoint doesn't work inside VS Code's markdown hover (no redirect
- * follow). Results are cached per asset for 24h.
- */
+/** Use the thumbnails API's CDN URL; VS Code hovers do not follow the legacy redirect endpoint. */
 async function tryAssetHover(
   document: vscode.TextDocument,
   position: vscode.Position,
   _text: string
 ): Promise<vscode.Hover | undefined> {
   const lineText = document.lineAt(position.line).text;
-  // Grab the (single-line) quoted string containing the cursor.
   let start = position.character;
   let quote: string | undefined;
   for (let i = position.character - 1; i >= 0; i--) {
@@ -393,8 +367,6 @@ async function tryAssetHover(
       `**Roblox asset \`${assetId}\`**\n\n![](${cdnUrl})\n\n[Open on roblox.com ↗](https://www.roblox.com/library/${assetId})`
     );
   } else {
-    // Pick a message that matches what the API actually said, so a
-    // freshly-uploaded asset doesn't get mislabelled as "moderated".
     let reason: string;
     switch (state) {
       case "Pending":
@@ -421,7 +393,6 @@ async function tryAssetHover(
   }
   return new vscode.Hover(md, range);
 }
-
 
 function collectKnownProps(component: DocumentComponentInfo): string[] {
   const out: string[] = [];
@@ -470,27 +441,16 @@ function buildPropHoverMarkdown(
   return md;
 }
 
-/**
- * Is `wordRange` a table key — i.e. the next non-blank character on the
- * line is a single `=`? Keeps the event / `Parent` hovers off identifiers
- * that merely appear in a value (`Size = other.Changed`).
- */
+/** Require an assignment key so value identifiers do not get event or Parent hovers. */
 function isTableKey(
   document: vscode.TextDocument,
   wordRange: vscode.Range
 ): boolean {
-  // Look past line breaks too so `Activated\n  = function() … end` (a
-  // key whose `=` wrapped onto the next line) still counts.
   const from = document.offsetAt(wordRange.end);
   const rest = document.getText().slice(from, from + 64);
   return /^\s*=(?!=)/.test(rest);
 }
 
-/**
- * Is `wordRange` the event name inside a computed event key —
- * `[React.Event.Activated]`, `[Roact.Event.Activated]` or
- * `[OnEvent "Activated"]`?
- */
 function isComputedEventKey(
   document: vscode.TextDocument,
   wordRange: vscode.Range
@@ -502,9 +462,7 @@ function isComputedEventKey(
     /\bOnEvent\s*\(?\s*["']$/.test(before);
 }
 
-// `Changed` is declared on `Object`, the engine root above `Instance`;
-// the data model files it under `Instance` (see data.ts) but the docs
-// page that actually has the anchor is `Object`.
+// Roblox documents Changed on Object, although the data model files it under Instance.
 const EVENT_DOCS_CLASS_OVERRIDE: Record<string, string> = {
   Changed: "Object",
 };
@@ -533,13 +491,6 @@ function buildEventHoverMarkdown(
   return md;
 }
 
-/**
- * Event hover for a custom component whose base class is known
- * (`---@extends TextButton` or a detected root element): a Vide
- * `create(Button, { Activated = … })` key, or a computed event key under
- * any framework. Mirrors the host-class branch so completion (which
- * already labels these as events) and hover agree.
- */
 function buildCustomEventHover(
   component: DocumentComponentInfo,
   invokedAs: string,
@@ -552,9 +503,7 @@ function buildCustomEventHover(
   if (!base || !flattenClassEvents(base).includes(word)) {
     return undefined;
   }
-  // A direct component call (`Button { … }`) carries no factory alias,
-  // so it can't be attributed to a framework; treat a plain event key
-  // there as Vide's only when an events-as-props framework is enabled.
+  // Direct calls lack an alias; allow plain event keys only when events-as-props is enabled.
   const framework = alias ? findFrameworkForAlias(alias) : undefined;
   const eventsAsProps = framework
     ? framework.eventsAsProps
@@ -598,10 +547,6 @@ function buildParentHoverMarkdown(className: string): vscode.MarkdownString {
   return md;
 }
 
-// ============================================================================
-// Inlay hints — `}) ▸ Frame (Container)` at every multi-line createElement
-// ============================================================================
-
 export class CreateElementInlayHintsProvider
   implements vscode.InlayHintsProvider, vscode.Disposable
 {
@@ -622,9 +567,6 @@ export class CreateElementInlayHintsProvider
         if (scope === "all") {
           return;
         }
-        // Cursor moves fire on every keystroke + arrow press. Debounce
-        // by ~80ms so that fast-typing or rapid arrowing doesn't trigger
-        // a re-render per character.
         if (this.selectionDebounce) {
           clearTimeout(this.selectionDebounce);
         }
@@ -693,8 +635,7 @@ export class CreateElementInlayHintsProvider
         hintOffset = call.fullEnd + 1;
       }
       const hintPos = document.positionAt(hintOffset);
-      // A call can enclose the requested lines while its closing label lies
-      // outside them. VS Code only accepts hints inside the requested range.
+      // VS Code accepts hints only inside the requested range, even for enclosing calls.
       if (!range.contains(hintPos)) {
         continue;
       }
@@ -726,10 +667,6 @@ export class CreateElementInlayHintsProvider
     this._onDidChange.dispose();
   }
 }
-
-// ============================================================================
-// Document symbols — Outline + breadcrumbs view of the React tree
-// ============================================================================
 
 export class CreateElementSymbolProvider
   implements vscode.DocumentSymbolProvider

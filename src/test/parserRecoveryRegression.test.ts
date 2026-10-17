@@ -1,7 +1,7 @@
 import * as assert from "assert";
 import { spawnSync } from "child_process";
 
-/** Keep a scanner regression from hanging the extension-host test runner. */
+/** Isolate scanner hangs from the test runner. */
 function runParserInChild(body: string): void {
   const script = [
     `const parser = require(${JSON.stringify(require.resolve("../parser"))});`,
@@ -13,7 +13,7 @@ function runParserInChild(body: string): void {
     encoding: "utf8",
     timeout: 5000,
     windowsHide: true,
-    // The VS Code test host runs in Electron; launch its Node runtime.
+    // Run the Electron test host as Node.
     env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
   });
   assert.ifError(result.error);

@@ -6,10 +6,6 @@ import { configChangeAffects, getConfig } from "./configCompat";
 import { getCacheStats } from "./assetThumbnails";
 import { WorkspaceValidation } from "./workspaceValidation";
 
-// ============================================================================
-// Workspace view — Wally / Rojo / scaffold entries
-// ============================================================================
-
 interface WorkspaceItemDef {
   label: string;
   description?: string;
@@ -59,8 +55,6 @@ export class WorkspaceTreeProvider
     }
   }
 
-  /** Re-tally the cache size & fire a tree refresh. Called by the
-   *  purge command after a successful wipe. */
   refreshCache(): void {
     void this.refreshCacheStats();
   }
@@ -141,10 +135,6 @@ export class WorkspaceTreeProvider
       }
     );
 
-    // Image-gutter entries: a one-click *enable* prompt when the
-    // feature is off (so users can discover it without hunting through
-    // settings), or the purge / open-folder pair when it's on AND
-    // there's a cache to manage.
     const gutterOn = getConfig<boolean>("imageGutter.enabled", false);
     if (!gutterOn) {
       items.push({
@@ -178,8 +168,6 @@ export class WorkspaceTreeProvider
       );
     }
 
-    // Workspace-wide validation summary — only shown when the user
-    // has opted in.
     if (
       getConfig<boolean>("workspaceValidation.enabled", false) &&
       this.workspaceValidation
@@ -228,10 +216,6 @@ class WorkspaceTreeItem extends vscode.TreeItem {
     this.command = { command: def.command, title: def.label };
   }
 }
-
-// ============================================================================
-// Components view — folder tree (default) + flat alphabetical toggle
-// ============================================================================
 
 type ViewMode = "tree" | "flat";
 
@@ -371,21 +355,12 @@ function getComponentsRoot(): string | undefined {
   return setting && setting.length > 0 ? setting : undefined;
 }
 
-/**
- * Group components by their containing directory. Returns a synthetic
- * root folder whose children are the top-level entries in display
- * order. If `componentsRoot` is set, paths are stripped of that prefix
- * (so the tree feels rooted there).
- */
 export function buildFolderTree(
   components: ComponentEntry[],
   componentsRoot: string | undefined
 ): { kind: "folder"; label: string; relPath: string; children: TreeNode[] } {
   const path = require("path") as typeof import("path");
 
-  // Determine the base each component path is relative to: the workspace
-  // folder that contains it (or the workspace folder its componentsRoot
-  // sits under, when set).
   const root: ReturnType<typeof buildFolderTree> = {
     kind: "folder",
     label: "",
@@ -396,7 +371,7 @@ export function buildFolderTree(
   for (const entry of components) {
     const workspaceFolder = vscode.workspace.getWorkspaceFolder(entry.uri);
     if (!workspaceFolder) {
-      // Component lives outside any workspace folder — drop it at the root.
+      // Place components outside the workspace at the tree root.
       root.children.push({ kind: "component", entry });
       continue;
     }
@@ -411,9 +386,7 @@ export function buildFolderTree(
       ) {
         rel = normalizedRel.slice(normalizedRoot.length).replace(/^\/+/, "");
       } else {
-        // Outside the configured root — skip it in tree mode so the
-        // root stays focused on the user's UI tree. They can switch to
-        // flat mode to see everything.
+        // Tree mode honors componentsRoot; flat mode still shows all components.
         continue;
       }
     }
@@ -444,7 +417,6 @@ export function buildFolderTree(
     cursor.children.push({ kind: "component", entry });
   }
 
-  // Sort: folders first (alphabetical), then components (alphabetical).
   sortFolder(root);
   return root;
 }

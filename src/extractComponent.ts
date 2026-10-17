@@ -14,8 +14,7 @@ const SHARED_GLOBALS = new Set((
 
 export interface ExtractionPlan { content: string; replacement: string; captures: string[] }
 
-/** Keep dependencies at their existing call site. Copying local initializers
- * into another module can recreate reactive state and loses lexical inputs. */
+/** Pass captures instead of recreating local state in the new module. */
 export function planComponentExtraction(
   text: string, target: CreateElementCall, name: string, spec: FrameworkSpec
 ): ExtractionPlan {
@@ -25,8 +24,7 @@ export function planComponentExtraction(
   }
   const body = text.slice(target.aliasStart, target.fullEnd);
   const selected = analyzeLuaBindings(body);
-  // A type alias cannot be transported as a runtime prop. Support plain
-  // callbacks and method calls; leave type-dependent selections for the LSP.
+  // Type dependencies cannot be passed as runtime props.
   for (let i = 0; i < selected.tokens.length; i++) {
     const token = selected.tokens[i];
     const argument = selected.tokens[i + 2];
@@ -49,8 +47,7 @@ export function planComponentExtraction(
     if (tokens[i - 1]?.value === "function") {return true;}
     let j = i + 1;
     if (tokens[j]?.value === ",") {
-      // A comma after a value (a prop, argument or return value) is not an
-      // assignment. Tuple assignment tails may themselves be t.x / t[index].
+      // Distinguish tuple assignments from comma-separated values.
       let first = i;
       while (tokens[first - 1]?.value === "," && tokens[first - 2]?.kind === "word") {first -= 2;}
       if (["=", "return", "(", "[", "{", "and", "or"].includes(tokens[first - 1]?.value)) {return false;}
@@ -96,11 +93,9 @@ export function planComponentExtraction(
   let inputName = "__luixInputs";
   while (selected.tokens.some(t => t.value === inputName) || inputName === scopeName) {inputName += "_";}
   const parameters = scopeName ? `${scopeName}, ${inputName}` : inputName;
-  // React reserves key/ref props. A generated namespace keeps every capture
-  // available even when the original local is called key or ref.
+  // Prefix captures to avoid React's reserved key/ref props.
   const locals = names.map(id => `\tlocal ${id} = ${inputName}.__luix_${id}`);
-  // Reindenting subsequent lines also changes multiline string contents.
-  // Keep the selected expression byte-for-byte intact after the return prefix.
+  // Preserve expression bytes, including multiline strings.
   const returned = `\treturn ${body}`;
   const eol = text.includes("\r\n") ? "\r\n" : "\n";
   const content = [
@@ -113,7 +108,7 @@ export function planComponentExtraction(
   return { content, replacement, captures: names };
 }
 
-/** A single WorkspaceEdit makes file creation and replacement one undo step. */
+/** Create and replace files in one undo step. */
 export function buildExtractionEdit(
   document: vscode.TextDocument, target: CreateElementCall, name: string,
   newUri: vscode.Uri, plan: ExtractionPlan, overwrite = false

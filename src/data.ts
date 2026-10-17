@@ -1,11 +1,4 @@
-// Constants, lookup tables, and pure data helpers.
-//
-// Nothing in this file imports from `vscode`; it's safe to consume from
-// tests without spinning up the extension host.
-
-// ============================================================================
-// Roblox class hierarchy
-// ============================================================================
+// Pure data helpers; keep independent of vscode for use outside the extension host.
 
 export interface ClassDef {
   inherits?: string;
@@ -13,26 +6,11 @@ export interface ClassDef {
   events?: string[];
 }
 
-// Hierarchy roughly mirrors Roblox's actual one (see
-// https://create.roblox.com/docs/reference/engine/classes/GuiObject), with a
-// few pragmatic shortcuts:
-//   - TextButton / TextBox extend TextLabel for sharing text props (Roblox
-//     keeps them as siblings, but the prop sets overlap entirely).
-//   - ImageButton extends ImageLabel for the same reason.
-//   - The various UILayout subclasses share `FillDirection`,
-//     `HorizontalAlignment`, etc. via a `UILayout` base.
+// The hierarchy groups shared UI properties and includes synthetic base classes.
 export const classHierarchy: Record<string, ClassDef> = {
-  // ---- roots ----
   Instance: {
     own: ["Archivable", "Name"],
-    // Signals every Instance exposes. Vide connects any signal-valued
-    // key (`Destroying = function() … end`), so these must be known
-    // for the unknown-prop diagnostic and the events-as-props
-    // completion; React/Roact/Fusion reach them via `[React.Event.X]`
-    // / `[OnEvent "X"]`. `Changed` is really declared on `Object`, the
-    // engine's root above `Instance`; it lives here because every
-    // Instance inherits it and nothing else in this hierarchy needs
-    // that extra level.
+    // Changed belongs to Object in Roblox; all Instances inherit it, so include it here.
     events: [
       "AncestryChanged",
       "AttributeChanged",
@@ -60,7 +38,6 @@ export const classHierarchy: Record<string, ClassDef> = {
     events: ["SelectionChanged"],
   },
 
-  // ---- 2D UI base ----
   GuiObject: {
     inherits: "GuiBase2d",
     own: [
@@ -110,7 +87,7 @@ export const classHierarchy: Record<string, ClassDef> = {
     ],
   },
 
-  // Synthetic level: shared by TextButton and ImageButton.
+  // Synthetic base shared by TextButton and ImageButton.
   GuiButton: {
     inherits: "GuiObject",
     own: [
@@ -133,7 +110,6 @@ export const classHierarchy: Record<string, ClassDef> = {
     ],
   },
 
-  // ---- Frame family ----
   Frame: { inherits: "GuiObject", own: ["Style"] },
 
   ScrollingFrame: {
@@ -190,15 +166,10 @@ export const classHierarchy: Record<string, ClassDef> = {
     own: ["GroupColor3", "GroupTransparency"],
   },
 
-  // ---- Text family ----
-  // TextLabel acts as the shared base for everything that renders text;
-  // TextButton and TextBox add their own extras on top.
   TextLabel: {
     inherits: "GuiObject",
     own: [
-      // `Font` is intentionally omitted — it's deprecated in favor of
-      // `FontFace`. The deprecation diagnostic still catches anyone
-      // who writes `Font = Enum.Font.X` and offers the quick-fix.
+      // Font remains valid but is omitted from suggestions in favor of FontFace.
       "FontFace",
       "LineHeight",
       "MaxVisibleGraphemes",
@@ -219,14 +190,10 @@ export const classHierarchy: Record<string, ClassDef> = {
     ],
   },
 
-  // TextButton acts like a button + a label. We model it as inheriting
-  // GuiButton (for the button extras and click events) and bolt the
-  // text-rendering props on directly.
+  // TextButton inherits button behavior and copies text properties from TextLabel.
   TextButton: {
     inherits: "GuiButton",
     own: [
-      // Mirrored from TextLabel for the prop list. `Font` is
-      // intentionally omitted — deprecated in favor of `FontFace`.
       "FontFace",
       "LineHeight",
       "MaxVisibleGraphemes",
@@ -279,7 +246,6 @@ export const classHierarchy: Record<string, ClassDef> = {
     events: ["Focused", "FocusLost", "ReturnPressedFromOnScreenKeyboard"],
   },
 
-  // ---- Image family ----
   ImageLabel: {
     inherits: "GuiObject",
     own: [
@@ -296,13 +262,12 @@ export const classHierarchy: Record<string, ClassDef> = {
     ],
   },
 
-  // ImageButton: GuiButton + ImageLabel props bolted on.
+  // ImageButton inherits button behavior and copies ImageLabel properties.
   ImageButton: {
     inherits: "GuiButton",
     own: [
       "HoverImage",
       "PressedImage",
-      // Mirrored from ImageLabel:
       "Image",
       "ImageColor3",
       "ImageRectOffset",
@@ -316,7 +281,6 @@ export const classHierarchy: Record<string, ClassDef> = {
     ],
   },
 
-  // ---- LayerCollectors (root containers — not GuiObjects) ----
   ScreenGui: {
     inherits: "Instance",
     own: [
@@ -379,7 +343,6 @@ export const classHierarchy: Record<string, ClassDef> = {
     ],
   },
 
-  // ---- UI utilities ----
   UICorner: {
     inherits: "Instance",
     own: [
@@ -396,10 +359,6 @@ export const classHierarchy: Record<string, ClassDef> = {
     own: ["Color", "Enabled", "Offset", "Rotation", "Transparency"],
   },
 
-  // Renders a shadow below the parent UI instance. Currently
-  // "Not Browsable" but live — props per the API. `Offset` / `Spread`
-  // are `UDim2` and `BlurRadius` is `UDim` here (see PROP_TYPE_OVERRIDES;
-  // they collide with the global `Offset: Vector2`).
   UIShadow: {
     inherits: "Instance",
     own: [
@@ -441,7 +400,6 @@ export const classHierarchy: Record<string, ClassDef> = {
     own: ["FlexMode", "GrowRatio", "ItemLineAlignment", "ShrinkRatio"],
   },
 
-  // ---- Layout family ----
   UILayout: {
     inherits: "Instance",
     own: [
@@ -489,7 +447,6 @@ export const classHierarchy: Record<string, ClassDef> = {
     ],
   },
 
-  // ---- Constraints ----
   UIAspectRatioConstraint: {
     inherits: "Instance",
     own: ["AspectRatio", "AspectType", "DominantAxis"],
@@ -503,8 +460,7 @@ export const classHierarchy: Record<string, ClassDef> = {
   },
 };
 
-// Memoized; the hierarchy is static, so the result for a given class never
-// changes. Callers must treat the returned array as immutable.
+// Treat memoized property arrays as immutable.
 const propsCache = new Map<string, string[]>();
 
 export function flattenClassProps(
@@ -514,7 +470,7 @@ export function flattenClassProps(
   if (seen.has(className)) {
     return [];
   }
-  // Only memoize the top-level call (when no parent passed `seen` in).
+  // Only memoize top-level calls; recursive calls share cycle detection.
   const topLevel = seen.size === 0;
   if (topLevel) {
     const hit = propsCache.get(className);
@@ -532,9 +488,6 @@ export function flattenClassProps(
     return [];
   }
   const inherited = def.inherits ? flattenClassProps(def.inherits, seen) : [];
-  // Use a Set for O(1) dedup. The prior `out.includes(p)` was O(N²) on
-  // classes with many props (GuiObject + TextLabel + TextButton inherit
-  // chain regularly exceeds 50 props).
   const out: string[] = [];
   const known = new Set<string>();
   for (const p of inherited) {
@@ -555,32 +508,13 @@ export function flattenClassProps(
   return out;
 }
 
-// ----------------------------------------------------------------------
-// Deprecated-but-valid properties
-// ----------------------------------------------------------------------
-//
-// Some legacy properties are intentionally kept OUT of the prop lists
-// above so completion nudges users toward the modern replacement
-// (`Font` → `FontFace`, …). But those props are still *real* — the code
-// compiles and runs. Omitting them from `flattenClassProps` made the
-// unknown-prop validator report `Font = …` as "Unknown property", a
-// false positive on perfectly valid code (issue #2). This set lets the
-// validator treat them as known (so no error) while keeping them out of
-// the suggestion list. The deprecation diagnostic handles the migration
-// nudge separately.
+// Deprecated properties remain valid but are excluded from completion suggestions.
 const DEPRECATED_VALID_PROPS: Record<string, string[]> = {
   TextLabel: ["Font"],
   TextButton: ["Font"],
   TextBox: ["Font"],
 };
 
-/**
- * True when `prop` is a deprecated-but-still-valid property of
- * `className` (walking the inheritance chain). Consumed by the
- * prop-validation diagnostic so legacy props like `Font` aren't flagged
- * "unknown". Kept separate from `flattenClassProps` on purpose:
- * deprecated props are *valid* but should not be *suggested*.
- */
 export function isDeprecatedValidProp(
   className: string,
   prop: string,
@@ -597,10 +531,7 @@ export function isDeprecatedValidProp(
   return false;
 }
 
-// `UICorner`'s per-corner radius properties (Roblox 2024+). When
-// `CornerRadius` is also set it overrides all four, so they conflict —
-// the diagnostic flags that, and the code actions collapse four equal
-// corners into one `CornerRadius` / expand one into four.
+// CornerRadius overrides all four individual radii.
 export const UICORNER_INDIVIDUAL_RADII = [
   "BottomLeftRadius",
   "BottomRightRadius",
@@ -608,12 +539,6 @@ export const UICORNER_INDIVIDUAL_RADII = [
   "TopRightRadius",
 ];
 
-/**
- * Given the prop keys present on a `UICorner`, return the individual
- * corner-radius props that are overridden by a co-present
- * `CornerRadius` (which sets all four). Empty when there's no conflict.
- * Pure — unit-tested and shared by the diagnostic + code action.
- */
 export function cornerRadiusConflicts(keys: Iterable<string>): string[] {
   const set = new Set(keys);
   if (!set.has("CornerRadius")) {
@@ -624,15 +549,7 @@ export function cornerRadiusConflicts(keys: Iterable<string>): string[] {
 
 const eventsCache = new Map<string, string[]>();
 
-/**
- * Every event a class can fire, most-specific first: the class's own
- * events, then its parent's, up to `Instance`. Unlike
- * `flattenClassProps` (base-first) this is ordered so the events users
- * actually reach for on a button (`Activated`, `MouseButton1Click`)
- * lead the `[React.Event.|` / `[OnEvent "|` / Vide suggestion lists and
- * the generic `Instance` signals (`AncestryChanged`, `Destroying`, …)
- * bring up the rear.
- */
+// List specific events before inherited ones to prioritize relevant completions.
 export function flattenClassEvents(
   className: string,
   seen: Set<string> = new Set(),
@@ -677,10 +594,6 @@ export function flattenClassEvents(
   return out;
 }
 
-/**
- * Returns the class in the hierarchy where `propName` is first declared
- * (its `own` array contains it). Useful for hover docs.
- */
 export function findIntroducingClass(
   className: string,
   propName: string,
@@ -688,11 +601,6 @@ export function findIntroducingClass(
   return findIntroducing(className, propName, (def) => def.own);
 }
 
-/**
- * Event counterpart of `findIntroducingClass`: the class whose `events`
- * array first declares `eventName` (e.g. `Activated` on `TextButton` →
- * `GuiButton`).
- */
 export function findIntroducingEventClass(
   className: string,
   eventName: string,
@@ -719,47 +627,24 @@ function findIntroducing(
   return undefined;
 }
 
-// Built-in defaults derived from the hierarchy. Same flat shape downstream
-// code already expects (Record<string, string[]>).
 export const defaultPropsMap: Record<string, string[]> = Object.fromEntries(
   Object.keys(classHierarchy).map((name) => [name, flattenClassProps(name)]),
 );
 
-// Abstract / intermediate classes Roblox doesn't let you `Instance.new(...)`.
-// Used to filter the hierarchy down to the names users can actually
-// construct directly (Vide's `Frame({...})` idiom).
 const ABSTRACT_CLASS_NAMES: ReadonlySet<string> = new Set([
   "Instance",
   "GuiBase2d",
   "GuiObject",
   "GuiButton",
-  // Luix-internal grouping under which UIListLayout / UIGridLayout / …
-  // share `FillDirection` etc. Not a real Roblox class.
+  // Synthetic grouping, not a constructible Roblox class.
   "UILayout",
 ]);
 
-/**
- * Roblox UI class names that Vide users can call directly as functions —
- * `Frame({ Size = … })`, `TextButton({ Activated = … })`, etc. This is the
- * full hierarchy minus the small handful of abstract / synthetic bases
- * that aren't constructible. Naturally limited to GUI types because the
- * extension's `classHierarchy` only contains GUI types — no `Camera`,
- * `Sound`, `Tween`, etc., so the allowlist can't accidentally fire on a
- * local variable named after a non-UI Roblox class.
- */
 export const DIRECT_INSTANTIABLE_CLASS_NAMES: ReadonlySet<string> = new Set(
   Object.keys(classHierarchy).filter((name) => !ABSTRACT_CLASS_NAMES.has(name)),
 );
 
-/**
- * Clear every derived cache and rebuild `defaultPropsMap` from the
- * current `classHierarchy`. Call this whenever the hierarchy itself
- * has been mutated (today: only the Roblox API-dump merge in
- * `apiDump.ts`). Without it, descendants of any class we extended
- * would keep returning their pre-merge flattened prop list, so e.g.
- * adding a prop to `Frame` wouldn't surface on `ScrollingFrame` or
- * `TextLabel` until the extension reloaded.
- */
+// Invalidate derived caches after any hierarchy mutation so descendants pick up changes.
 export function rebuildDerivedClassData(): void {
   propsCache.clear();
   eventsCache.clear();
@@ -769,10 +654,6 @@ export function rebuildDerivedClassData(): void {
   }
 }
 
-// ============================================================================
-// createElement aliases
-// ============================================================================
-
 export const DEFAULT_ALIASES = [
   "e",
   "createElement",
@@ -780,13 +661,7 @@ export const DEFAULT_ALIASES = [
   "Roact.createElement",
 ];
 
-// ============================================================================
-// Prop types + value snippet templates
-// ============================================================================
-
-// Map of prop name → Roblox type. Used to insert a value snippet when the
-// user accepts a completion. Conservative — only props whose type is
-// unambiguous across all classes that have them.
+// Only types shared unambiguously across classes belong here.
 export const PROP_TYPES: Record<string, string> = {
   // Color3
   Ambient: "Color3",
@@ -844,7 +719,7 @@ export const PROP_TYPES: Record<string, string> = {
   // Rect
   SliceCenter: "Rect",
 
-  // number
+  // Numbers
   AspectRatio: "number",
   BackgroundTransparency: "number",
   BorderSizePixel: "number",
@@ -885,7 +760,7 @@ export const PROP_TYPES: Record<string, string> = {
   Volume: "number",
   ZIndex: "number",
 
-  // boolean
+  // Booleans
   Active: "boolean",
   AlwaysOnTop: "boolean",
   Animated: "boolean",
@@ -922,7 +797,7 @@ export const PROP_TYPES: Record<string, string> = {
   Visible: "boolean",
   Wraps: "boolean",
 
-  // string
+  // Strings
   BottomImage: "string",
   HoverImage: "string",
   Image: "string",
@@ -935,10 +810,10 @@ export const PROP_TYPES: Record<string, string> = {
   TopImage: "string",
   Video: "string",
 
-  // Font (struct)
+  // Fonts
   FontFace: "Font",
 
-  // Instance refs
+  // Instance references
   Adornee: "Instance",
   CurrentCamera: "Camera",
   NextSelectionDown: "GuiObject",
@@ -949,7 +824,7 @@ export const PROP_TYPES: Record<string, string> = {
   RootLocalizationTable: "LocalizationTable",
   SelectionImageObject: "GuiObject",
 
-  // Enum.* — generic-enum templates rendered as Enum.<X>.${1}
+  // Enums
   ApplyStrokeMode: "Enum.ApplyStrokeMode",
   AspectType: "Enum.AspectType",
   AutomaticCanvasSize: "Enum.AutomaticSize",
@@ -999,31 +874,12 @@ export const PROP_TYPES: Record<string, string> = {
   ZIndexBehavior: "Enum.ZIndexBehavior",
 };
 
-// ============================================================================
-// Per-class type overrides
-//
-// Some prop names are reused across classes with DIFFERENT types. The
-// canonical case is `Style`:
-//   - Frame.Style      → Enum.FrameStyle
-//   - GuiButton.Style  → Enum.ButtonStyle  (inherited by TextButton, ImageButton)
-//
-// Looking up by prop name alone (`PROP_TYPES.Style`) can only return one
-// answer, which would always be wrong for half of the call sites. The
-// override map below is keyed by the class that *defines* the divergent
-// type — `getPropType(className, propName)` walks the class hierarchy
-// from the leaf upward, returning the first override that matches and
-// falling back to the global `PROP_TYPES` map.
-//
-// To handle a future conflict, add another entry like:
-//   GuiObject: { Foo: "Enum.SomeOtherFoo" },
-// — the closest ancestor wins, so leaf-level overrides take precedence.
-// ============================================================================
+// Resolve class-specific type conflicts from the nearest ancestor before using PROP_TYPES.
 export const PROP_TYPE_OVERRIDES: Record<string, Record<string, string>> = {
   Frame: {
     Style: "Enum.FrameStyle",
   },
   GuiButton: {
-    // Inherited by TextButton + ImageButton via the class hierarchy
     Style: "Enum.ButtonStyle",
   },
   UIStroke: {
@@ -1035,10 +891,6 @@ export const PROP_TYPE_OVERRIDES: Record<string, Record<string, string>> = {
     Transparency: "NumberSequence",
   },
   UIShadow: {
-    // `Offset` is globally `Vector2`; on UIShadow it's `UDim2`. The rest
-    // are either absent globally (`BlurRadius`, `Spread`) or ambiguous
-    // (`Color`, `Transparency`), so pin them here. `ZIndex` (number) and
-    // `Enabled` (boolean) resolve correctly from the global map.
     BlurRadius: "UDim",
     Color: "Color3",
     Offset: "UDim2",
@@ -1047,18 +899,7 @@ export const PROP_TYPE_OVERRIDES: Record<string, Record<string, string>> = {
   },
 };
 
-/**
- * Resolve a prop's Roblox type, honouring per-class overrides defined
- * in `PROP_TYPE_OVERRIDES`. Walks the class hierarchy from the supplied
- * class up to its roots, returning the first override that matches the
- * prop name. Falls back to the global `PROP_TYPES` map when no override
- * applies (or when `className` is undefined, which is the case for
- * custom components where we only know the prop name).
- */
-// Memoize per (className, propName) — the class hierarchy and
-// PROP_TYPE_OVERRIDES are static at module load, so a hit answer is
-// permanent. We use a sentinel for "no value" so `undefined` results
-// still cache and avoid re-walking the inheritance chain.
+// Cache missing types too, avoiding repeated hierarchy walks.
 const getPropTypeCache = new Map<string, string | typeof NO_TYPE>();
 const NO_TYPE = Symbol("no-type");
 
@@ -1090,9 +931,7 @@ export function getPropType(
   return result;
 }
 
-// Snippet templates per type. `${1:…}`, `${2:…}` become tab stops; the
-// caller appends `$0` (and a `,` if value-with-comma mode) after the
-// rendered template.
+// Callers append the final tabstop and optional comma.
 export const TYPE_SNIPPETS: Record<string, string> = {
   Color3: "Color3.fromRGB(${1:255}, ${2:255}, ${3:255})",
   UDim2: "UDim2.new(${1:0}, ${2:0}, ${3:0}, ${4:0})",
@@ -1120,12 +959,7 @@ export function renderTypeSnippet(typeName: string): string | undefined {
   return undefined;
 }
 
-// ============================================================================
-// Annotation completion: types offered after `---@prop NAME `
-// ============================================================================
-
 export const ANNOTATION_TYPE_HINTS = [
-  // Roblox value types
   "Color3",
   "UDim",
   "UDim2",
@@ -1141,25 +975,17 @@ export const ANNOTATION_TYPE_HINTS = [
   "BrickColor",
   "Instance",
   "LocalizationTable",
-  // Primitives
   "number",
   "string",
   "boolean",
   "nil",
   "any",
   "unknown",
-  // Common React-Luau types
   "React.ReactNode",
   "React.Ref",
 ];
 
-// ============================================================================
-// Font.fromName replacement table (for the Font → FontFace quick-fix)
-// ============================================================================
-
-// Conservative Enum.Font.* → (family, weight, italic?) translation for the
-// Font → FontFace quick fix. Unknown values fall back to the original
-// suffix as the family name; users can edit afterwards.
+// Unknown Enum.Font values fall back to the suffix as the family name.
 export const FONT_FACE_MAP: Record<
   string,
   { family: string; weight: string; italic?: boolean }

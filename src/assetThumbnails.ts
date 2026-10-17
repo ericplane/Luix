@@ -2,45 +2,14 @@ import * as vscode from "vscode";
 import { getConfig } from "./configCompat";
 import { logWarn } from "./output";
 
-// ============================================================================
-// Roblox asset thumbnail helpers — shared by the hover provider and the
-// gutter decorator
-// ============================================================================
-//
-// Two layers of caching, with deliberately different lifetimes:
-//
-//   1. In-memory `thumbnailUrlCache` — maps `assetId` → resolved CDN
-//      URL, for the *hover* path. The hover renders the image directly
-//      from the CDN URL through VS Code's markdown image loader, so it
-//      never touches disk. 24h TTL on success, 1 min on failure.
-//
-//   2. On-disk PNG cache, for the *gutter icon* path. VS Code's
-//      `gutterIconPath` requires a local file URI (remote URLs aren't
-//      supported), so we download each thumbnail once and write it
-//      somewhere the decorator can point to.
-//
-// The on-disk cache lives in one of two places, picked by
-// `luix.imageGutter.cacheLocation`:
-//
-//   • `global` (default) — `<extension globalStorage>/assetThumbs/`.
-//     Shared across every workspace, never touches the user's repo.
-//   • `workspace` — `<workspace>/.luix/assetThumbs/`. Self-contained per
-//     project. A `.luix/.gitignore` is auto-written so the cache
-//     doesn't leak into commits.
+// Hover URLs stay in memory; gutter thumbnails are cached on disk.
 
-/**
- * Size requested from the thumbnails API. 150×150 is the sweet spot:
- *   - Big enough to be legible in the hover popup with no scroll.
- *   - Small enough that the file cache stays under a few KB per asset.
- *   - Looks crisp scaled down to the ~16px gutter icon.
- */
 const THUMBNAIL_SIZE = "150x150" as const;
 
 interface CachedUrl {
   url: string | null;
-  /** When this entry stops being honoured. `0` means never cached. */
+  // Zero means uncached.
   expires: number;
-  /** What we last heard from the API — used by callers to compose a hover message. */
   state?: ThumbnailState;
 }
 const thumbnailUrlCache = new Map<string, CachedUrl>();
@@ -48,31 +17,9 @@ let cacheGeneration = 0;
 let purgePromise: Promise<void> | undefined;
 const activeWrites = new Set<Promise<void>>();
 const THUMBNAIL_TTL_OK = 24 * 60 * 60 * 1000;
-/**
- * Cache lifetime for *settled* failures (asset blocked, moderated, the
- * API returned 404, etc.). 10 s — long enough to suppress hammering
- * during a flurry of hovers, short enough that fixing a typo or
- * switching to a different ID gets a fresh fetch on the next look.
- *
- * Previously 60 s, which left users staring at a "moderated" message
- * for a full minute after every edit until the in-memory cache aged out.
- */
 const THUMBNAIL_TTL_FAIL = 10 * 1000;
 
-/**
- * Roblox's thumbnails API splits its responses into a handful of named
- * states. We use this to decide whether a result is worth caching:
- *
- *   • `Completed` — done, has `imageUrl`. Cache for a day.
- *   • `Pending` / `InReview` — Roblox hasn't generated the thumbnail
- *     yet (common for freshly-uploaded assets). Almost always
- *     transitions to `Completed` within seconds. **Do not cache** —
- *     the next call will succeed.
- *   • `Error` / `TemporarilyUnavailable` — transient backend issue.
- *     Same rationale: don't cache, let the next call retry.
- *   • `Blocked` / `Moderated` — permanent. Cache as failure.
- *   • Unknown / missing / network error — cache as failure (short TTL).
- */
+// Retry transient API states without caching them.
 export type ThumbnailState =
   | "Completed"
   | "Pending"
@@ -95,13 +42,6 @@ export interface ThumbnailLookup {
   state: ThumbnailState;
 }
 
-/**
- * Resolve a Roblox asset ID to the actual CDN image URL via the public
- * thumbnails API. Returns the URL plus the API's reported state so the
- * caller can pick a sensible message (transient vs permanent).
- * Memoised for the session — successes for 24 h, settled failures for
- * 10 s, transient states (Pending, InReview, Error, …) not cached at all.
- */
 export async function fetchAssetThumbnail(
   assetId: string,
   size: string = THUMBNAIL_SIZE
@@ -140,10 +80,6 @@ export async function fetchAssetThumbnail(
       return { url: entry.imageUrl, state };
     }
     if (TRANSIENT_STATES.has(state)) {
-      // Don't cache — the next call will likely succeed once Roblox has
-      // finished generating the thumbnail / recovered from a backend
-      // blip. This is the difference between "hover works after a few
-      // seconds" and "hover is stuck for 60 s after every edit".
       return { url: null, state };
     }
     return cacheFailure(cacheKey, now, state);
@@ -167,10 +103,6 @@ function cacheFailure(
   return { url: null, state };
 }
 
-/**
- * Back-compat shim for callers that only want the URL — the gutter
- * decorator doesn't need to know the state.
- */
 export async function fetchAssetThumbnailUrl(
   assetId: string,
   size: string = THUMBNAIL_SIZE
@@ -179,11 +111,6 @@ export async function fetchAssetThumbnailUrl(
   return url;
 }
 
-/**
- * Resolve the directory where on-disk thumbnails should live. Honours
- * `luix.imageGutter.cacheLocation` and falls back to global storage
- * when "workspace" is requested but no workspace is open.
- */
 export function getThumbnailCacheDir(
   context: vscode.ExtensionContext
 ): vscode.Uri {
@@ -197,12 +124,7 @@ export function getThumbnailCacheDir(
   return vscode.Uri.joinPath(context.globalStorageUri, "assetThumbs");
 }
 
-/**
- * Every cache directory that has ever been used for this extension —
- * resolved location *plus* the global fallback. Used by `purge` and
- * `getCacheStats` so flipping the location setting doesn't leave a
- * second directory dangling.
- */
+// Include both locations so switching settings leaves no orphaned cache.
 function allKnownCacheDirs(
   context: vscode.ExtensionContext
 ): vscode.Uri[] {
@@ -216,11 +138,6 @@ function allKnownCacheDirs(
   return out;
 }
 
-/**
- * Ensure the thumbnail PNG for `assetId` exists on disk; download it
- * if not. Returns the local file URI suitable for `gutterIconPath`,
- * or undefined if the network/API call failed.
- */
 export async function ensureThumbnailFile(
   context: vscode.ExtensionContext,
   assetId: string,
@@ -236,7 +153,7 @@ export async function ensureThumbnailFile(
     await vscode.workspace.fs.stat(filePath);
     return isCurrent() ? filePath : undefined;
   } catch {
-    // Not cached yet — fall through to download.
+    // Cache miss; download below.
   }
   const cdnUrl = await fetchAssetThumbnailUrl(assetId);
   if (!cdnUrl || !isCurrent()) {
@@ -269,19 +186,13 @@ export async function ensureThumbnailFile(
   }
 }
 
-/**
- * Create the cache directory if missing. When the cache lives inside
- * the workspace, also drop a `.gitignore` next to it so the cache
- * doesn't leak into commits.
- */
 async function ensureCacheDirReady(cacheDir: vscode.Uri): Promise<void> {
   try {
     await vscode.workspace.fs.createDirectory(cacheDir);
   } catch {
-    // Already exists — fine.
+    // The directory may already exist.
   }
-  // The cache dir is `<…>/.luix/assetThumbs` — the gitignore goes one
-  // level up so the whole `.luix/` folder is ignored.
+  // Ignore the entire .luix directory, not just assetThumbs.
   if (!cacheDir.path.includes("/.luix/")) {
     return;
   }
@@ -289,9 +200,9 @@ async function ensureCacheDirReady(cacheDir: vscode.Uri): Promise<void> {
   const gitignore = vscode.Uri.joinPath(parent, ".gitignore");
   try {
     await vscode.workspace.fs.stat(gitignore);
-    return; // already there
+    return;
   } catch {
-    // Need to write it.
+    // Create the missing ignore file below.
   }
   try {
     await vscode.workspace.fs.writeFile(
@@ -304,15 +215,10 @@ async function ensureCacheDirReady(cacheDir: vscode.Uri): Promise<void> {
       )
     );
   } catch {
-    // Best-effort.
+    // Ignore-file creation is best effort.
   }
 }
 
-/**
- * Tally up every PNG across the active cache and the global fallback
- * so the sidebar can display "N assets, X MB" honestly even if the
- * user flipped between cache locations.
- */
 export async function getCacheStats(
   context: vscode.ExtensionContext
 ): Promise<{ count: number; bytes: number }> {
@@ -335,18 +241,13 @@ export async function getCacheStats(
         count++;
         bytes += stat.size;
       } catch {
-        // Ignore individual stat failures.
+        // Skip unreadable files.
       }
     }
   }
   return { count, bytes };
 }
 
-/**
- * Delete every cached thumbnail across both possible locations. Safe
- * to call when the cache is empty or the directories don't exist —
- * the call is idempotent.
- */
 export async function purgeAllThumbnails(
   context: vscode.ExtensionContext
 ): Promise<void> {
@@ -354,8 +255,7 @@ export async function purgeAllThumbnails(
   cacheGeneration++;
   thumbnailUrlCache.clear();
   const purge = (async () => {
-    // Finish writes already dispatched before deleting their directories;
-    // downloads still in flight fail their generation check before writing.
+    // Finish active writes before deletion; generation checks reject pending downloads.
     await Promise.allSettled([...activeWrites]);
     for (const dir of allKnownCacheDirs(context)) {
       try {
@@ -364,7 +264,7 @@ export async function purgeAllThumbnails(
           useTrash: false,
         });
       } catch {
-        // Directory may not exist — fine.
+        // The directory may not exist.
       }
     }
   })();
@@ -376,14 +276,10 @@ export async function purgeAllThumbnails(
   }
 }
 
-/** Extract every distinct asset ID referenced anywhere in the document. */
 export function findAssetReferences(
   text: string
 ): Array<{ assetId: string; offset: number }> {
   const out: Array<{ assetId: string; offset: number }> = [];
-  // Match `rbxassetid://NNNN` or `rbxasset://NNNN` inside any quote
-  // style (`"…"`, `'…'`, Luau backticks). The thumbnails API treats both
-  // prefixes the same; users sometimes type one and sometimes the other.
   const re = /(["'`])rbxasset(?:id)?:\/\/(\d+)\1/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {

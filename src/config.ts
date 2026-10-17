@@ -1,16 +1,10 @@
 import { getConfig } from "./configCompat";
 import { getAliasPartition } from "./frameworks";
 
-/**
- * Returns the flat union of all enabled aliases regardless of call shape.
- * Most internal code now prefers `getAliasPartition()` to know which
- * call form each alias uses; this helper exists for the legacy
- * `createElementAliases` user override and for tests.
- */
+/** Flat alias list, with the legacy createElementAliases override taking precedence. */
 export function getAliases(): string[] {
   const partition = getAliasPartition();
   const combined = [...partition.parens, ...partition.curried];
-  // The legacy `createElementAliases` setting still wins if set.
   const fromConfig = getConfig<string[]>("createElementAliases", combined);
   if (!Array.isArray(fromConfig) || fromConfig.length === 0) {
     return combined;

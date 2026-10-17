@@ -89,7 +89,7 @@ suite("findEnclosingPropsCall", () => {
   });
 
   test("returns the actually-enclosing class, not the last seen one (regression for issue #3)", () => {
-    // Cursor is back in Frame's props, after a closed TextLabel child.
+    // Cursor is back in the parent props after the closed child.
     const text = `
 e("Frame", {
     child = e("TextLabel", { Text = "x" }),
@@ -132,7 +132,6 @@ e("TextLabel", {
   });
 
   test("rejects identifier-suffix `e` false positives (regression for issue #5)", () => {
-    // `frame(...)` is NOT a createElement call.
     const result = detect(`frame("Frame", { | })`);
     assert.strictEqual(result, undefined);
   });
@@ -148,7 +147,7 @@ e("TextLabel", {
   });
 
   test("returns undefined inside an unclosed paren expression", () => {
-    // Cursor is in the argument list of UDim2.new, not in Frame's props.
+    // Cursor is inside a value constructor.
     const text = `e("Frame", { Size = UDim2.new(| ) })`;
     const result = detect(text);
     assert.strictEqual(result, undefined);
@@ -227,10 +226,6 @@ suite("Default props map", () => {
   });
 });
 
-// ============================================================================
-// 1.4.0 — type-aware snippets
-// ============================================================================
-
 import { _testing } from "../extension";
 
 suite("renderTypeSnippet", () => {
@@ -274,9 +269,7 @@ suite("Class hierarchy", () => {
   test("Frame inherits from GuiObject and adds Style", () => {
     const frame = _testing.classHierarchy.Frame;
     assert.strictEqual(frame.inherits, "GuiObject");
-    // Frame's own `Style` prop is type `Enum.FrameStyle` (distinct from
-    // GuiButton's `Style` → `Enum.ButtonStyle`); resolved via
-    // `PROP_TYPE_OVERRIDES`.
+    // Frame.Style and GuiButton.Style use different enums.
     assert.deepStrictEqual(frame.own, ["Style"]);
     assert.strictEqual(
       _testing.getPropType("Frame", "Style"),
@@ -287,22 +280,20 @@ suite("Class hierarchy", () => {
   test("TextButton chains inheritance: GuiObject → GuiButton → TextButton", () => {
     const tb = _testing.classHierarchy.TextButton;
     assert.strictEqual(tb.inherits, "GuiButton");
-    // `own` carries the text-rendering props (mirrored from TextLabel) since
-    // TextButton is a button-and-label hybrid in our model.
     assert.ok(tb.own.includes("Text"));
     assert.ok(tb.own.includes("FontFace"));
   });
 
   test("Flattening TextButton includes GuiObject, GuiButton, and text props", () => {
     const flat = _testing.flattenClassProps("TextButton");
-    // From GuiObject:
+    // Inherited from GuiObject.
     assert.ok(flat.includes("BackgroundColor3"));
     assert.ok(flat.includes("Position"));
     assert.ok(flat.includes("Interactable"));
-    // From GuiButton:
+    // Inherited from GuiButton.
     assert.ok(flat.includes("AutoButtonColor"));
     assert.ok(flat.includes("Selected"));
-    // Mirrored text props on TextButton itself:
+    // Own text properties.
     assert.ok(flat.includes("Text"));
     assert.ok(flat.includes("FontFace"));
   });
@@ -375,12 +366,10 @@ suite("PROP_TYPES coverage", () => {
   });
 
   test("Style resolves to the right enum per class", () => {
-    // Frame.Style → Enum.FrameStyle
     assert.strictEqual(
       _testing.getPropType("Frame", "Style"),
       "Enum.FrameStyle"
     );
-    // GuiButton.Style → Enum.ButtonStyle (and inherited subclasses)
     assert.strictEqual(
       _testing.getPropType("GuiButton", "Style"),
       "Enum.ButtonStyle"
@@ -396,7 +385,6 @@ suite("PROP_TYPES coverage", () => {
   });
 
   test("getPropType falls back to global PROP_TYPES for shared props", () => {
-    // BackgroundColor3 has no override — same answer everywhere.
     assert.strictEqual(
       _testing.getPropType("Frame", "BackgroundColor3"),
       "Color3"
@@ -405,17 +393,12 @@ suite("PROP_TYPES coverage", () => {
       _testing.getPropType("TextButton", "BackgroundColor3"),
       "Color3"
     );
-    // No className supplied at all → still resolves via the global map.
     assert.strictEqual(
       _testing.getPropType(undefined, "Position"),
       "UDim2"
     );
   });
 });
-
-// ============================================================================
-// 1.2.0 — in-file prop inference
-// ============================================================================
 
 suite("extractTypeFields", () => {
   test("simple flat literal", () => {
@@ -522,7 +505,7 @@ suite("parseAnnotationsForComponent", () => {
       "---@extends Frame",
       "local function Foo(props) end",
     ].join("\n");
-    // The plain `--` comment breaks the chain, so @extends is NOT picked up.
+    // An ordinary comment breaks the annotation chain.
     const result = parseAnnotationsForComponent(text, 2);
     assert.strictEqual(result.extendsClass, "Frame");
   });
@@ -601,7 +584,6 @@ local function Foo(props)
     return e("B", {})
 end`.trimStart();
     const info = scanDocument(text, ALIASES).get("Foo");
-    // First top-level return wins.
     assert.strictEqual(info?.detectedBase, "A");
   });
 });
@@ -657,20 +639,6 @@ suite("scanDocument — caching", () => {
   });
 });
 
-// ============================================================================
-// 1.3.0 — cross-file resolution (unit)
-// ============================================================================
-//
-// The full WorkspaceIndex relies on VS Code's file watcher and workspace
-// APIs. The hard part — parsing — is already covered by scanDocument tests.
-// Here we just verify the *aggregation* logic that `findComponent` will run
-// over the cache, by parsing two pretend "files" the same way the index
-// does and looking up across them.
-
-// ============================================================================
-// 1.5.0 — new helpers
-// ============================================================================
-
 import {
   extractColorLiterals,
   findAllCreateElementCalls,
@@ -688,7 +656,6 @@ suite("Events (1.5)", () => {
     const events = _testing.flattenClassEvents("TextButton");
     assert.ok(events.includes("Activated"));
     assert.ok(events.includes("MouseButton1Click"));
-    // Still has GuiObject events:
     assert.ok(events.includes("MouseEnter"));
   });
 
@@ -918,32 +885,22 @@ suite("Cross-file aggregation", () => {
     const indexA = scanDocument(fileA, ALIASES);
     const indexB = scanDocument(fileB, ALIASES);
 
-    // File B (the consumer) has no GamepassCard definition.
     assert.strictEqual(indexB.has("GamepassCard"), false);
 
-    // File A has it with the @extends annotation.
     const info = indexA.get("GamepassCard");
     assert.strictEqual(info?.annotations.extendsClass, "Frame");
 
-    // Aggregation: consumer's same-file lookup misses → fall back to file A.
     const acrossFiles = indexB.get("GamepassCard") ?? indexA.get("GamepassCard");
     assert.strictEqual(acrossFiles?.annotations.extendsClass, "Frame");
   });
 });
-
-// ============================================================================
-// 1.6.0 — multi-framework support (Fusion, Vide)
-// ============================================================================
 
 const FUSION_PARTITION = {
   parens: [] as string[],
   curried: ["New", "Fusion.New"],
 };
 const VIDE_PARTITION = {
-  // 1.5.0: Vide aliases live in *both* buckets via
-  // `recognizedCallShapes: ["parens", "curried"]` so the parser picks
-  // up `create "Frame" { … }`, `create("Frame", { … })`, and the
-  // dotted `Vide.create(...)` form alike.
+  // Vide supports both parenthesized and curried calls.
   parens: ["create", "vide.create", "Vide.create"],
   curried: ["create", "vide.create", "Vide.create"],
 };
@@ -1029,8 +986,6 @@ local b = create "Frame" {
     assert.strictEqual(tree[0].children[0].call.className, "TextLabel");
   });
 
-  // Fork's three Vide-parens tests — ported as-is so future
-  // regressions in the parens-form path get caught early.
   test("findEnclosingPropsCall picks up `Vide.create(\"Frame\", { | })`", () => {
     const text = `Vide.create("Frame", { | })`;
     const cursor = text.indexOf("|");
@@ -1085,19 +1040,9 @@ suite("Framework filtering", () => {
 });
 
 suite("Parens-form inline-children scoping (1.5.0)", () => {
-  // 1.5.0 review: the inline-children fallback in the parens-form
-  // branch used to gate on `partition.curried.includes(alias)`, which
-  // misfires for non-Vide aliases that happen to land in the curried
-  // bucket via an alias override. Behaviour is now scoped to
-  // `partition.parensWithInlineChildren` — populated only for
-  // frameworks whose spec declares `childrenLayout: "inline"` AND
-  // recognises the parens shape (today: Vide only).
 
   test("React 2-arg parens never sets inline-children", () => {
-    // `e("Frame", { Inner = e("X", {}) })` — `Inner` is a prop value,
-    // not a sibling child. With React-only aliases (no curried entries)
-    // the inline-children branch must NOT fire, so the inner call
-    // remains a sibling at the tree root, not nested under `Frame`.
+    // React elements in prop values are not children in the call tree.
     const text = `e("Frame", { Inner = e("X", {}) })`;
     const calls = findAllCreateElementCalls(text, {
       parens: ["e"],
@@ -1106,15 +1051,10 @@ suite("Parens-form inline-children scoping (1.5.0)", () => {
     });
     const outer = calls.find((c) => c.className === "Frame");
     assert.strictEqual(outer?.childrenStart, undefined);
-    // The buildCallTree result depends on Vide's inline-children
-    // membership; with React-only, both calls stay at the root.
     assert.strictEqual(buildCallTree(calls).length, 2);
   });
 
   test("Vide parens form DOES set inline-children", () => {
-    // The positive case — when the alias IS in
-    // `parensWithInlineChildren`, the props brace doubles as the
-    // children container, so the inner call nests as a tree child.
     const text = `Vide.create("Frame", { Vide.create("X", {}) })`;
     const calls = findAllCreateElementCalls(text, {
       parens: ["Vide.create"],
@@ -1153,19 +1093,6 @@ suite("Curried return-statement detection", () => {
   });
 });
 
-// ============================================================================
-// Issue #3: curried calls written with explicit parentheses.
-//
-// The class-name stage and the props stage each independently accept
-// Lua's call sugar or explicit parens, and Fusion 0.3 adds a scope —
-// either threaded as a leading argument or bound to a `scope:` receiver
-// by `scoped()`. StyLua's `call_parentheses = "Always"` (which the
-// Roblox Lua Style Guide mandates) rewrites every sugar call into the
-// parenthesised form, so a formatted codebase hits these shapes on
-// every element.
-// ============================================================================
-
-/** Every way `New "Frame" { … }` can legally be spelled. */
 const CURRIED_HEADS = [
   ['sugar', 'New "Frame" '],
   ['scoped sugar', 'scope:New "Frame" '],
@@ -1189,8 +1116,7 @@ suite("Curried calls with explicit parentheses (issue #3)", () => {
         assert.strictEqual(calls[0].className, "Frame");
         assert.strictEqual(calls[0].isStringLiteralName, true);
         assert.strictEqual(calls[0].nameProp, "Outer");
-        // The reported range has to cover the whole call — receiver and
-        // trailing `)` included — or refactors rewrite a partial call.
+        // Refactors need the receiver and closing parentheses in the range.
         assert.strictEqual(
           text.slice(calls[0].aliasStart, calls[0].fullEnd),
           `${head}${open} Name = "Outer" ${close}`
@@ -1367,10 +1293,6 @@ suite("Fusion 0.3 scope parameter (issue #3)", () => {
   });
 });
 
-// ============================================================================
-// Sidebar plumbing: palette completion + scaffold templates
-// ============================================================================
-
 import { buildPaletteCompletions } from "../palette";
 import { _renderTemplate } from "../scaffolds";
 
@@ -1380,7 +1302,6 @@ suite("Palette completion", () => {
       primary: "Color3.fromRGB(124, 92, 255)",
       surface: "Color3.fromRGB(28, 30, 38)",
     };
-    // Pretend the cursor is at column 30 of a line ending with `= Color3.`.
     const position = new vscode.Position(0, 30);
     const items = buildPaletteCompletions(palette, position);
     assert.strictEqual(items.length, 2);
@@ -1389,8 +1310,6 @@ suite("Palette completion", () => {
     );
     assert.ok(labels.includes("palette.primary"));
     assert.ok(labels.includes("palette.surface"));
-    // Each insertion replaces the trailing `Color3.` (7 chars) and
-    // inserts the full configured expression.
     for (const item of items) {
       assert.ok(item.range instanceof vscode.Range);
       assert.strictEqual(
@@ -1410,10 +1329,6 @@ suite("Palette completion", () => {
     assert.deepStrictEqual(items, []);
   });
 });
-
-// ============================================================================
-// Workspace exclusion + component filtering
-// ============================================================================
 
 import { _internal as wsInternal } from "../workspaceIndex";
 
@@ -1451,11 +1366,7 @@ suite("WorkspaceIndex exclusion", () => {
 });
 
 suite("buildFolderTree", () => {
-  // Lightweight stub of the workspace folder lookup. The real
-  // implementation reads vscode.workspace.getWorkspaceFolder, which
-  // would resolve to undefined in the headless test host. We sidestep
-  // that here by writing the tree-builder's input as paths already
-  // relative to a virtual workspace folder.
+  // Paths are relative to a virtual workspace folder.
 
   function fakeEntry(name: string, fsPath: string) {
     return {
@@ -1470,11 +1381,8 @@ suite("buildFolderTree", () => {
     };
   }
 
-  // Skip in environments without a workspace folder.
   test("groups components by folder when componentsRoot is set", () => {
-    // We can't easily fake `vscode.workspace.getWorkspaceFolder` from a
-    // test; if no workspace folder is open all entries get dropped at
-    // the root. That degenerate behavior is itself worth validating.
+    // Without a workspace folder, entries are grouped at the root.
     const tree = sidebar.buildFolderTree(
       [
         fakeEntry("Card", "/proj/src/UI/Components/Card.luau"),
@@ -1482,7 +1390,6 @@ suite("buildFolderTree", () => {
       ],
       undefined
     );
-    // All entries land at root because no workspace folder resolves.
     assert.strictEqual(tree.kind, "folder");
     assert.ok(tree.children.length >= 0);
   });
@@ -1564,9 +1471,6 @@ suite("findEnclosingFactoryStringArg", () => {
     assert.strictEqual(r?.alias, "Roact.createElement");
   });
 
-  // Fork's `Vide.create("…")` parens-form string-arg test —
-  // the alias lives in both partition buckets so the parens-form
-  // detector should match it (and not just the curried form).
   test("parens form — Vide.create", () => {
     const r = detectArg(`Vide.create("Fr|")`);
     assert.ok(r);
@@ -1681,10 +1585,6 @@ end`;
   });
 });
 
-// ============================================================================
-// 1.4.3 — direct component-call detection (Vide / Fusion idiom)
-// ============================================================================
-
 suite("Direct component-call detection", () => {
   const KNOWN = new Set(["StylizedButton", "Card", "MyComp"]);
 
@@ -1732,8 +1632,7 @@ suite("Direct component-call detection", () => {
   });
 
   test("does NOT trigger for a plain `tbl { ... }` Lua function call with unknown name", () => {
-    // This is the safety case — without the known-components gate the
-    // curried regex would match every `f { ... }` table-call in Lua.
+    // Unknown table-call functions must not be treated as components.
     const text = `task.spawn(function() local t = work { | } end)`;
     const cursor = text.indexOf("|");
     const stripped = text.replace("|", "");
@@ -1747,8 +1646,6 @@ suite("Direct component-call detection", () => {
   });
 
   test("does NOT trigger when no known-components set is supplied", () => {
-    // Back-compat: the old 3-arg signature must keep returning undefined
-    // for bare component calls.
     const text = `StylizedButton({ | })`;
     const cursor = text.indexOf("|");
     const stripped = text.replace("|", "");
@@ -1770,9 +1667,6 @@ suite("Direct component-call detection", () => {
   });
 
   test("does NOT trigger on qualified accesses like `Mod.Card({ | })`", () => {
-    // The `.` exclusion in the regex keeps `Mod.Card(` out — Luix's
-    // workspace index keys components by bare name anyway, so the
-    // user's component table is always a `require`d local.
     const text = `Mod.Card({ | })`;
     const cursor = text.indexOf("|");
     const stripped = text.replace("|", "");
@@ -1786,9 +1680,6 @@ suite("Direct component-call detection", () => {
   });
 
   test("framework-mediated calls still take precedence over direct detection", () => {
-    // `e(Card, { | })` should match the parens-form alias path first
-    // (callShape=parens, alias='e', isDirectComponentCall=undefined),
-    // not the direct-call fallback.
     const text = `e(Card, { | })`;
     const cursor = text.indexOf("|");
     const stripped = text.replace("|", "");
@@ -1805,9 +1696,6 @@ suite("Direct component-call detection", () => {
   });
 
   test("direct call inside an outer e(...) still resolves to the inner component", () => {
-    // Mixed framework: React-style outer with a direct-Vide-call inner
-    // child. Cursor inside the inner `{ ... }` should resolve to the
-    // inner component, not the outer "Frame".
     const text = `e("Frame", {
   StylizedButton({ | }),
 })`;
@@ -1824,16 +1712,7 @@ suite("Direct component-call detection", () => {
   });
 });
 
-// ============================================================================
-// Direct instance-call detection — Vide's `Frame({...})` shape for built-in
-// Roblox classes. Same gate as direct component calls; the parser doesn't
-// distinguish, downstream code differentiates by checking `classHierarchy`.
-// ============================================================================
-
 suite("Direct instance-call detection (Vide)", () => {
-  // Built-in class names that flow through as direct-call targets when
-  // `luix.vide.directInstanceCalls` is on. In production these come from
-  // `DIRECT_INSTANTIABLE_CLASS_NAMES`; here we hand-roll the same shape.
   const INSTANCES = new Set([
     "Frame",
     "TextLabel",
@@ -1875,9 +1754,6 @@ suite("Direct instance-call detection (Vide)", () => {
   });
 
   test("does NOT fire on `Camera({ | })` (non-UI class not in the set)", () => {
-    // The allowlist is UI-only; non-UI Roblox class names like Camera,
-    // Sound, Tween, Workspace are deliberately absent so a local
-    // variable with one of those names can't accidentally trigger.
     const text = `Camera({ | })`;
     const cursor = text.indexOf("|");
     const stripped = text.replace("|", "");
@@ -1891,11 +1767,7 @@ suite("Direct instance-call detection (Vide)", () => {
   });
 
   test("workspace component shadows a built-in class name in the set", () => {
-    // If both `Frame` (workspace component) and `Frame` (built-in class)
-    // map into the set, detection still succeeds — downstream picks the
-    // workspace component via `findComponent` → `getPropsForClass`. The
-    // parser itself is order-agnostic; this test guards the membership
-    // check, not the precedence (which is downstream).
+    // This checks parser membership; component precedence is resolved separately.
     const both = new Set(["Frame", "TextLabel"]);
     const text = `Frame { | }`;
     const cursor = text.indexOf("|");
@@ -1911,41 +1783,24 @@ suite("Direct instance-call detection (Vide)", () => {
   });
 
   test("DIRECT_INSTANTIABLE_CLASS_NAMES excludes abstract bases", () => {
-    // Smoke-test the curated allowlist: concrete UI classes present,
-    // abstract bases absent.
     const { DIRECT_INSTANTIABLE_CLASS_NAMES } = require("../data");
     const set: ReadonlySet<string> = DIRECT_INSTANTIABLE_CLASS_NAMES;
-    // Concrete — should be there.
     assert.ok(set.has("Frame"));
     assert.ok(set.has("TextLabel"));
     assert.ok(set.has("ScrollingFrame"));
     assert.ok(set.has("UIPadding"));
     assert.ok(set.has("UICorner"));
-    // Abstract — should NOT be there.
     assert.ok(!set.has("Instance"));
     assert.ok(!set.has("GuiBase2d"));
     assert.ok(!set.has("GuiObject"));
     assert.ok(!set.has("GuiButton"));
     assert.ok(!set.has("UILayout"));
-    // Non-UI — should NOT be there (defensive; Luix's classHierarchy
-    // doesn't model them anyway).
     assert.ok(!set.has("Camera"));
     assert.ok(!set.has("Sound"));
     assert.ok(!set.has("Tween"));
     assert.ok(!set.has("Workspace"));
   });
 });
-
-// ============================================================================
-// 1.5.0 — Active-framework detection (per-file framework discovery)
-// ============================================================================
-//
-// Drives the snippet- and completion-gating system that lets a Vide
-// file surface only Vide snippets, a React file only React, etc.
-// Detector lives in `src/activeFramework.ts`; we test the pure
-// text-only helpers (require + factory-call scanning) since they're
-// the meaningful logic — override precedence is a one-line config
-// read and workspace fallback is a setter/getter pair.
 
 import { _internal as activeFrameworkInternal } from "../activeFramework";
 
@@ -1960,10 +1815,6 @@ suite("activeFramework — detectFromRequires (1.5.0)", () => {
   });
 
   test("require(...Packages.Roact) → roact (wins over react substring)", () => {
-    // "Roact" contains "react" as a substring; the priority order in
-    // detectFromRequires checks Roact first so the more-specific match
-    // wins. Regression guard: if someone swaps the test order, a Roact
-    // file would mis-detect as React and surface the wrong snippets.
     const text =
       `local Roact = require(ReplicatedStorage.Packages.Roact)\n` +
       `local e = Roact.createElement\n`;
@@ -1985,8 +1836,6 @@ suite("activeFramework — detectFromRequires (1.5.0)", () => {
   });
 
   test("no require → undefined", () => {
-    // A file with no require at all should fall through; the calls
-    // path then takes over upstream of this helper.
     const text = `local x = 1\nlocal y = 2\n`;
     assert.strictEqual(detectFromRequires(text), undefined);
   });
@@ -2000,11 +1849,7 @@ suite("activeFramework — detectFromRequires (1.5.0)", () => {
 suite("activeFramework — detectFromCalls (1.5.0)", () => {
   const { detectFromCalls } = activeFrameworkInternal;
 
-  // detectFromCalls relies on the real getAliasPartition(), which
-  // reads `luix.frameworks` from the workspace configuration. In the
-  // test extension host that defaults to all four frameworks
-  // enabled, so all aliases (`e`, `New`, `create`, `Vide.create`,
-  // `Roact.createElement`, …) participate.
+  // Uses the test workspace's enabled frameworks and aliases.
 
   test("e(\"Frame\", { … }) → react (factory-call fallback)", () => {
     const text = `local x = e("Frame", { Name = "A" })`;
@@ -2019,9 +1864,6 @@ suite("activeFramework — detectFromCalls (1.5.0)", () => {
   });
 
   test("Vide.create(\"Frame\", { … }) → vide (fork's parens form)", () => {
-    // Forks the same alias added in 1.5.0 — guards that the
-    // detection's call-fallback path sees the parens-form alias
-    // alongside its curried twin.
     const text = `local x = Vide.create("Frame", { Name = "A" })`;
     const fw = detectFromCalls(text);
     assert.strictEqual(fw, "vide");
@@ -2039,16 +1881,6 @@ suite("activeFramework — detectFromCalls (1.5.0)", () => {
   });
 });
 
-// ============================================================================
-// 1.5.0 — Computed-key fast-path regexes (React / Roact / Fusion)
-// ============================================================================
-//
-// 1.4.x's fast-path was React-only (`[React.Event.X]`). 1.5.0 extends
-// it to Roact (same shape, different prefix) and adds Fusion's
-// quoted-string shapes (`[OnEvent "X"]`, `[OnChange "X"]`, `[Out "X"]`).
-// Tests below pin each regex shape so a refactor can't quietly drop
-// a framework's support.
-
 import { _internal as completionInternal } from "../completion";
 
 suite("Computed-key fast-paths (1.5.0)", () => {
@@ -2060,14 +1892,8 @@ suite("Computed-key fast-paths (1.5.0)", () => {
   });
 
   test("Roact: [Roact.Event.A → matches roactEvent (1.5 — separate from React)", () => {
-    // 1.5.0 review: React and Roact get separate regexes so the
-    // active-framework gate downstream can suppress the Roact shape
-    // in React files and vice versa. Previously a single merged
-    // `(?:React|Roact)` regex matched both, which leaked Roact
-    // suggestions into React files when typing `[Roact.Event.…`.
     assert.ok(fp.roactEvent.exec("[Roact.Event.Activated"));
     assert.ok(fp.roactEvent.exec("[Roact.Event."));
-    // Cross-framework non-match: reactEvent must NOT swallow Roact.
     assert.strictEqual(fp.reactEvent.exec("[Roact.Event.A"), null);
     assert.strictEqual(fp.roactEvent.exec("[React.Event.A"), null);
   });
@@ -2095,7 +1921,6 @@ suite("Computed-key fast-paths (1.5.0)", () => {
   });
 
   test("non-matching shapes do not match", () => {
-    // Plain text, no `[`, mid-identifier, wrong framework name, etc.
     assert.strictEqual(fp.reactEvent.exec("React.Event.A"), null);
     assert.strictEqual(fp.reactEvent.exec("[Vide.Event.A"), null);
     assert.strictEqual(fp.roactEvent.exec("[Vide.Event.A"), null);
@@ -2104,16 +1929,6 @@ suite("Computed-key fast-paths (1.5.0)", () => {
     assert.strictEqual(fp.fusionOut.exec(`[OnEvent "A`), null);
   });
 });
-
-// ============================================================================
-// 1.5.0 — Snippet-bag smoke tests
-// ============================================================================
-//
-// Every framework's element / scaffold / event / state snippets are
-// gated to that framework via `snip.framework === active`. The smoke
-// tests below assert the bag is populated for each (id, kind) pair —
-// catches accidental deletion / mis-gating of an entire bag in one
-// shot, instead of waiting for the user to notice an absent snippet.
 
 import { _internal as snippetsInternal } from "../elementSnippets";
 
@@ -2143,9 +1958,6 @@ suite("Snippet-bag parity (1.5.0)", () => {
   }
 
   function elementClassNames(framework: string): string[] {
-    // Each element snippet's prefix is `<letter><ClassName>` — `e` for
-    // React, `r` for Roact, `n` for Fusion, `c` for Vide. Strip the
-    // single-letter framework marker to recover the class name.
     return byKindAndFramework("element", framework).map((s) =>
       s.prefix.replace(/^[a-z]/, "")
     );
@@ -2240,7 +2052,6 @@ suite("Snippet-bag parity (1.5.0)", () => {
   });
 
   test("Every framework-tagged snippet sits in one of the four frameworks", () => {
-    // Sanity check: no typos like "react " or "Fusion" sneaking in.
     const valid = new Set(["react", "roact", "fusion", "vide"]);
     for (const s of SNIPPETS) {
       if (s.framework !== undefined) {
@@ -2252,10 +2063,6 @@ suite("Snippet-bag parity (1.5.0)", () => {
     }
   });
 });
-
-// ============================================================================
-// 1.5.1 — Roblox content-URL autocomplete (rbxthumb:// + rbxasset://)
-// ============================================================================
 
 import {
   RBXTHUMB_TYPES,
@@ -2269,10 +2076,7 @@ import {
 
 suite("rbxthumb type table (1.5.1)", () => {
   test("every type's sizes are square-able (used as a single w=h choice)", () => {
-    // The completion mirrors one size choice into both w and h, which
-    // is only valid because every documented size is square. This test
-    // pins that invariant: each entry must have >=1 size and they must
-    // be positive integers.
+    // A shared width/height choice requires square thumbnail sizes.
     for (const t of RBXTHUMB_TYPES) {
       assert.ok(t.sizes.length > 0, `${t.type} has no sizes`);
       for (const s of t.sizes) {
@@ -2350,8 +2154,6 @@ suite("validateRbxThumb (1.5.1)", () => {
   });
 
   test("flags a valid size for a DIFFERENT type (per-type gating)", () => {
-    // 420 is valid for Outfit but not for AvatarHeadShot — the whole
-    // point of per-type sizing.
     const ok = validateRbxThumb(
       parseRbxThumb("rbxthumb://type=Outfit&id=1&w=420&h=420")!
     );
@@ -2385,8 +2187,6 @@ suite("validateRbxThumb (1.5.1)", () => {
   });
 
   test("missing size / type are flagged but as the low-signal kinds", () => {
-    // The diagnostic filters these out (they fire while typing); make
-    // sure they're tagged so that filter works.
     const missingSize = validateRbxThumb(
       parseRbxThumb("rbxthumb://type=GameIcon&id=1")!
     );
@@ -2424,7 +2224,6 @@ suite("getEnclosingString (1.5.1)", () => {
     const stripped = text.replace("|", "");
     const enc = getEnclosingString(stripped, offset);
     assert.ok(enc);
-    // The slice from innerStart should begin with the URL.
     assert.ok(stripped.slice(enc!.innerStart).startsWith("rbxthumb://"));
   });
 });
@@ -2444,15 +2243,12 @@ suite("deprecated-but-valid props — Font (1.5.1)", () => {
   const { isDeprecatedValidProp } = require("../data");
 
   test("Font is a deprecated-but-valid prop on text classes", () => {
-    // Issue #2: `Font = …` on a TextLabel was wrongly flagged "Unknown
-    // property". It's deprecated (in favour of FontFace) but valid.
     assert.strictEqual(isDeprecatedValidProp("TextLabel", "Font"), true);
     assert.strictEqual(isDeprecatedValidProp("TextButton", "Font"), true);
     assert.strictEqual(isDeprecatedValidProp("TextBox", "Font"), true);
   });
 
   test("Font is NOT valid on non-text classes (still flagged there)", () => {
-    // A Frame genuinely has no Font property — keep flagging that.
     assert.strictEqual(isDeprecatedValidProp("Frame", "Font"), false);
     assert.strictEqual(isDeprecatedValidProp("ImageLabel", "Font"), false);
   });
@@ -2463,9 +2259,7 @@ suite("deprecated-but-valid props — Font (1.5.1)", () => {
   });
 
   test("Font stays OUT of the suggestion list (valid ≠ suggested)", () => {
-    // The whole point of keeping Font in a separate set: it's accepted
-    // by the validator but must not be offered in completion, so users
-    // are still nudged toward FontFace.
+    // Deprecated Font remains valid but is omitted from suggestions.
     assert.ok(!_testing.flattenClassProps("TextLabel").includes("Font"));
     assert.ok(_testing.flattenClassProps("TextLabel").includes("FontFace"));
   });
@@ -2476,8 +2270,6 @@ suite("auto-import gating — shouldInsertAutoImport (1.5.1)", () => {
   const empty = new Set<string>();
 
   test("does NOT auto-import when the setting is disabled (the bug)", () => {
-    // The reported bug: disabling `luix.autoImport.enabled` left the
-    // completion-time require insertion firing anyway.
     assert.strictEqual(
       shouldInsertAutoImport(false, "GameCard", empty, empty),
       false
@@ -2518,7 +2310,6 @@ suite("rbxasset folder navigation — computeRbxAssetChildren (1.5.1)", () => {
 
   test("top level lists distinct first-segment folders + files", () => {
     const children = computeRbxAssetChildren(FILES, "");
-    // Folders first (alpha), then files.
     assert.deepStrictEqual(children, [
       { name: "fonts", isFolder: true },
       { name: "sounds", isFolder: true },
@@ -2540,7 +2331,6 @@ suite("rbxasset folder navigation — computeRbxAssetChildren (1.5.1)", () => {
       { name: "premium.png", isFolder: false },
       { name: "robux_color.png", isFolder: false },
     ]);
-    // None of the entries leak the parent path.
     assert.ok(children.every((c) => !c.name.includes("/")));
   });
 
@@ -2554,10 +2344,6 @@ suite("rbxasset folder navigation — computeRbxAssetChildren (1.5.1)", () => {
     assert.deepStrictEqual(computeRbxAssetChildren(FILES, "nope/"), []);
   });
 });
-
-// ============================================================================
-// 1.5.1 — UICorner: CornerRadius vs individual radii (diagnostic + refactors)
-// ============================================================================
 
 import { cornerRadiusConflicts } from "../data";
 import { planUICornerRefactor } from "../uiCorner";
@@ -2656,8 +2442,7 @@ suite("UICorner refactor planning — planUICornerRefactor (1.5.1)", () => {
   });
 
   test("conflict (both forms present) → no refactor offered", () => {
-    // The diagnostic handles the conflict; neither collapse nor expand
-    // makes sense, so the lightbulb stays quiet.
+    // Resolve conflicting radii before offering conversions.
     const plan = planUICornerRefactor([
       r("CornerRadius", "UDim.new(0, 4)"),
       ...FOUR_EQUAL,
@@ -2666,8 +2451,7 @@ suite("UICorner refactor planning — planUICornerRefactor (1.5.1)", () => {
   });
 
   test("no collapse when an extra non-corner prop is present", () => {
-    // entries.length must be exactly 4 so the collapse span is
-    // unambiguous (UICorner carries no other props in practice).
+    // The collapse range requires exactly the four corner properties.
     const plan = planUICornerRefactor([...FOUR_EQUAL, r("Name", '"x"')]);
     assert.strictEqual(plan, undefined);
   });
@@ -2679,10 +2463,6 @@ suite("UICorner refactor planning — planUICornerRefactor (1.5.1)", () => {
     );
   });
 });
-
-// ============================================================================
-// 1.5.1 — UIShadow class support
-// ============================================================================
 
 suite("UIShadow class support (1.5.1)", () => {
   const { getPropType, DIRECT_INSTANTIABLE_CLASS_NAMES, defaultPropsMap } =
@@ -2701,26 +2481,22 @@ suite("UIShadow class support (1.5.1)", () => {
     ]) {
       assert.ok(props.includes(p), `UIShadow missing prop ${p}`);
     }
-    // Inherited from Instance.
     assert.ok(props.includes("Name"));
     assert.ok(props.includes("Archivable"));
   });
 
   test("UIShadow prop types resolve correctly (incl. the Offset override)", () => {
-    // Offset is globally Vector2 — on UIShadow it must be UDim2.
+    // UIShadow.Offset overrides the global Vector2 type with UDim2.
     assert.strictEqual(getPropType("UIShadow", "Offset"), "UDim2");
     assert.strictEqual(getPropType("UIShadow", "Spread"), "UDim2");
     assert.strictEqual(getPropType("UIShadow", "BlurRadius"), "UDim");
     assert.strictEqual(getPropType("UIShadow", "Color"), "Color3");
     assert.strictEqual(getPropType("UIShadow", "Transparency"), "number");
-    // These resolve from the global PROP_TYPES (no override needed).
     assert.strictEqual(getPropType("UIShadow", "ZIndex"), "number");
     assert.strictEqual(getPropType("UIShadow", "Enabled"), "boolean");
   });
 
   test("a plain Vector2 Offset elsewhere is unaffected by the override", () => {
-    // UIGradient.Offset is Vector2 — make sure the UIShadow override
-    // didn't leak across classes.
     assert.strictEqual(getPropType("UIGradient", "Offset"), "Vector2");
   });
 
@@ -2734,10 +2510,6 @@ suite("UIShadow class support (1.5.1)", () => {
     assert.ok(set.has("UIShadow"));
   });
 });
-
-// ============================================================================
-// 1.5.1 — Font deprecation broadened to all value forms
-// ============================================================================
 
 import { extractDeprecatedFontEnum } from "../codeActions";
 
@@ -2754,8 +2526,6 @@ suite("Font deprecation auto-fix gating — extractDeprecatedFontEnum (1.5.1)", 
   });
 
   test("returns undefined for the string form (no value-destroying fix)", () => {
-    // `Font = "Gotham"` still WARNS (deprecated), but offers no
-    // auto-convert — we won't silently swap the value for a default.
     assert.strictEqual(extractDeprecatedFontEnum('Font = "Gotham"'), undefined);
   });
 
@@ -2767,8 +2537,6 @@ suite("Font deprecation auto-fix gating — extractDeprecatedFontEnum (1.5.1)", 
   });
 
   test("Font is still a deprecated-valid prop on text classes (warns, not 'unknown')", () => {
-    // The broadened warning relies on this: any `Font` on a text class
-    // is flagged deprecated, never 'unknown property'.
     const { isDeprecatedValidProp } = require("../data");
     assert.strictEqual(isDeprecatedValidProp("TextLabel", "Font"), true);
     assert.strictEqual(isDeprecatedValidProp("Frame", "Font"), false);
@@ -2789,17 +2557,12 @@ suite("UIShadow element snippets (1.5.1)", () => {
       assert.ok(snip, `missing ${prefix}`);
       assert.strictEqual(snip!.kind, "element");
       assert.strictEqual(snip!.framework, fw);
-      // Body should construct a UIShadow with the offset/blur props.
       const body = snip!.body.join("\n");
       assert.ok(body.includes("UIShadow"));
       assert.ok(body.includes("BlurRadius"));
     }
   });
 });
-
-// ============================================================================
-// 1.5.1 — UICorner hover preview with individual radii
-// ============================================================================
 
 import { cornerRadiiFromProps, roundedRectPath } from "../hoverPreviews";
 
@@ -2860,7 +2623,7 @@ suite("UICorner preview corner resolution — cornerRadiiFromProps (1.5.1)", () 
 
 suite("UICorner preview path — roundedRectPath (1.5.1)", () => {
   test("emits an arc for each non-zero corner, none for zero", () => {
-    // Only TL + BR rounded → exactly two arc commands.
+    // Two rounded corners produce two arcs.
     const path = roundedRectPath(0, 0, 100, 60, 8, 0, 8, 0);
     const arcs = (path.match(/A /g) ?? []).length;
     assert.strictEqual(arcs, 2);
@@ -2877,10 +2640,6 @@ suite("UICorner preview path — roundedRectPath (1.5.1)", () => {
     assert.strictEqual((path.match(/A /g) ?? []).length, 4);
   });
 });
-
-// ============================================================================
-// 1.5.3 — event data coverage, most-specific-first ordering, Parent key
-// ============================================================================
 
 import { sortPropsBody, DEFAULT_CATEGORY_ORDER, SortTarget } from "../sortProps";
 import { FRAMEWORKS } from "../frameworks";
@@ -2960,9 +2719,7 @@ suite("Event coverage — Instance / VideoFrame / UIPageLayout (1.5.3)", () => {
 });
 
 suite("sortProps — event keys come from the class hierarchy (1.5.3)", () => {
-  // `[Children]` sorts into the Children category, which follows Events
-  // in the default order. Any plain key recognised as an event must
-  // therefore land BEFORE it; an unrecognised key ("Other") lands after.
+  // Default category order: Events, Children, Other.
   const host = (className: string) => ({ className, isStringLiteralName: true });
   function sorted(target: SortTarget | undefined, ...keys: string[]): string[] {
     const body = "\n" + keys.map((k) => `  ${k},`).join("\n") + "\n";
@@ -3001,7 +2758,6 @@ suite("sortProps — event keys come from the class hierarchy (1.5.3)", () => {
       const out = sorted(host(cls), "[Children] = {}", `${key} = fn`);
       assert.deepStrictEqual(out, [`${key} = fn`, "[Children] = {}"], `${cls}.${key}`);
     }
-    // …and an event another class has is NOT an event here.
     const out = sorted(host("Frame"), "[Children] = {}", "Ended = fn");
     assert.deepStrictEqual(out, ["[Children] = {}", "Ended = fn"]);
   });
@@ -3011,8 +2767,6 @@ suite("sortProps — event keys come from the class hierarchy (1.5.3)", () => {
       const out = sorted(undefined, "[Children] = {}", `${key} = fn`);
       assert.deepStrictEqual(out, [`${key} = fn`, "[Children] = {}"], key);
     }
-    // `Ended` / `Loaded` / `Changed` are ordinary prop names on a
-    // component, so they must stay in Other (after Children).
     for (const key of ["Ended", "Loaded", "Changed", "Destroying"]) {
       const out = sorted(undefined, `${key} = 1`, "[Children] = {}");
       assert.deepStrictEqual(out, ["[Children] = {}", `${key} = 1`], key);
@@ -3027,7 +2781,6 @@ suite("sortProps — event keys come from the class hierarchy (1.5.3)", () => {
   test("a non-event key falls through to Other (real reorder, not a no-op)", () => {
     const out = sorted(host("Frame"), "Whatever = 1", "[Children] = {}");
     assert.deepStrictEqual(out, ["[Children] = {}", "Whatever = 1"]);
-    // Already in order → sortPropsBody reports "nothing to do".
     assert.strictEqual(
       sortPropsBody("\n  [Children] = {},\n  Whatever = 1,\n", DEFAULT_CATEGORY_ORDER, host("Frame")),
       undefined
@@ -3090,9 +2843,7 @@ suite("sortProps — positional entries are kept, not dropped (1.5.3)", () => {
 
 suite("sortProps — SortTarget threading through nested calls (1.5.3)", () => {
   test("sortBodyRecursive sorts each nested call with that call's own event list", () => {
-    // `Ended` is an event on VideoFrame but an ordinary key on Frame, so
-    // the inner table must move it before `[Children]` while the outer
-    // table leaves it after.
+    // Ended is an event on VideoFrame but an ordinary property on Frame.
     const text = [
       'local f = create "Frame" {',
       "  [Children] = {},",
@@ -3119,12 +2870,9 @@ suite("sortProps — SortTarget threading through nested calls (1.5.3)", () => {
     );
     assert.ok(sorted, "expected a change");
     const lines = sorted!.split("\n").map((l) => l.trim()).filter(Boolean);
-    // Inner: Ended (event on VideoFrame) before [Children].
     const innerEnded = lines.indexOf("Ended = fn,", lines.indexOf('create "VideoFrame" {'));
     const innerChildren = lines.indexOf("[Children] = {},", lines.indexOf('create "VideoFrame" {'));
     assert.ok(innerEnded !== -1 && innerChildren !== -1 && innerEnded < innerChildren, sorted);
-    // Outer: Ended is Other on a Frame → stays after [Children]; the
-    // positional child call moves to the Children slot before it.
     const outerChildren = lines.indexOf("[Children] = {},");
     const outerEnded = lines.indexOf("Ended = fn,");
     assert.ok(outerChildren < outerEnded, sorted);

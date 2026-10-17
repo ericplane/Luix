@@ -1,27 +1,12 @@
-// Pure parsing helpers — no `vscode` imports, all input/output is plain
-// strings/objects. Everything here is unit-testable in isolation.
-
-// ============================================================================
-// Public types
-// ============================================================================
+// Pure parsing helpers; no VS Code dependency.
 
 export interface EnclosingCall {
   className: string;
   isStringLiteralName: boolean;
-  /** Which factory alias matched (`e`, `New`, `create`, …). Lets callers
-   *  look up the framework. For direct component calls
-   *  (`MyComp({...})` / `MyComp {...}`) this is the component name
-   *  itself — no factory alias was used. */
+  /** Matched factory alias, or the component name for a direct call. */
   alias?: string;
-  /** Whether the matched call was the parens or curried form. */
   callShape?: "parens" | "curried";
-  /**
-   * True when the match came from the Vide/Fusion-style direct
-   * component call shape (`MyComp({...})` / `MyComp {...}`) rather than
-   * a known factory alias. Callers that want to skip
-   * built-in-instance-only logic (e.g. merging Roblox event names into
-   * suggestions) can branch on this.
-   */
+  /** Direct component call rather than a configured factory call. */
   isDirectComponentCall?: boolean;
 }
 
@@ -36,20 +21,14 @@ export interface DocumentComponentInfo {
   paramTypeFields?: string[];
   annotations: ComponentAnnotations;
   detectedBase?: string;
-  /**
-   * Props the component's root return-element sets to a value that
-   * doesn't textually reference the component's `props` parameter. When
-   * a caller passes one of these keys to `<Component>`, the call-site
-   * value is silently ignored — the diagnostic surface flags it.
-   */
+  /** Root props whose values do not textually reference the component's props parameter. */
   hardcodedProps?: Set<string>;
-  /** Identifier of the first parameter — the props table (e.g. "props"). */
   paramName?: string;
   /** Offset of the first character inside the function body. */
   bodyStart?: number;
-  /** Offset just after the function's terminating `end`. */
+  /** Offset just after the function's terminating end. */
   bodyEnd?: number;
-  /** Offset range of the first param's type annotation (after the `:`). */
+  /** Start of the props parameter's type annotation, after the colon. */
   paramTypeStart?: number;
   paramTypeEnd?: number;
 }
@@ -58,38 +37,22 @@ export interface CreateElementCall {
   className: string;
   isStringLiteralName: boolean;
   isDirectComponentCall?: boolean;
-  /** A configured Vide constructor, after excluding component bindings. */
+  /** Configured Vide constructor after excluding component bindings. */
   isDirectInstanceCall?: boolean;
   nameProp?: string;
-  /**
-   * The factory alias that matched (`e`, `New`, `Vide.create`, …),
-   * without any receiver. Look the framework up with this rather than
-   * re-reading the text at `aliasStart` — that offset may point at a
-   * receiver (`scope:New`), which resolves to nothing.
-   */
+  /** Factory alias without its receiver; use this for framework lookup. */
   alias?: string;
-  /**
-   * The receiver in front of the alias, verbatim and including its
-   * separator — `"scope:"` for Fusion 0.3's `scope:New "Frame" { … }`,
-   * `""` when the alias stands alone. Code generation has to re-emit
-   * it or the rewritten call loses the scope it constructs into.
-   */
+  /** Verbatim receiver and separator, such as scope:; code generation must retain it. */
   receiver?: string;
-  /**
-   * Offset where the whole call begins — the receiver when there is
-   * one, the alias otherwise. `[aliasStart, fullEnd)` is always the
-   * call's complete text range.
-   */
+  /** The whole call spans [aliasStart, fullEnd), including any receiver. */
   aliasStart: number;
   fullEnd: number;
   classNameStart: number;
   classNameEnd: number;
   childrenStart?: number;
   childrenEnd?: number;
-  /** Offset of the opening `{` of the props table, if a literal one is
-   *  present (i.e. not when props is a variable like `Component(SomeProps)`). */
+  /** Opening props brace, absent when props are passed as a variable. */
   propsBraceStart?: number;
-  /** Offset of the matching closing `}` of the props table. */
   propsBraceEnd?: number;
 }
 
@@ -106,21 +69,10 @@ export interface ColorLiteral {
   end: number;
 }
 
-/**
- * Aliases partitioned by call shape. `parens` aliases are used in the
- * React/Roact form (`f("X", { … })`); `curried` aliases use Lua's sugar
- * (`f "X" { … }`) as in Fusion / Vide.
- */
 export interface AliasPartition {
   parens: string[];
   curried: string[];
-  /** Aliases of frameworks whose `childrenLayout === "inline"` and
-   *  that recognise the `parens` shape (today: Vide). When the
-   *  matched alias of a parens-form call is in this set, the props
-   *  table doubles as the inline-children container. Optional so
-   *  hand-rolled test fixtures and legacy callers stay compiling;
-   *  callers fall back to the legacy bucket-membership check when
-   *  absent. Populated by `getAliasPartition()` in `./frameworks.ts`. */
+  /** Parens aliases with inline children; absent values fall back to curried-bucket membership. */
   parensWithInlineChildren?: string[];
 }
 
@@ -131,54 +83,212 @@ function asPartition(aliases: AliasPartition | string[]): AliasPartition {
   return aliases;
 }
 
-// ============================================================================
-// String/comment masking
-// ============================================================================
+// Share lazy analysis per text; separate document and fragment caches prevent fragment churn from evicting documents.
 
-const LUA_BLOCK_OPENERS = new Set(["function", "if", "do", "repeat"]);
-const LUA_BLOCK_CLOSERS = new Set(["end", "until"]);
+const DOCUMENT_ANALYSES_MAX = 8;
+const FRAGMENT_ANALYSES_MAX = 16;
+/** Character budget per tier; always retain the newest analysis even if larger. */
+const ANALYSES_CHARS_MAX = 3_000_000;
+/** Maximum alias/direct-call result variants cached per text. */
+const RESULTS_PER_TEXT_MAX = 8;
 
-// Combined cache for the mask + masked text. Every provider that touches a
-// document needs at least one of these, so caching both per text saves a
-// surprising amount of work — `findAllCreateElementCalls` and
-// `findEnclosingPropsCall` and `scanDocument` and `extractColorLiterals`
-// would otherwise each rebuild the mask from scratch.
-interface MaskedDoc {
-  mask: boolean[];
-  masked: string;
+class TextAnalysis {
+  private maskBits?: boolean[];
+  private maskedText?: string;
+  private blockIndex?: BlockIndex;
+  private newlineOffsets?: number[];
+  private lineList?: string[];
+  private memos?: Map<string, { deps: readonly unknown[]; value: unknown }>;
+  readonly scans = new Map<string, Map<string, DocumentComponentInfo>>();
+  readonly calls = new Map<string, CreateElementCall[]>();
+  /** Factory-only calls in discovery order, keyed by alias set. */
+  readonly rawCalls = new Map<string, CreateElementCall[]>();
+
+  /** Adopt equal caller strings so repeated lookups can use pointer equality. */
+  constructor(public text: string) {}
+
+  get mask(): boolean[] {
+    return (this.maskBits ??= buildCodeMaskImpl(this.text));
+  }
+
+  ownsMask(mask: boolean[]): boolean {
+    return this.maskBits === mask;
+  }
+
+  get masked(): string {
+    return (this.maskedText ??= applyMaskImpl(this.text, this.mask));
+  }
+
+  get blocks(): BlockIndex {
+    return (this.blockIndex ??= buildBlockIndex(this.masked));
+  }
+
+  get lines(): string[] {
+    return (this.lineList ??= this.text.split("\n"));
+  }
+
+  lineOf(offset: number): number {
+    if (!this.newlineOffsets) {
+      const offsets: number[] = [];
+      for (let i = this.text.indexOf("\n"); i !== -1; i = this.text.indexOf("\n", i + 1)) {
+        offsets.push(i);
+      }
+      this.newlineOffsets = offsets;
+    }
+    return lowerBound(this.newlineOffsets, Math.min(offset, this.text.length));
+  }
+
+  memo<T>(slot: string, deps: readonly unknown[], compute: () => T): T {
+    const hit = this.memos?.get(slot);
+    if (hit && hit.deps.length === deps.length && hit.deps.every((d, i) => d === deps[i])) {
+      return hit.value as T;
+    }
+    const value = compute();
+    (this.memos ??= new Map()).set(slot, { deps, value });
+    return value;
+  }
 }
 
-const maskedDocCache: Array<{ text: string; entry: MaskedDoc }> = [];
-const MASKED_DOC_CACHE_MAX = 4;
+interface AnalysisCache {
+  documents: TextAnalysis[];
+  fragments: TextAnalysis[];
+}
 
-function getMaskedDoc(text: string): MaskedDoc {
-  for (let i = maskedDocCache.length - 1; i >= 0; i--) {
-    if (maskedDocCache[i].text === text) {
-      // LRU bump: move to end so most-recent stays warm.
-      const hit = maskedDocCache.splice(i, 1)[0];
-      maskedDocCache.push(hit);
-      return hit.entry;
+const sharedAnalyses: AnalysisCache = { documents: [], fragments: [] };
+/** Temporary analyses keep background work from evicting open documents. */
+let transientAnalyses: AnalysisCache | undefined;
+
+function analyses(entry: TextAnalysis, text: string): boolean {
+  // Reject different lengths before comparing large texts.
+  if (entry.text.length !== text.length || entry.text !== text) {
+    return false;
+  }
+  entry.text = text;
+  return true;
+}
+
+function takeFrom(list: TextAnalysis[], text: string): TextAnalysis | undefined {
+  for (let i = list.length - 1; i >= 0; i--) {
+    const entry = list[i];
+    if (analyses(entry, text)) {
+      if (i !== list.length - 1) {
+        list.splice(i, 1);
+        list.push(entry);
+      }
+      return entry;
     }
   }
-  const mask = buildCodeMaskImpl(text);
-  const masked = applyMaskImpl(text, mask);
-  maskedDocCache.push({ text, entry: { mask, masked } });
-  if (maskedDocCache.length > MASKED_DOC_CACHE_MAX) {
-    maskedDocCache.shift();
-  }
-  return { mask, masked };
+  return undefined;
 }
 
-/**
- * Build a per-character bitmap where `true` means the character is *code*
- * (not inside a Lua string or comment). Quotes/comment delimiters are kept
- * as code so that downstream regexes can still see them.
- *
- * Cached: repeated calls with the same `text` return the same array
- * reference. Callers must treat the returned array as immutable.
- */
+function remember(list: TextAnalysis[], entry: TextAnalysis, max: number): void {
+  list.push(entry);
+  let chars = 0;
+  for (const kept of list) {
+    chars += kept.text.length;
+  }
+  while (list.length > 1 && (list.length > max || chars > ANALYSES_CHARS_MAX)) {
+    chars -= list.shift()!.text.length;
+  }
+}
+
+function lookupAnalysis(cache: AnalysisCache, text: string, asDocument: boolean): TextAnalysis | undefined {
+  const document = takeFrom(cache.documents, text);
+  if (document) {
+    return document;
+  }
+  const fragment = takeFrom(cache.fragments, text);
+  if (fragment && asDocument) {
+    cache.fragments.splice(cache.fragments.indexOf(fragment), 1);
+    remember(cache.documents, fragment, DOCUMENT_ANALYSES_MAX);
+  }
+  return fragment;
+}
+
+function analysisFor(text: string, asDocument = false): TextAnalysis {
+  const shared = lookupAnalysis(sharedAnalyses, text, asDocument);
+  if (shared) {
+    return shared;
+  }
+  const cache = transientAnalyses ?? sharedAnalyses;
+  if (transientAnalyses) {
+    const transient = lookupAnalysis(transientAnalyses, text, asDocument);
+    if (transient) {
+      return transient;
+    }
+  }
+  const entry = new TextAnalysis(text);
+  if (asDocument) {
+    remember(cache.documents, entry, DOCUMENT_ANALYSES_MAX);
+  } else {
+    remember(cache.fragments, entry, FRAGMENT_ANALYSES_MAX);
+  }
+  return entry;
+}
+
+function peekAnalysis(text: string): TextAnalysis | undefined {
+  for (const cache of transientAnalyses ? [sharedAnalyses, transientAnalyses] : [sharedAnalyses]) {
+    for (const list of [cache.documents, cache.fragments]) {
+      // Search newest first to avoid comparing older, equal-length document versions.
+      for (let i = list.length - 1; i >= 0; i--) {
+        const entry = list[i];
+        if (analyses(entry, text)) {
+          return entry;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+/** Reuse cached analyses, but discard new ones when synchronous background work returns. */
+export function withTransientAnalyses<T>(work: () => T): T {
+  const outer = transientAnalyses;
+  transientAnalyses = outer ?? { documents: [], fragments: [] };
+  try {
+    return work();
+  } finally {
+    transientAnalyses = outer;
+  }
+}
+
+/** Memoize by text and dependency identity; values expire with the text's analysis. */
+export function memoForText<T>(
+  text: string,
+  slot: string,
+  deps: readonly unknown[],
+  compute: () => T
+): T {
+  return analysisFor(text, true).memo(slot, deps, compute);
+}
+
+function trimResults<V>(results: Map<string, V>): void {
+  if (results.size > RESULTS_PER_TEXT_MAX) {
+    const oldest = results.keys().next().value;
+    if (oldest !== undefined) {
+      results.delete(oldest);
+    }
+  }
+}
+
+/** First index whose value is at least x in an ascending array. */
+function lowerBound(arr: ArrayLike<number>, x: number): number {
+  let lo = 0;
+  let hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (arr[mid] < x) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+/** Immutable cached code mask; string/comment contents are false, while delimiters remain visible. */
 export function buildCodeMask(text: string): boolean[] {
-  return getMaskedDoc(text).mask;
+  return analysisFor(text).mask;
 }
 
 function buildCodeMaskImpl(text: string): boolean[] {
@@ -188,7 +298,6 @@ function buildCodeMaskImpl(text: string): boolean[] {
   while (i < text.length) {
     const c = text[i];
 
-    // Comments: `--`, `--[[ ... ]]`, `--[=*[ ... ]=*]`
     if (c === "-" && text[i + 1] === "-") {
       const blockMatch = /^\[(=*)\[/.exec(text.slice(i + 2));
       if (blockMatch) {
@@ -210,8 +319,7 @@ function buildCodeMaskImpl(text: string): boolean[] {
       continue;
     }
 
-    // Quoted strings: keep the quotes as code so a later regex can spot
-    // them; mask the interior only.
+    // Keep quotes visible to downstream patterns.
     if (c === '"' || c === "'") {
       const quote = c;
       i++;
@@ -229,7 +337,7 @@ function buildCodeMaskImpl(text: string): boolean[] {
           break;
         }
         if (text[i] === "\n") {
-          // Unterminated string: stop masking at end-of-line.
+          // Recover from unterminated strings at the next line.
           break;
         }
         mask[i] = false;
@@ -238,8 +346,7 @@ function buildCodeMaskImpl(text: string): boolean[] {
       continue;
     }
 
-    // Long-bracket strings: `[[ ... ]]` / `[=*[ ... ]=*]`. Keep delimiters as
-    // code; mask only the interior.
+    // Long-bracket strings keep their delimiters visible.
     if (c === "[") {
       const longMatch = /^\[(=*)\[/.exec(text.slice(i));
       if (longMatch) {
@@ -262,34 +369,54 @@ function buildCodeMaskImpl(text: string): boolean[] {
   return mask;
 }
 
-/**
- * Apply a code mask to a text, replacing non-code characters with spaces
- * (newlines preserved). When the mask was produced by `buildCodeMask(text)`
- * with the same `text`, the result is cached — callers should pass the
- * pair together to take advantage of that.
- */
+/** Blank masked characters, preserving newlines; matching text/mask pairs reuse cached output. */
 export function applyMask(text: string, mask: boolean[]): string {
-  // Fast path: if the mask is the one our cache built for this text, the
-  // masked version is already cached too.
-  for (let i = maskedDocCache.length - 1; i >= 0; i--) {
-    if (
-      maskedDocCache[i].text === text &&
-      maskedDocCache[i].entry.mask === mask
-    ) {
-      return maskedDocCache[i].entry.masked;
-    }
+  const cached = peekAnalysis(text);
+  if (cached && cached.ownsMask(mask)) {
+    return cached.masked;
   }
   return applyMaskImpl(text, mask);
 }
 
+function maskUncached(text: string): string {
+  return applyMaskImpl(text, buildCodeMaskImpl(text));
+}
+
 function applyMaskImpl(text: string, mask: boolean[]): string {
+  // Copy whole runs to avoid per-character string allocation.
   const out: string[] = [];
-  for (let i = 0; i < text.length; i++) {
+  const n = text.length;
+  let runStart = 0;
+  let i = 0;
+  while (i < n) {
     if (mask[i]) {
-      out.push(text[i]);
-    } else {
-      out.push(text[i] === "\n" ? "\n" : " ");
+      i++;
+      continue;
     }
+    if (i > runStart) {
+      out.push(text.slice(runStart, i));
+    }
+    let j = i + 1;
+    while (j < n && !mask[j]) {
+      j++;
+    }
+    let blankFrom = i;
+    for (let k = i; k < j; k++) {
+      if (text.charCodeAt(k) === 10) {
+        if (k > blankFrom) {
+          out.push(" ".repeat(k - blankFrom));
+        }
+        out.push("\n");
+        blankFrom = k + 1;
+      }
+    }
+    if (j > blankFrom) {
+      out.push(" ".repeat(j - blankFrom));
+    }
+    runStart = i = j;
+  }
+  if (runStart < n) {
+    out.push(runStart === 0 ? text : text.slice(runStart));
   }
   return out.join("");
 }
@@ -305,10 +432,6 @@ export function lineNumberOf(text: string, offset: number): number {
   return line;
 }
 
-// ============================================================================
-// Shared regex helpers
-// ============================================================================
-
 const aliasAlternationCache = new Map<string, string>();
 
 export function buildAliasAlternation(aliases: string[]): string {
@@ -317,8 +440,7 @@ export function buildAliasAlternation(aliases: string[]): string {
   if (hit !== undefined) {
     return hit;
   }
-  // Longest first so multi-segment names like `React.createElement` win over
-  // bare `createElement` during alternation.
+  // Longest aliases must match before their shorter suffixes.
   const sorted = [...aliases].sort((a, b) => b.length - a.length);
   const result = sorted.map(escapeRegex).join("|");
   aliasAlternationCache.set(key, result);
@@ -329,57 +451,16 @@ function escapeRegex(s: string): string {
   return s.replace(/[.+*?^$()[\]{}|\\]/g, "\\$&");
 }
 
-// ---- Curried-form syntax variants -----------------------------------------
-//
-// Fusion and Vide are "curried": a class-name stage followed by a props
-// table. Real-world code writes that in four interchangeable ways, and
-// Luix has to recognise all of them:
-//
-//   New "Frame" { … }              Fusion 0.2 / Vide, Lua call sugar
-//   scope:New "Frame" { … }        Fusion 0.3 `scoped()` receiver sugar
-//   New(scope, "Frame") { … }      Fusion 0.3 explicit-scope constructor
-//   New("Frame")({ … })            StyLua `call_parentheses = "Always"`,
-//                                  which the Roblox Lua Style Guide
-//                                  mandates — it rewrites *every* sugar
-//                                  call into an explicit parens call.
-//
-// StyLua composes with the others, so `scope:New("Frame")({ … })` and
-// `New(scope, "Frame")({ … })` are both live shapes too. The two
-// degrees of freedom are therefore independent:
-//
-//   name stage  → `"Frame"`      or `( [args ,] "Frame" )`
-//   props stage → `{ … }`        or `( { … } )`
-//
-// A receiver in front of the alias is a third, orthogonal degree of
-// freedom, handled by `RECEIVER_PREFIX` below — which also picks up a
-// `require` bound to a local name other than `Fusion`
-// (`MyFusion.New "Frame" { … }`).
-
-/**
- * Optional `scope:` / `Fusion.` receiver in front of a curried alias.
- * Non-capturing and lazy where it matters, so a configured dotted alias
- * (`Fusion.New`) still matches whole rather than being split.
- */
+/** Lazy receiver matching lets configured dotted aliases match whole. */
 const RECEIVER_PREFIX = `(?:[A-Za-z_][A-Za-z0-9_]*\\s*[.:]\\s*)??`;
 
-/** Class-name token: `"Frame"`, `'Frame'`, or a dotted identifier. */
 const CLASS_NAME_ALT =
   `(?:"([A-Za-z_][A-Za-z0-9_]*)"|'([A-Za-z_][A-Za-z0-9_]*)'|` +
   `([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*))`;
 
-/**
- * Arguments preceding the class name inside a parenthesised name stage
- * — Fusion 0.3's `New(scope, "Frame")`. Deliberately excludes nested
- * parens and newlines: the leading argument is always a plain scope
- * variable, and staying single-line keeps the pattern linear.
- */
+/** Leading scope arguments exclude nested parentheses and newlines to keep matching linear. */
 const LEADING_ARGS = `(?:[^()\\n]*?,\\s*)?`;
 
-// Compiled-RegExp caches for the shapes findEnclosingPropsCall uses.
-// Keyed by the alias-alternation string — same key the alternation
-// cache uses, so a hit there means a hit here too once the patterns
-// are warmed. Eliminates `new RegExp(...)` allocation on every
-// keystroke per provider.
 const parensPatternCache = new Map<string, RegExp>();
 const curriedPatternCache = new Map<string, RegExp>();
 const curriedNameParensPatternCache = new Map<string, RegExp>();
@@ -410,11 +491,7 @@ function curriedPatternFor(aliasPattern: string): RegExp {
   return re;
 }
 
-/**
- * Parenthesised name stage: `ALIAS("Frame")` / `ALIAS(scope, "Frame")`,
- * optionally followed by StyLua's props-stage `(`. Anchored so the
- * match ends exactly where the props `{` begins.
- */
+/** Match a parenthesized name stage ending at the props brace, with an optional props-stage parenthesis. */
 function curriedNameParensPatternFor(aliasPattern: string): RegExp {
   const hit = curriedNameParensPatternCache.get(aliasPattern);
   if (hit) {return hit;}
@@ -426,11 +503,7 @@ function curriedNameParensPatternFor(aliasPattern: string): RegExp {
   return re;
 }
 
-/**
- * Sugar name stage but parenthesised props stage: `ALIAS "Frame" ({ … })`.
- * StyLua never emits this on its own, but hand-written and
- * partially-formatted code does.
- */
+/** Support mixed call sugar and parentheses, such as New "Frame" ({ ... }). */
 function curriedPropsParensPatternFor(aliasPattern: string): RegExp {
   const hit = curriedPropsParensPatternCache.get(aliasPattern);
   if (hit) {return hit;}
@@ -442,11 +515,6 @@ function curriedPropsParensPatternFor(aliasPattern: string): RegExp {
   return re;
 }
 
-/**
- * Cursor-inside-the-class-name variant: matches the text immediately
- * before the opening quote of a parenthesised name stage, i.e.
- * `ALIAS(` or `ALIAS(scope,`.
- */
 function factoryNameStageParensPatternFor(aliasPattern: string): RegExp {
   const hit = factoryNameStageParensCache.get(aliasPattern);
   if (hit) {return hit;}
@@ -458,49 +526,23 @@ function factoryNameStageParensPatternFor(aliasPattern: string): RegExp {
   return re;
 }
 
-// Module-level direct-call patterns — they don't depend on aliases.
 const DIRECT_PARENS_PATTERN =
   /(?:^|[^A-Za-z0-9_.:])([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*$/;
 const DIRECT_CURRIED_PATTERN =
   /(?:^|[^A-Za-z0-9_.:])([A-Za-z_][A-Za-z0-9_]*)\s*$/;
-// Fusion 0.3 passes the scope to a component before its props table:
-// `MyButton(scope, { … })`. Same `directComponents` gate as the other
-// direct shapes; the leading-arg class excludes parens and newlines so
-// this can't run away across a multi-line argument list.
+// Fusion scope arguments must stay on one line without nested parentheses.
 const DIRECT_PARENS_SCOPED_PATTERN =
   /(?:^|[^A-Za-z0-9_.:])([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*[^()\n{}]*?,\s*$/;
 
-/**
- * Maximum bytes the backward brace-walk in `findEnclosingPropsCall`
- * scans before giving up. Props tables in real React/Vide/Fusion code
- * fit comfortably under a few KB; 16 KB is generous and prevents the
- * worst case (cursor at the bottom of a 50K-line file with no
- * enclosing `{` → scanning the full document on every keystroke for
- * every provider that uses the function).
- */
+/** Bound per-keystroke backward scans when no enclosing table exists. */
 const MAX_BACKWARD_SCAN = 16 * 1024;
 
-// ============================================================================
-// findEnclosingPropsCall — used by the completion + hover providers
-// ============================================================================
-
-/**
- * Walk backward from the cursor to find the `{` of the immediately enclosing
- * block. If that block opens a createElement-style props table, return the
- * class/component name. Otherwise return undefined.
- */
+/** Return the nearest enclosing block only when it is a recognized factory props table. */
 export function findEnclosingPropsCall(
   text: string,
   cursorIndex: number,
   aliases: AliasPartition | string[],
-  /**
-   * Identifiers Luix's workspace index already recognises as components.
-   * When provided, the detector also accepts the Vide/Fusion-style direct
-   * component-call shapes — `<Identifier>({ ... })` and `<Identifier> { ... }`
-   * — *only* when the identifier appears in this set. Without the gate the
-   * curried form would match every `f { ... }` table-call in the language,
-   * so this set is the entire safety net.
-   */
+  /** Allow direct-call shapes only for these known names, not arbitrary Lua table-call functions. */
   directComponents?: ReadonlySet<string>
 ): EnclosingCall | undefined {
   const partition = asPartition(aliases);
@@ -509,9 +551,6 @@ export function findEnclosingPropsCall(
   let braceDepth = 0;
   let parenDepth = 0;
   let openBraceIdx = -1;
-  // Cap how far back we'll walk. With the cursor sitting outside any
-  // table (top of a 50K-line file, say), the unbounded walk used to
-  // scan the entire document on every keystroke per provider.
   const stopAt = Math.max(0, cursorIndex - MAX_BACKWARD_SCAN);
 
   for (let i = cursorIndex - 1; i >= stopAt; i--) {
@@ -523,8 +562,7 @@ export function findEnclosingPropsCall(
       braceDepth++;
     } else if (c === "{") {
       if (braceDepth === 0) {
-        // If we're inside an unmatched `(`, the cursor is in an expression,
-        // not directly in the props object — skip.
+        // An unmatched opening parenthesis means the cursor is inside a value expression.
         if (parenDepth < 0) {
           return undefined;
         }
@@ -546,7 +584,6 @@ export function findEnclosingPropsCall(
   const sliceStart = Math.max(0, openBraceIdx - 500);
   const before = text.slice(sliceStart, openBraceIdx);
 
-  // 1) Try parens form: FUNC(ARG, $
   if (partition.parens.length > 0) {
     const aliasPattern = buildAliasAlternation(partition.parens);
     const pattern = parensPatternFor(aliasPattern);
@@ -568,7 +605,6 @@ export function findEnclosingPropsCall(
     }
   }
 
-  // 2) Try curried form: FUNC "ARG" $    (no comma, no second paren)
   if (partition.curried.length > 0) {
     const aliasPattern = buildAliasAlternation(partition.curried);
     const pattern = curriedPatternFor(aliasPattern);
@@ -590,15 +626,7 @@ export function findEnclosingPropsCall(
     }
   }
 
-  // 2b) Curried form with explicit parentheses. Covers the shapes
-  //     StyLua's `call_parentheses = "Always"` produces (which the
-  //     Roblox Lua Style Guide mandates) and Fusion 0.3's
-  //     explicit-scope constructor:
-  //       New("Frame") {          New("Frame")({
-  //       New(scope, "Frame") {   New(scope, "Frame")({
-  //       scope:New("Frame")({    New "Frame" ({
-  //     Runs after the sugar form so the cheap pattern still wins on
-  //     the common case.
+  // Accept parentheses independently around the name and props stages, including Fusion scope arguments.
   if (partition.curried.length > 0) {
     const aliasPattern = buildAliasAlternation(partition.curried);
     for (const pattern of [
@@ -621,20 +649,8 @@ export function findEnclosingPropsCall(
     }
   }
 
-  // 3) Direct component-call shapes — Vide / Fusion idiom for custom
-  //    components. Only run when the caller handed us a set of names
-  //    Luix's workspace index already knows about; without that gate the
-  //    curried form would match every `someFunc { … }` table-call in the
-  //    language and pollute completions in pure-logic code.
-  //
-  //    Excludes `.` and `:` from the leading char-class so method calls
-  //    (`obj.Method({…})`, `obj:Method({…})`) and qualified accesses
-  //    (`Module.Sub({…})`) don't trip the regex — the user's component
-  //    table is almost always a bare local from a `require`.
+  // Direct calls require known component names; exclude methods and qualified accesses.
   if (directComponents && directComponents.size > 0) {
-    // 3a) Direct parens:  IDENT(  $   — and Fusion 0.3's scope-passing
-    //     convention `IDENT(scope,  $`, where the props table is the
-    //     second argument.
     const parensMatch =
       DIRECT_PARENS_PATTERN.exec(before) ??
       DIRECT_PARENS_SCOPED_PATTERN.exec(before);
@@ -648,7 +664,6 @@ export function findEnclosingPropsCall(
         isDirectComponentCall: true,
       };
     }
-    // 3b) Direct curried:  IDENT  $   (followed by `{`)
     const curriedMatch = DIRECT_CURRIED_PATTERN.exec(before);
     if (curriedMatch && directComponents.has(curriedMatch[1])) {
       const name = curriedMatch[1];
@@ -665,46 +680,25 @@ export function findEnclosingPropsCall(
   return undefined;
 }
 
-// ============================================================================
-// findEnclosingFactoryStringArg — cursor inside the class-name string literal
-// ============================================================================
-
 export interface EnclosingStringArg {
   alias: string;
   callShape: "parens" | "curried";
-  /**
-   * Curried form only: the class name sits inside a parenthesised name
-   * stage — `New("Fr|")` / `New(scope, "Fr|")` — rather than Lua's call
-   * sugar `New "Fr|"`. Callers completing the rest of the call have to
-   * close that paren before opening the props table, so the accepted
-   * snippet tail is `")({ … })"` instead of `" { … }"`.
-   */
+  /** The curried name stage is parenthesized and must close before the props stage opens. */
   nameStageParens?: boolean;
   quote: '"' | "'" | "`";
-  /** Offset of the opening quote in the document. */
+  /** Opening quote offset. */
   stringStart: number;
-  /** Offset of the closing quote, or -1 if not present on the same line. */
+  /** Closing quote offset, or -1 if absent on this line. */
   stringEnd: number;
-  /**
-   * For parens form: offset of the closing `)` immediately after the
-   * string (skipping whitespace), or -1 if there's content between (i.e. a
-   * `,` and a props table is already present).
-   */
+  /** Closing parenthesis safe to consume in the same-line edit, or -1. */
   closeParen: number;
-  /**
-   * Whether a props table (`{ … }`) already follows the string. If true,
-   * inserting the suggestion should NOT add another `{ … }`.
-   */
+  /** Existing props follow the name; do not insert another props block. */
   hasPropsAfter: boolean;
   /** Existing punctuation/comments must stay outside the single-line edit. */
   preserveSuffix?: boolean;
 }
 
-/**
- * If the cursor sits inside a quoted string that is the first argument of
- * an enabled factory call (`e("Fr|"`, `New "Fr|"`, etc.), return the call
- * context — used by the class-name completion provider.
- */
+/** Find a factory's quoted class-name argument containing the cursor. */
 export function findEnclosingFactoryStringArg(
   text: string,
   cursorIndex: number,
@@ -715,9 +709,6 @@ export function findEnclosingFactoryStringArg(
     return undefined;
   }
 
-  // Walk back from cursor to find the opening quote on the same line.
-  // Recognises Lua's three string delimiters: `"`, `'`, and Luau's
-  // backtick template strings.
   let stringStart = -1;
   let quote: '"' | "'" | "`" | undefined;
   for (let i = cursorIndex - 1; i >= 0; i--) {
@@ -743,9 +734,6 @@ export function findEnclosingFactoryStringArg(
     return undefined;
   }
 
-  // The string contents up to the cursor must be a valid (partial)
-  // identifier — i.e. only `[A-Za-z0-9_]`. Otherwise this isn't a class
-  // name (could be a path, message, etc.).
   for (let i = stringStart + 1; i < cursorIndex; i++) {
     const c = text[i];
     if (!/[A-Za-z0-9_]/.test(c)) {
@@ -753,7 +741,6 @@ export function findEnclosingFactoryStringArg(
     }
   }
 
-  // Find the closing quote, if any, on the same line.
   let stringEnd = -1;
   for (let i = cursorIndex; i < text.length; i++) {
     const c = text[i];
@@ -773,13 +760,10 @@ export function findEnclosingFactoryStringArg(
       }
     }
     if (!/[A-Za-z0-9_]/.test(c)) {
-      // Non-identifier char between cursor and end of line means the string
-      // already has unexpected content — bail.
       return undefined;
     }
   }
 
-  // Look back from the opening quote to identify the factory alias.
   const beforeSliceStart = Math.max(0, stringStart - 200);
   const before = text.slice(beforeSliceStart, stringStart);
 
@@ -810,8 +794,6 @@ export function findEnclosingFactoryStringArg(
     }
   }
   if (!alias && partition.curried.length > 0) {
-    // Parenthesised name stage — `New("Fr|")`, `New(scope, "Fr|")`,
-    // `scope:New("Fr|")`. Same curried semantics, different syntax.
     const aliasPattern = buildAliasAlternation(partition.curried);
     const pattern = factoryNameStageParensPatternFor(aliasPattern);
     const m = pattern.exec(before);
@@ -825,9 +807,7 @@ export function findEnclosingFactoryStringArg(
     return undefined;
   }
 
-  // Inspect existing arguments across line breaks without widening the
-  // completion's edit range. Only a same-line, trivia-free closing paren
-  // can be consumed while expanding the call.
+  // Inspect across lines, but consume closing punctuation only in a same-line, trivia-free edit.
   let closeParen = -1;
   let hasPropsAfter = false;
   let preserveSuffix = false;
@@ -851,7 +831,7 @@ export function findEnclosingFactoryStringArg(
     const i = skipTrivia(stringEnd + 1);
     if (callShape === "parens") {
       if (text[i] === ",") {
-        // Existing props may be a table, a variable or an unfinished arg.
+        // Existing props may be a table, a variable or an unfinished argument.
         hasPropsAfter = true;
       } else if (text[i] === ")") {
         const next = skipTrivia(i + 1);
@@ -866,8 +846,6 @@ export function findEnclosingFactoryStringArg(
         }
       }
     } else if (nameStageParens) {
-      // `New("Fr|")` — the name stage's own `)` comes first, then the
-      // props stage in either shape: `) { … }` or `)({ … })`.
       if (text[i] === ")") {
         const j = skipTrivia(i + 1);
         if (text[j] === "{" || text[j] === "(") {
@@ -879,7 +857,6 @@ export function findEnclosingFactoryStringArg(
         }
       }
     } else {
-      // curried
       if (text[i] === "{" || text[i] === "(") {
         hasPropsAfter = true;
       }
@@ -899,61 +876,42 @@ export function findEnclosingFactoryStringArg(
   };
 }
 
-// ============================================================================
-// Component scanning (function definitions + annotations + type aliases)
-// ============================================================================
-
 export interface PropEntry {
   key: string;
-  /** Offsets relative to the body text passed in. */
+  /** Offsets are relative to the supplied table body. */
   keyStart: number;
   keyEnd: number;
   valueStart: number;
   valueEnd: number;
 }
 
-/**
- * Extract top-level `Key = value` entries from the body of a Lua table
- * literal (the text INSIDE the outermost `{...}`, without those braces).
- *
- * Skips `[…] = …` computed keys, ignores entries nested inside `{}` or
- * `()`, tolerates trailing commas, and reports per-entry positions so
- * callers can map the diagnostic back to the source range.
- */
+/** Extract top-level Key = value entries from a brace-free table body, excluding computed keys. */
 export function extractPropEntries(bodyText: string): PropEntry[] {
-  const masked = applyMask(bodyText, buildCodeMask(bodyText));
-  return parsePropEntriesFromMasked(masked);
+  // Keep short-lived props fragments out of the shared analysis cache.
+  return parsePropEntriesFromMasked(maskUncached(bodyText));
 }
 
-/**
- * Faster overload for callers that already have the *full document
- * text* in hand — `applyMask(fullText, buildCodeMask(fullText))` hits
- * the document-level mask cache instead of rebuilding the mask for a
- * substring (which never sees a cache hit). A single diagnostic
- * recompute on a busy file calls this ~hundreds of times — each call
- * used to rebuild the mask from scratch.
- */
+/** Extract entries using the full document's cached mask. */
 export function extractPropEntriesFromDocument(
   fullText: string,
   bodyStart: number,
   bodyEnd: number
 ): PropEntry[] {
-  const masked = applyMask(fullText, buildCodeMask(fullText));
-  return parsePropEntriesFromMasked(masked.slice(bodyStart, bodyEnd));
+  return parsePropEntriesFromMasked(
+    analysisFor(fullText, true).masked.slice(bodyStart, bodyEnd)
+  );
 }
 
 function parsePropEntriesFromMasked(masked: string): PropEntry[] {
   const out: PropEntry[] = [];
   let i = 0;
   while (i < masked.length) {
-    // Skip whitespace + commas/semicolons + comments-stripped-to-space.
     while (i < masked.length && /[\s,;]/.test(masked[i])) {
       i++;
     }
     if (i >= masked.length) {
       break;
     }
-    // Skip `[expr] = value` entries (array-style children, computed keys).
     if (masked[i] === "[") {
       let depth = 1;
       i++;
@@ -962,7 +920,6 @@ function parsePropEntriesFromMasked(masked: string): PropEntry[] {
         else if (masked[i] === "]") {depth--;}
         i++;
       }
-      // Skip `= value` for this computed key.
       while (i < masked.length && /\s/.test(masked[i])) {i++;}
       if (masked[i] === "=") {
         i++;
@@ -971,11 +928,7 @@ function parsePropEntriesFromMasked(masked: string): PropEntry[] {
       continue;
     }
     if (!/[A-Za-z_]/.test(masked[i])) {
-      // Could be a positional value (Vide inline child, `e(...)`,
-      // `local …` block, etc.). Skip the value expression and move on.
-      // While typing, an unmatched closer can make the value scanner
-      // stop immediately. Always consume at least that character so
-      // malformed input cannot spin forever and freeze the extension host.
+      // Unmatched closers can stop value scanning immediately; always advance to avoid an infinite loop.
       i = Math.max(i + 1, skipValueExpression(masked, i));
       continue;
     }
@@ -989,8 +942,6 @@ function parsePropEntriesFromMasked(masked: string): PropEntry[] {
       i++;
     }
     if (masked[i] !== "=") {
-      // Not a `Key = …` entry — probably a positional value that happens
-      // to start with an identifier (a variable reference). Skip it.
       continue;
     }
     i++;
@@ -1034,14 +985,9 @@ function skipValueExpression(masked: string, start: number): number {
   return i;
 }
 
-/**
- * Extract top-level field names from the body of a Luau type literal.
- * Input is the text INSIDE the outermost `{...}` (without those braces).
- * Skips index signatures (`[K]: V`) and ignores fields nested inside `{}`,
- * `()`, or `<>`.
- */
+/** Extract top-level fields from a brace-free type literal, excluding index signatures and nested fields. */
 export function extractTypeFields(literalBody: string): string[] {
-  const masked = applyMask(literalBody, buildCodeMask(literalBody));
+  const masked = maskUncached(literalBody);
   const fields: string[] = [];
   let i = 0;
   let braceDepth = 0;
@@ -1135,15 +1081,18 @@ export function extractTypeFields(literalBody: string): string[] {
   return fields;
 }
 
-/**
- * Walk backward from `defLineIndex - 1` over consecutive `---` comment
- * lines and pull recognized directives.
- */
+/** Read recognized directives from consecutive triple-dash lines before the definition. */
 export function parseAnnotationsForComponent(
   text: string,
   defLineIndex: number
 ): ComponentAnnotations {
-  const lines = text.split("\n");
+  return parseAnnotationsFromLines(text.split("\n"), defLineIndex);
+}
+
+function parseAnnotationsFromLines(
+  lines: readonly string[],
+  defLineIndex: number
+): ComponentAnnotations {
   const result: ComponentAnnotations = { props: [] };
   const commentLines: string[] = [];
 
@@ -1173,22 +1122,121 @@ export function parseAnnotationsForComponent(
   return result;
 }
 
-function findMatchingEnd(masked: string, startIdx: number): number {
-  let depth = 1;
-  const tokenRe = /\b\w+\b/g;
-  tokenRe.lastIndex = startIdx;
+// Share one block-keyword pass across functions to avoid quadratic scans of unfinished bodies.
+
+const BLOCK_KEYWORD_RE = /\b(?:function|if|do|repeat|end|until|return)\b/g;
+
+interface BlockIndex {
+  /** Block-keyword offsets in ascending order. */
+  starts: number[];
+  ends: number[];
+  /** Depth after each keyword; may be negative in unbalanced text. */
+  depthAfter: number[];
+  /** Number of function entries on the block stack before each keyword. */
+  fnBefore: number[];
+  /** Closer keyword indexes grouped by their resulting depth. */
+  closersByDepth: Map<number, number[]>;
+  /** Return keyword indexes grouped by their fnBefore value. */
+  returnsByFn: Map<number, number[]>;
+}
+
+function buildBlockIndex(masked: string): BlockIndex {
+  const starts: number[] = [];
+  const ends: number[] = [];
+  const depthAfter: number[] = [];
+  const fnBefore: number[] = [];
+  const closersByDepth = new Map<number, number[]>();
+  const returnsByFn = new Map<number, number[]>();
+  // 1 marks function entries; 0 marks other blocks.
+  const stack: number[] = [];
+  let depth = 0;
+  let fns = 0;
+  const re = new RegExp(BLOCK_KEYWORD_RE.source, "g");
   let m: RegExpExecArray | null;
-  while ((m = tokenRe.exec(masked)) !== null) {
-    if (LUA_BLOCK_OPENERS.has(m[0])) {
+  while ((m = re.exec(masked)) !== null) {
+    const word = m[0];
+    const k = starts.length;
+    starts.push(m.index);
+    ends.push(m.index + word.length);
+    fnBefore.push(fns);
+    if (word === "function") {
       depth++;
-    } else if (LUA_BLOCK_CLOSERS.has(m[0])) {
+      stack.push(1);
+      fns++;
+    } else if (word === "end" || word === "until") {
       depth--;
-      if (depth === 0) {
-        return m.index + m[0].length;
+      if (stack.length > 0 && stack.pop() === 1) {
+        fns--;
       }
+      let closers = closersByDepth.get(depth);
+      if (!closers) {
+        closersByDepth.set(depth, (closers = []));
+      }
+      closers.push(k);
+    } else if (word === "return") {
+      let returns = returnsByFn.get(fns);
+      if (!returns) {
+        returnsByFn.set(fns, (returns = []));
+      }
+      returns.push(k);
+    } else {
+      depth++;
+      stack.push(0);
+    }
+    depthAfter.push(depth);
+  }
+  return { starts, ends, depthAfter, fnBefore, closersByDepth, returnsByFn };
+}
+
+/** Find the first closer one level below the body start, or return the text length if unclosed. */
+function matchingEnd(ix: BlockIndex, maskedLength: number, startIdx: number): number {
+  const k0 = lowerBound(ix.starts, startIdx);
+  const base = k0 > 0 ? ix.depthAfter[k0 - 1] : 0;
+  const closers = ix.closersByDepth.get(base - 1);
+  if (closers) {
+    const j = lowerBound(closers, k0);
+    if (j < closers.length) {
+      return ix.ends[closers[j]];
     }
   }
-  return masked.length;
+  return maskedLength;
+}
+
+/** Visit the body's own returns in source order, excluding nested functions; stop when visit returns true. */
+function forEachOwnReturn(
+  ix: BlockIndex,
+  bodyStart: number,
+  bodyEnd: number,
+  visit: (afterReturn: number) => boolean
+): void {
+  const k0 = lowerBound(ix.starts, bodyStart);
+  if (k0 >= ix.starts.length) {
+    return;
+  }
+  const returns = ix.returnsByFn.get(ix.fnBefore[k0]);
+  if (!returns) {
+    return;
+  }
+  for (let j = lowerBound(returns, k0); j < returns.length; j++) {
+    const k = returns[j];
+    if (ix.starts[k] >= bodyEnd || visit(ix.ends[k])) {
+      return;
+    }
+  }
+}
+
+/** Cache the block map for caller-supplied masked text outside the shared analysis cache. */
+let looseBlocks: { masked: string; index: BlockIndex } | undefined;
+
+function blocksForMasked(originalText: string, masked: string): BlockIndex {
+  const analysis = peekAnalysis(originalText);
+  if (analysis && analysis.masked === masked) {
+    return analysis.blocks;
+  }
+  if (looseBlocks?.masked !== masked) {
+    looseBlocks = { masked, index: buildBlockIndex(masked) };
+  }
+  return looseBlocks.index;
 }
 
 function findMatchingBrace(text: string, openIdx: number): number {
@@ -1206,26 +1254,15 @@ function findMatchingBrace(text: string, openIdx: number): number {
   return -1;
 }
 
-/**
- * Find the first `return ALIAS(CLASS, ...)` whose enclosing function is the
- * component (i.e. not inside a nested function literal). Conditional returns
- * inside `if`/`do`/`while`/`for`/`repeat` blocks still count.
- *
- * `maskedText` is used for token scanning (so braces inside strings/comments
- * don't trip us up), `originalText` is used for capturing the class name
- * (because masking blanks out string interiors).
- */
-export function detectReturnedClass(
-  originalText: string,
-  maskedText: string,
-  bodyStart: number,
-  bodyEnd: number,
-  aliases: AliasPartition | string[]
-): string | undefined {
-  const partition = asPartition(aliases);
-  // Combined regex: try parens form OR curried form, both rooted right
-  // after the `return` keyword. The two alternations are wrapped in a
-  // non-capturing group, with the class-name capture groups inside each.
+// Return-pattern captures: parens 1-3, curried sugar 4-6, curried parens 7-9.
+const returnPatternCache = new Map<string, RegExp | null>();
+
+function returnAliasPatternFor(partition: AliasPartition): RegExp | null {
+  const key = partition.parens.join("|") + "\0" + partition.curried.join("|");
+  const hit = returnPatternCache.get(key);
+  if (hit !== undefined) {
+    return hit;
+  }
   const parts: string[] = [];
   if (partition.parens.length > 0) {
     const a = buildAliasAlternation(partition.parens);
@@ -1233,87 +1270,115 @@ export function detectReturnedClass(
   }
   if (partition.curried.length > 0) {
     const a = buildAliasAlternation(partition.curried);
-    // Sugar name stage: `return New "Frame" { … }`.
     parts.push(`${RECEIVER_PREFIX}(?:${a})\\s+${CLASS_NAME_ALT}`);
-    // Parenthesised name stage: `return New("Frame") { … }`,
-    // `return New(scope, "Frame")({ … })`, `return scope:New("Frame")({ … })`.
     parts.push(
       `${RECEIVER_PREFIX}(?:${a})\\s*\\(\\s*${LEADING_ARGS}${CLASS_NAME_ALT}\\s*\\)`
     );
   }
-  if (parts.length === 0) {
-    return undefined;
-  }
-  const returnAliasPattern = new RegExp(
-    `^\\s*\\(?\\s*(?:${parts.join("|")})`
-  );
-
-  const stack: string[] = [];
-  const tokenRe = /\b\w+\b/g;
-  tokenRe.lastIndex = bodyStart;
-  let m: RegExpExecArray | null;
-  while ((m = tokenRe.exec(maskedText)) !== null) {
-    if (m.index >= bodyEnd) {
-      break;
-    }
-    const word = m[0];
-    if (word === "function") {
-      stack.push("fn");
-    } else if (word === "if" || word === "do" || word === "repeat") {
-      stack.push(word);
-    } else if (word === "end" || word === "until") {
-      stack.pop();
-    } else if (word === "return") {
-      const functionDepth = stack.reduce(
-        (n, t) => n + (t === "fn" ? 1 : 0),
-        0
-      );
-      if (functionDepth === 0) {
-        const after = originalText.slice(m.index + word.length, bodyEnd);
-        const r = returnAliasPattern.exec(after);
-        if (r) {
-          // Each alternation branch contributes its own class-name
-          // capture triple (parens 1-3, curried sugar 4-6, curried
-          // parens 7-9). Take whichever branch matched.
-          const name = r.slice(1).find(Boolean);
-          if (name) {
-            return name;
-          }
-        }
-      }
-    }
-  }
-  return undefined;
+  const re = parts.length === 0
+    ? null
+    : new RegExp(`^\\s*\\(?\\s*(?:${parts.join("|")})`);
+  returnPatternCache.set(key, re);
+  return re;
 }
 
-/**
- * Walk the function body to find the root element returned by the
- * component, then collect prop keys whose RHS expression doesn't
- * textually reference the component's `props` parameter. Those are the
- * props a caller can't actually override.
- *
- * Heuristic — purely textual:
- *   - `Position = UDim2.new(0,0,0,0)`     → hardcoded
- *   - `Position = props.Position`         → forwarded (skipped)
- *   - `Position = if X then props.Position else ...`  → has `props`, skipped
- *   - `Position = pos` where `pos = props.Position` → indirect, *missed*
- *     (false negative — diagnostic stays quiet, which is the safe call).
- */
-function computeHardcodedProps(
+/** Find a factory return outside nested functions; use originalText for class names hidden by masking. */
+export function detectReturnedClass(
   originalText: string,
   maskedText: string,
   bodyStart: number,
   bodyEnd: number,
-  paramName: string | undefined,
-  partition: AliasPartition
-): Set<string> | undefined {
-  const rootCall = findReturnedRootCall(
+  aliases: AliasPartition | string[]
+): string | undefined {
+  const pattern = returnAliasPatternFor(asPartition(aliases));
+  if (!pattern) {
+    return undefined;
+  }
+  return detectReturnedClassIn(
+    blocksForMasked(originalText, maskedText),
     originalText,
-    maskedText,
     bodyStart,
     bodyEnd,
-    partition
+    pattern
   );
+}
+
+function detectReturnedClassIn(
+  ix: BlockIndex,
+  originalText: string,
+  bodyStart: number,
+  bodyEnd: number,
+  pattern: RegExp
+): string | undefined {
+  let found: string | undefined;
+  forEachOwnReturn(ix, bodyStart, bodyEnd, (afterReturn) => {
+    const r = pattern.exec(originalText.slice(afterReturn, bodyEnd));
+    found = r?.slice(1).find(Boolean);
+    return found !== undefined;
+  });
+  return found;
+}
+
+/** Sort by source position while retaining discovery order for tie-breaking. */
+interface SortedCalls {
+  calls: CreateElementCall[];
+  order: number[];
+  starts: number[];
+}
+
+function sortCalls(calls: CreateElementCall[]): SortedCalls {
+  const order = calls.map((_call, i) => i);
+  order.sort((a, b) => calls[a].aliasStart - calls[b].aliasStart || a - b);
+  return { calls, order, starts: order.map((i) => calls[i].aliasStart) };
+}
+
+/** Allow whitespace, one opening parenthesis and an optional receiver after return. */
+const ROOT_GAP = /^\s*\(?\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*[.:]\s*)?$/;
+/** Greedy prefix bounds the longest gap ROOT_GAP can accept. */
+const ROOT_GAP_PREFIX = /\s*\(?\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*[.:]\s*)?/y;
+
+/** Find the first own return followed by a factory call, preserving discovery-order priority. */
+function findReturnedRootCallIn(
+  ix: BlockIndex,
+  rootCalls: () => SortedCalls,
+  originalText: string,
+  bodyStart: number,
+  bodyEnd: number
+): CreateElementCall | undefined {
+  let found: CreateElementCall | undefined;
+  forEachOwnReturn(ix, bodyStart, bodyEnd, (after) => {
+    const sorted = rootCalls();
+    ROOT_GAP_PREFIX.lastIndex = after;
+    const longest = ROOT_GAP_PREFIX.exec(originalText);
+    const limit = after + (longest ? longest[0].length : 0);
+    let best = -1;
+    for (let j = lowerBound(sorted.starts, after); j < sorted.starts.length && sorted.starts[j] <= limit; j++) {
+      const index = sorted.order[j];
+      const call = sorted.calls[index];
+      if (
+        call.aliasStart < bodyEnd &&
+        (best === -1 || index < best) &&
+        ROOT_GAP.test(originalText.slice(after, call.aliasStart))
+      ) {
+        best = index;
+      }
+    }
+    if (best !== -1) {
+      found = sorted.calls[best];
+      return true;
+    }
+    return false;
+  });
+  return found;
+}
+
+/** Textual forwarding check; indirect aliases of props are not resolved. */
+function hardcodedPropsOf(
+  rootCall: CreateElementCall | undefined,
+  originalText: string,
+  paramName: string | undefined,
+  entriesByCall: Map<CreateElementCall, PropEntry[]>
+): Set<string> | undefined {
   if (
     !rootCall ||
     rootCall.propsBraceStart === undefined ||
@@ -1326,15 +1391,16 @@ function computeHardcodedProps(
     rootCall.propsBraceStart + 1,
     rootCall.propsBraceEnd
   );
-  const entries = extractPropEntries(propsBody);
+  let entries = entriesByCall.get(rootCall);
+  if (!entries) {
+    entries = extractPropEntries(propsBody);
+    entriesByCall.set(rootCall, entries);
+  }
   if (entries.length === 0) {
     return undefined;
   }
 
-  // Word-boundary check against the actual parameter identifier, falling
-  // back to the conventional `props`. Bare `_` (commonly used to ignore
-  // the parameter) is treated as "no forwarding ever happens", so no
-  // hardcoded set is produced — silence beats false positives.
+  // Match the actual parameter name; use conventional props when absent or ignored.
   const candidate = paramName && paramName !== "_" ? paramName : "props";
   const re = new RegExp(`\\b${candidate}\\b`);
 
@@ -1346,63 +1412,6 @@ function computeHardcodedProps(
     }
   }
   return out.size > 0 ? out : undefined;
-}
-
-/**
- * Mirror of `detectReturnedClass`, but returns the matched call's bounds
- * (alias start, class-name range, props brace range) so a caller can
- * inspect the root element's props table.
- */
-function findReturnedRootCall(
-  originalText: string,
-  maskedText: string,
-  bodyStart: number,
-  bodyEnd: number,
-  partition: AliasPartition
-): CreateElementCall | undefined {
-  const allCalls = findAllCreateElementCallsImpl(originalText, partition);
-  const stack: string[] = [];
-  const tokenRe = /\b\w+\b/g;
-  tokenRe.lastIndex = bodyStart;
-  let m: RegExpExecArray | null;
-  while ((m = tokenRe.exec(maskedText)) !== null) {
-    if (m.index >= bodyEnd) {
-      break;
-    }
-    const word = m[0];
-    if (word === "function") {
-      stack.push("fn");
-    } else if (word === "if" || word === "do" || word === "repeat") {
-      stack.push(word);
-    } else if (word === "end" || word === "until") {
-      stack.pop();
-    } else if (word === "return") {
-      const functionDepth = stack.reduce(
-        (n, t) => n + (t === "fn" ? 1 : 0),
-        0
-      );
-      if (functionDepth !== 0) {
-        continue;
-      }
-      // The next call whose alias starts after `return` (skipping
-      // whitespace, an optional `(`, and an optional `scope:` /
-      // `Fusion.` receiver — `aliasStart` points at the alias itself,
-      // not at the receiver) is the returned root element.
-      const after = m.index + word.length;
-      const matched = allCalls.find(
-        (c) =>
-          c.aliasStart >= after &&
-          c.aliasStart < bodyEnd &&
-          /^\s*\(?\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*[.:]\s*)?$/.test(
-            originalText.slice(after, c.aliasStart)
-          )
-      );
-      if (matched) {
-        return matched;
-      }
-    }
-  }
-  return undefined;
 }
 
 function collectTypeAliases(maskedText: string): Map<string, string[]> {
@@ -1426,11 +1435,8 @@ interface FunctionDef {
   name: string;
   defIdx: number;
   paramType?: string;
-  /** Identifier of the first parameter, e.g. `props` in `function MyCard(props)`. */
   paramName?: string;
-  /** Offset of the first character of the first parameter's type annotation
-   *  (after the `:`), if any. Used to locate per-field positions for the
-   *  unused-prop diagnostic. */
+  /** Type annotation start after the colon, used to locate unused-prop fields. */
   paramTypeStart?: number;
   paramTypeEnd?: number;
   bodyStart: number;
@@ -1452,17 +1458,7 @@ interface ParsedParameter {
   typeEnd?: number;
 }
 
-/**
- * A Fusion 0.3 component takes the scope *first* and its props second:
- *
- *   local function Button(scope: Scope<typeof(Fusion)>, props: ButtonProps)
- *
- * Treating `scope` as the props table would hand the prop-completion
- * and hardcoded-prop machinery the wrong parameter, so recognise it and
- * skip past. Deliberately narrow — name or annotated type has to
- * actually say "scope" — so a React/Vide component whose props
- * parameter happens to be first is never misread.
- */
+/** Fusion 0.3 may pass scope before props; require an explicit scope name or type to infer it. */
 function looksLikeFusionScopeParam(param: ParsedParameter): boolean {
   if (/^_?scope$/i.test(param.name)) {
     return true;
@@ -1491,8 +1487,6 @@ function parseParameterList(
       i++;
     }
     if (i === nameStart) {
-      // Not an identifier (`...`, or something unparseable) — stop
-      // collecting parameters and just find the closing paren.
       break;
     }
     const param: ParsedParameter = {
@@ -1547,14 +1541,12 @@ function parseParameterList(
     }
 
     params.push(param);
-    // Two parameters is all any caller needs (props, or scope + props).
+    // Only props, or scope plus props, are needed.
     if (params.length === 2) {
       break;
     }
   }
 
-  // The props table is the first parameter, unless that slot is taken
-  // by a Fusion 0.3 scope and a second parameter exists to hold it.
   const propsParam =
     params.length > 1 && looksLikeFusionScopeParam(params[0])
       ? params[1]
@@ -1581,7 +1573,7 @@ function parseParameterList(
   return undefined;
 }
 
-function findFunctionDefinitions(maskedText: string): FunctionDef[] {
+function findFunctionDefinitions(maskedText: string, blocks: BlockIndex): FunctionDef[] {
   const results: FunctionDef[] = [];
 
   const p1 =
@@ -1601,7 +1593,7 @@ function findFunctionDefinitions(maskedText: string): FunctionDef[] {
         continue;
       }
       const bodyStart = sig.paramListEnd + 1;
-      const bodyEnd = findMatchingEnd(maskedText, bodyStart);
+      const bodyEnd = matchingEnd(blocks, maskedText.length, bodyStart);
       results.push({
         name,
         defIdx,
@@ -1619,18 +1611,7 @@ function findFunctionDefinitions(maskedText: string): FunctionDef[] {
   return results;
 }
 
-interface ScanCacheEntry {
-  text: string;
-  textLen: number;
-  aliasesKey: string;
-  result: Map<string, DocumentComponentInfo>;
-}
-const scanCache: ScanCacheEntry[] = [];
-// Bumped from 4 → 8: the active set of "documents being inspected
-// concurrently" can exceed 4 in a busy session (current editor +
-// diagnostics on a few open files + codeLens + hover on a peeked file).
-const SCAN_CACHE_MAX = 8;
-
+/** Cached component definitions by alias set; callers must not mutate the returned Map. */
 export function scanDocument(
   text: string,
   aliases: AliasPartition | string[]
@@ -1638,33 +1619,39 @@ export function scanDocument(
   const partition = asPartition(aliases);
   const aliasesKey =
     partition.parens.join("|") + "\0" + partition.curried.join("|");
-  const len = text.length;
-  for (let i = scanCache.length - 1; i >= 0; i--) {
-    const entry = scanCache[i];
-    // Cheap rejections first: text length and alias-key are O(1) and
-    // O(short-string), so we only pay the full O(N) string-equality
-    // cost when a real hit is plausible. On big files this keeps the
-    // cache check at near-constant time for misses.
-    if (entry.textLen !== len) {continue;}
-    if (entry.aliasesKey !== aliasesKey) {continue;}
-    if (entry.text !== text) {continue;}
-    const hit = scanCache.splice(i, 1)[0];
-    scanCache.push(hit);
-    return hit.result;
+  const analysis = analysisFor(text, true);
+  const cached = analysis.scans.get(aliasesKey);
+  if (cached) {
+    return cached;
   }
+  const components = scanAnalysis(analysis, partition);
+  analysis.scans.set(aliasesKey, components);
+  trimResults(analysis.scans);
+  return components;
+}
 
-  const { masked } = getMaskedDoc(text);
+function scanAnalysis(
+  analysis: TextAnalysis,
+  partition: AliasPartition
+): Map<string, DocumentComponentInfo> {
+  const text = analysis.text;
+  const masked = analysis.masked;
+  const blocks = analysis.blocks;
   const typeAliases = collectTypeAliases(masked);
   const components = new Map<string, DocumentComponentInfo>();
+  const returnPattern = returnAliasPatternFor(partition);
+  let sortedCalls: SortedCalls | undefined;
+  const rootCalls = () => (sortedCalls ??= sortCalls(rawCallsOf(analysis, partition)));
+  const entriesByCall = new Map<CreateElementCall, PropEntry[]>();
 
-  for (const def of findFunctionDefinitions(masked)) {
+  for (const def of findFunctionDefinitions(masked, blocks)) {
     const lastSegment = def.name.split(".").pop()!;
     if (components.has(lastSegment)) {
       continue;
     }
 
-    const defLineIndex = lineNumberOf(text, def.defIdx);
-    const annotations = parseAnnotationsForComponent(text, defLineIndex);
+    const defLineIndex = analysis.lineOf(def.defIdx);
+    const annotations = parseAnnotationsFromLines(analysis.lines, defLineIndex);
 
     let paramTypeFields: string[] | undefined;
     if (def.paramType) {
@@ -1679,21 +1666,15 @@ export function scanDocument(
       }
     }
 
-    const detectedBase = detectReturnedClass(
-      text,
-      masked,
-      def.bodyStart,
-      def.bodyEnd,
-      partition
-    );
+    const detectedBase = returnPattern
+      ? detectReturnedClassIn(blocks, text, def.bodyStart, def.bodyEnd, returnPattern)
+      : undefined;
 
-    const hardcodedProps = computeHardcodedProps(
+    const hardcodedProps = hardcodedPropsOf(
+      findReturnedRootCallIn(blocks, rootCalls, text, def.bodyStart, def.bodyEnd),
       text,
-      masked,
-      def.bodyStart,
-      def.bodyEnd,
       def.paramName,
-      partition
+      entriesByCall
     );
 
     components.set(lastSegment, {
@@ -1711,82 +1692,98 @@ export function scanDocument(
     });
   }
 
-  scanCache.push({ text, textLen: len, aliasesKey, result: components });
-  if (scanCache.length > SCAN_CACHE_MAX) {
-    scanCache.shift();
-  }
   return components;
-}
-
-// ============================================================================
-// findAllCreateElementCalls — used by inlay hints + document symbols
-// ============================================================================
-
-interface AllCallsCacheEntry {
-  text: string;
-  aliasesKey: string;
-  result: CreateElementCall[];
 }
 
 export interface DirectCallOptions {
   componentNames?: ReadonlySet<string>;
   instanceNames?: ReadonlySet<string>;
 }
-const allCallsCache: AllCallsCacheEntry[] = [];
-const ALL_CALLS_CACHE_MAX = 4;
 
+function partitionKey(partition: AliasPartition): string {
+  return JSON.stringify([
+    partition.parens, partition.curried, partition.parensWithInlineChildren,
+  ]);
+}
+
+// Cache sorted name keys per set to avoid sorting on every lookup.
+const namesKeyCache = new WeakMap<ReadonlySet<string>, { size: number; key: string }>();
+
+function namesKey(names: ReadonlySet<string> | undefined): string {
+  if (!names || names.size === 0) {
+    return "[]";
+  }
+  const hit = namesKeyCache.get(names);
+  if (hit && hit.size === names.size) {
+    return hit.key;
+  }
+  const key = JSON.stringify([...names].sort());
+  namesKeyCache.set(names, { size: names.size, key });
+  return key;
+}
+
+/** Factory calls in discovery order, shared by component and call scans. */
+function rawCallsOf(analysis: TextAnalysis, partition: AliasPartition): CreateElementCall[] {
+  const key = partitionKey(partition);
+  let calls = analysis.rawCalls.get(key);
+  if (!calls) {
+    calls = findFactoryCalls(analysis, partition);
+    analysis.rawCalls.set(key, calls);
+    trimResults(analysis.rawCalls);
+  }
+  return calls;
+}
+
+/** Cached calls in document order; callers must not mutate the returned array. */
 export function findAllCreateElementCalls(
   text: string,
   aliases: AliasPartition | string[],
   directCalls?: DirectCallOptions
 ): CreateElementCall[] {
   const partition = asPartition(aliases);
-  const aliasesKey =
-    JSON.stringify([
-      partition.parens, partition.curried, partition.parensWithInlineChildren,
-      [...(directCalls?.componentNames ?? [])].sort(),
-      [...(directCalls?.instanceNames ?? [])].sort(),
-    ]);
-  for (let i = allCallsCache.length - 1; i >= 0; i--) {
-    if (
-      allCallsCache[i].text === text &&
-      allCallsCache[i].aliasesKey === aliasesKey
-    ) {
-      const hit = allCallsCache.splice(i, 1)[0];
-      allCallsCache.push(hit);
-      return hit.result;
-    }
+  const key = partitionKey(partition) + "\0" +
+    namesKey(directCalls?.componentNames) + "\0" +
+    namesKey(directCalls?.instanceNames);
+  const analysis = analysisFor(text, true);
+  const cached = analysis.calls.get(key);
+  if (cached) {
+    return cached;
   }
-  const result = findAllCreateElementCallsImpl(text, partition, directCalls);
-  allCallsCache.push({ text, aliasesKey, result });
-  if (allCallsCache.length > ALL_CALLS_CACHE_MAX) {
-    allCallsCache.shift();
-  }
-  // Sort by start position so consumers (inlay hints / symbols) see
-  // document-order regardless of which pass produced them.
+  const factory = rawCallsOf(analysis, partition);
+  const result = directCalls
+    ? factory.concat(findDirectCalls(analysis, factory, directCalls))
+    : factory.slice();
   result.sort((a, b) => a.aliasStart - b.aliasStart);
+  analysis.calls.set(key, result);
+  trimResults(analysis.calls);
   return result;
 }
 
-function findAllCreateElementCallsImpl(
-  text: string,
-  partition: AliasPartition,
-  directCalls?: DirectCallOptions
+const parensCallPatternCache = new Map<string, RegExp>();
+const curriedCallPatternCache = new Map<string, RegExp>();
+
+function factoryPattern(cache: Map<string, RegExp>, aliasPattern: string, build: () => string): RegExp {
+  let re = cache.get(aliasPattern);
+  if (!re) {
+    re = new RegExp(build(), "g");
+    cache.set(aliasPattern, re);
+  }
+  re.lastIndex = 0;
+  return re;
+}
+
+function findFactoryCalls(
+  analysis: TextAnalysis,
+  partition: AliasPartition
 ): CreateElementCall[] {
-  const { masked } = getMaskedDoc(text);
+  const text = analysis.text;
+  const masked = analysis.masked;
   const results: CreateElementCall[] = [];
 
-  // Pass 1: parens form — `ALIAS ( ARG , {…}[, {…}] )`
   if (partition.parens.length > 0) {
     const aliasPattern = buildAliasAlternation(partition.parens);
-    // Capturing the alias (was non-capturing): lets us detect when
-    // the matched alias is *also* a curried-bucket alias (Vide:
-    // `create` / `Vide.create` register in both buckets). In that
-    // case the props brace doubles as the inline-children container,
-    // matching Vide's `Vide.create("Frame", { Child() })` shape.
-    const re = new RegExp(
-      `(?<![A-Za-z0-9_.])(${aliasPattern})\\s*\\(`,
-      "g"
+    const re = factoryPattern(parensCallPatternCache, aliasPattern, () =>
+      `(?<![A-Za-z0-9_.])(${aliasPattern})\\s*\\(`
     );
     let m: RegExpExecArray | null;
     while ((m = re.exec(masked)) !== null) {
@@ -1803,12 +1800,7 @@ function findAllCreateElementCallsImpl(
         continue;
       }
 
-      // For aliases registered in *both* buckets (Vide's `create`), a
-      // props stage after the closing paren means this is really the
-      // curried form with a parenthesised name stage —
-      // `create(scope, "Frame")({ … })` — which pass 2 parses
-      // correctly. Bail so the two passes can't both emit a call at
-      // this offset with different class names.
+      // A second props stage identifies a curried call; leave it to the next pass to avoid duplicates.
       if (
         partition.curried.includes(alias) &&
         curriedPropsStageFollows(text, closeParen + 1)
@@ -1863,20 +1855,14 @@ function findAllCreateElementCallsImpl(
           }
         }
       } else if (
-        // Prefer the precise spec-derived set when present (1.5.0+);
-        // fall back to the legacy bucket-membership check for callers
-        // (notably hand-rolled test fixtures) that don't populate the
-        // new field. Same effective behaviour for the default config
-        // where the only multi-shape framework is Vide.
+        // Use explicit inline-child aliases when available; otherwise retain the legacy bucket fallback.
         (partition.parensWithInlineChildren
           ? partition.parensWithInlineChildren.includes(alias)
           : partition.curried.includes(alias)) &&
         propsBraceStart !== undefined &&
         propsBraceEnd !== undefined
       ) {
-        // Vide-style parens form: the props table doubles as the
-        // inline-children container. `Vide.create("Frame", { Child() })`
-        // — `Child()` lives in the same brace as the props.
+        // Vide's props table also contains its children.
         childrenStart = propsBraceStart + 1;
         childrenEnd = propsBraceEnd;
       }
@@ -1898,33 +1884,13 @@ function findAllCreateElementCallsImpl(
     }
   }
 
-  // Pass 2: curried form. Both stages independently accept Lua's call
-  // sugar or explicit parentheses (see the "Curried-form syntax
-  // variants" note above), so all of these land here:
-  //
-  //   ALIAS "Frame" { … }          ALIAS("Frame") { … }
-  //   ALIAS "Frame" ({ … })        ALIAS(scope, "Frame")({ … })
-  //
-  // We anchor only on the alias keyword (which is in code position, so the
-  // masked text is safe), then walk forward in the *original* text to read
-  // the class-name token (string contents would be blanked in the masked
-  // version) and locate the props table.
+  // Parse curried stages from original text because masking hides quoted class names.
   if (partition.curried.length > 0) {
     const aliasPattern = buildAliasAlternation(partition.curried);
-    // Lookahead was `(?=\s)` — that only ever admitted the sugar form.
-    // A plain word boundary lets `ALIAS(` through too; the forward walk
-    // below is what actually validates the shape.
-    //
-    // The leading group absorbs a receiver so `scope:New` (Fusion 0.3
-    // `scoped()`) and `MyFusion.New` (a `require` bound to any local
-    // name) resolve to the `New` alias. It is *lazy* so a configured
-    // dotted alias still wins outright: at `Fusion.New` the empty
-    // branch is tried first and the longest-first alternation matches
-    // `Fusion.New` whole, exactly as before.
-    const aliasRe = new RegExp(
+    // A lazy receiver preserves whole dotted aliases; the forward parser validates the call shape.
+    const aliasRe = factoryPattern(curriedCallPatternCache, aliasPattern, () =>
       `(?<![A-Za-z0-9_.])((?:[A-Za-z_][A-Za-z0-9_]*\\s*[.:]\\s*)??)` +
-        `(?:${aliasPattern})(?![A-Za-z0-9_])`,
-      "g"
+        `(?:${aliasPattern})(?![A-Za-z0-9_])`
     );
     let m: RegExpExecArray | null;
     while ((m = aliasRe.exec(masked)) !== null) {
@@ -1932,8 +1898,7 @@ function findAllCreateElementCallsImpl(
       if (!parsed) {
         continue;
       }
-      // `aliasStart` covers the receiver too, so the call's text range
-      // is complete; the alias and receiver travel separately.
+      // Keep the receiver in the full source range and separately for code generation.
       const receiver = m[1];
       const alias = m[0].slice(receiver.length);
 
@@ -1959,19 +1924,30 @@ function findAllCreateElementCallsImpl(
     }
   }
 
-  if (directCalls) {
+  return results;
+}
+
+/** Recognize only configured direct names, skipping offsets already claimed by factories. */
+function findDirectCalls(
+  analysis: TextAnalysis,
+  factoryCalls: CreateElementCall[],
+  directCalls: DirectCallOptions
+): CreateElementCall[] {
+  const text = analysis.text;
+  const masked = analysis.masked;
+  const results: CreateElementCall[] = [];
+  {
     const names = new Set([
       ...(directCalls.componentNames ?? []),
       ...(directCalls.instanceNames ?? []),
     ]);
-    const existingStarts = new Set(results.map((call) => call.aliasStart));
+    const existingStarts = new Set(factoryCalls.map((call) => call.aliasStart));
     const re = /(?<![A-Za-z0-9_.:])([A-Za-z_][A-Za-z0-9_]*)\s*(?=[({])/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(masked)) !== null) {
       const name = m[1];
       if (!names.has(name) || existingStarts.has(m.index)) {continue;}
-      // A function definition's parameter table is not a call. Inspect
-      // only the preceding token instead of rescanning the document prefix.
+      // Function parameter tables are not calls; inspect the preceding token.
       let before = m.index - 1;
       while (before >= 0 && /\s/.test(masked[before])) {before--;}
       if (masked.slice(Math.max(0, before - 7), before + 1) === "function" &&
@@ -1982,7 +1958,7 @@ function findAllCreateElementCallsImpl(
         const closeParen = findMatchingParen(masked, openBrace);
         if (closeParen === -1) {continue;}
         const args = splitTopLevelArgs(masked, openBrace + 1, closeParen);
-        // Custom components may take a Fusion scope before props.
+        // Custom components may pass Fusion scope before props.
         const arg = args.length === 1 ? args[0]
           : args.length === 2 && directCalls.componentNames?.has(name)
             ? args[1] : undefined;
@@ -2000,7 +1976,7 @@ function findAllCreateElementCallsImpl(
       }
       const closeBrace = findMatchingBrace(masked, openBrace);
       if (closeBrace === -1) {continue;}
-      const entries = extractPropEntriesFromDocument(text, openBrace + 1, closeBrace);
+      const entries = parsePropEntriesFromMasked(masked.slice(openBrace + 1, closeBrace));
       const nameEntry = entries.find((entry) => entry.key === "Name");
       const nameValue = nameEntry && text.slice(
         openBrace + 1 + nameEntry.valueStart, openBrace + 1 + nameEntry.valueEnd
@@ -2022,10 +1998,6 @@ function findAllCreateElementCallsImpl(
   return results;
 }
 
-/**
- * True when a curried props stage (`{ … }` or `({ … })`) begins at or
- * after `from`, skipping whitespace.
- */
 function curriedPropsStageFollows(text: string, from: number): boolean {
   let i = from;
   while (i < text.length && /\s/.test(text[i])) {
@@ -2049,24 +2021,13 @@ interface ParsedCurriedCall {
   isString: boolean;
   classNameStart: number;
   classNameEnd: number;
-  /** Offset of the props table's `{`. */
   openBrace: number;
-  /** Offset of the props table's matching `}`. */
   closeBrace: number;
-  /** Offset just past the whole call (past `)` when the props stage is
-   *  parenthesised, past `}` otherwise). */
+  /** Offset after the full call, including the props-stage closing parenthesis if present. */
   fullEnd: number;
 }
 
-/**
- * Parse the two stages of a curried factory call starting at
- * `afterAlias` (the offset just past the alias identifier). Returns
- * undefined when what follows isn't a complete `<name><props>` pair —
- * that rejection is what keeps the widened alias anchor from matching
- * unrelated uses of the same identifier, and what separates Vide's
- * two-argument parens form `create("Frame", { … })` (handled by pass 1)
- * from a parenthesised name stage.
- */
+/** Require a complete name/props pair to reject unrelated identifiers and two-argument parens calls. */
 function parseCurriedCall(
   text: string,
   masked: string,
@@ -2088,9 +2049,7 @@ function parseCurriedCall(
   let isString = false;
 
   if (text[i] === "(") {
-    // Parenthesised name stage: `("Frame")` or `(scope, "Frame")`.
-    // The class name is the last argument; anything before it is the
-    // scope Fusion 0.3 threads through.
+    // The class name is the last name-stage argument; earlier arguments carry Fusion scope.
     const closeParen = findMatchingParen(masked, i);
     if (closeParen === -1) {
       return undefined;
@@ -2139,7 +2098,6 @@ function parseCurriedCall(
     return undefined;
   }
 
-  // Props stage: `{ … }`, or StyLua's `({ … })`.
   i = skipSpace(i);
   let propsParen = -1;
   if (text[i] === "(") {
@@ -2310,22 +2268,7 @@ function parseFirstArgClassName(
   return undefined;
 }
 
-// ============================================================================
-// Color literal extraction (for the DocumentColorProvider)
-// ============================================================================
-
-/**
- * Find every Color3 constructor call — `Color3.fromRGB(...)`,
- * `Color3.new(...)`, `Color3.fromHex(...)`, `Color3.fromHSV(...)` — and
- * return the resolved RGB triple (each channel `0..1`).
- *
- * Pass `originalText` alongside `maskedText` so we can read the literal
- * hex string out of `Color3.fromHex("#FFFFFF")` — the masked version
- * has the string interior blanked out. The parameter is optional for
- * back-compat with callers that only have the masked text on hand:
- * fromHex calls won't resolve in that mode (we can't see the hex), but
- * the other constructors still work.
- */
+/** Resolve Color3 literals to RGB channels in [0, 1]; fromHex also requires originalText. */
 export function extractColorLiterals(
   maskedText: string,
   originalText?: string
@@ -2341,8 +2284,6 @@ export function extractColorLiterals(
       if (!originalText) {
         continue;
       }
-      // Re-parse the call from the original text so we can see the
-      // string contents (the masked version blanked them out).
       const callText = originalText.slice(m.index, m.index + m[0].length);
       const hexMatch = /["']\s*(#?[0-9a-fA-F]{3,8})\s*["']/.exec(callText);
       if (!hexMatch) {
@@ -2407,7 +2348,7 @@ function hsvToRgb(
   s: number,
   v: number
 ): { r: number; g: number; b: number } {
-  // Roblox's HSV is 0..1 across the board. Standard conversion.
+  // Roblox HSV channels use the 0-1 range.
   const hNorm = ((h % 1) + 1) % 1;
   const i = Math.floor(hNorm * 6);
   const f = hNorm * 6 - i;
@@ -2430,10 +2371,6 @@ function hsvToRgb(
   }
 }
 
-// ============================================================================
-// Small utility used by several providers
-// ============================================================================
-
 export function pushUnique(target: string[], items: string[]): void {
   for (const item of items) {
     if (!target.includes(item)) {
@@ -2445,7 +2382,6 @@ export function pushUnique(target: string[], items: string[]): void {
 export function collectLocalBindings(text: string): Set<string> {
   const masked = applyMask(text, buildCodeMask(text));
   const out = new Set<string>();
-  // Matches both `local X = ...` and `local function X(...)`.
   const re = /(?<![A-Za-z0-9_])local\s+(?:function\s+)?([A-Za-z_]\w*)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(masked)) !== null) {
@@ -2453,3 +2389,55 @@ export function collectLocalBindings(text: string): Set<string> {
   }
   return out;
 }
+
+export const _scanInternals = {
+  matchingEnd(masked: string, startIdx: number): number {
+    return matchingEnd(buildBlockIndex(masked), masked.length, startIdx);
+  },
+  ownReturns(masked: string, bodyStart: number, bodyEnd: number): number[] {
+    const out: number[] = [];
+    forEachOwnReturn(buildBlockIndex(masked), bodyStart, bodyEnd, (after) => {
+      out.push(after);
+      return false;
+    });
+    return out;
+  },
+  factoryCalls(text: string, aliases: AliasPartition | string[]): CreateElementCall[] {
+    return rawCallsOf(analysisFor(text, true), asPartition(aliases));
+  },
+  returnedRootCall(
+    text: string,
+    bodyStart: number,
+    bodyEnd: number,
+    aliases: AliasPartition | string[]
+  ): CreateElementCall | undefined {
+    const analysis = analysisFor(text, true);
+    const partition = asPartition(aliases);
+    return findReturnedRootCallIn(
+      analysis.blocks,
+      () => sortCalls(rawCallsOf(analysis, partition)),
+      text,
+      bodyStart,
+      bodyEnd
+    );
+  },
+  lineOf(text: string, offset: number): number {
+    return new TextAnalysis(text).lineOf(offset);
+  },
+  cachedTexts(): { documents: number; fragments: number } {
+    return {
+      documents: sharedAnalyses.documents.length,
+      fragments: sharedAnalyses.fragments.length,
+    };
+  },
+  isCached(text: string): boolean {
+    return [...sharedAnalyses.documents, ...sharedAnalyses.fragments]
+      .some((entry) => entry.text === text);
+  },
+  cachedChars(): { documents: number; fragments: number } {
+    const sum = (list: TextAnalysis[]) => list.reduce((n, entry) => n + entry.text.length, 0);
+    return { documents: sum(sharedAnalyses.documents), fragments: sum(sharedAnalyses.fragments) };
+  },
+  DOCUMENT_ANALYSES_MAX,
+  ANALYSES_CHARS_MAX,
+};

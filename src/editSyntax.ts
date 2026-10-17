@@ -1,5 +1,4 @@
-// Deliberately small lexical helpers for refactors. Unlike presentation parsers,
-// these preserve every byte and reject syntax whose bindings we cannot prove.
+// Refactor helpers preserve source offsets and reject unprovable bindings.
 export interface LuaToken {
   value: string;
   start: number;
@@ -11,8 +10,7 @@ export const LUA_KEYWORDS = new Set(
   "and break continue do else elseif end false for function if in local nil not or repeat return then true until while export type".split(" ")
 );
 
-/** Strings, long strings and comments are consumed as units. Interpolation
- * expressions remain visible so captures and renames include their references. */
+/** Keep interpolation references visible while consuming strings and comments as units. */
 export function luaTokens(text: string, interpolate = true): LuaToken[] {
   const out: LuaToken[] = [];
   let i = 0;
@@ -47,7 +45,7 @@ export function luaTokens(text: string, interpolate = true): LuaToken[] {
       }
       if (text[i] === "{") {
         if (interpolate) {emit(start, "string");}
-        i++; // interpolation delimiters are not Lua table delimiters
+        i++; // Interpolation braces are not table delimiters.
         code(true);
         start = i;
       } else { i++; }
@@ -101,7 +99,6 @@ const EXPRESSION_CONTINUATIONS = new Set([
   ",", "=", ".", ":", "+", "-", "*", "/", "%", "^", "<", ">", "<=", ">=", "==", "~=", "and", "or", "not", "..", "then", "else", "elseif",
 ]);
 
-/** Find a table field's terminator without splitting callback statements. */
 export function luaValueEnd(text: string, start: number): number {
   const tokens = luaTokens(text.slice(start), false);
   let brackets = 0;
@@ -131,8 +128,6 @@ export interface LuaBindings {
   root: LuaScope;
 }
 
-/** Resolve lexical value names. Types are skipped; generic/type declarations
- * sharing the renamed name are rejected by the caller rather than guessed. */
 export function analyzeLuaBindings(text: string): LuaBindings {
   const tokens = luaTokens(text);
   const root: LuaScope = { start: 0, end: text.length, kind: "root" };
@@ -164,9 +159,7 @@ export function analyzeLuaBindings(text: string): LuaBindings {
       if (depth === 0 && stop.has(v)) {break;}
       if (depth === 0 && j > from) {
         const previous = tokens[j - 1];
-        // A declaration can end at a newline without an initializer; a
-        // function body can also begin immediately after its return type.
-        // Union/intersection continuations are still part of the type.
+        // Newlines can end uninitialized declarations; union and intersection continuations stay in the type.
         if (!requiresType.has(previous.value) && !continuesType.has(v) &&
             (/\n/.test(text.slice(previous.end, tokens[j].start)) ||
              tokens[j].kind === "word") &&
@@ -190,8 +183,7 @@ export function analyzeLuaBindings(text: string): LuaBindings {
   const pendingRepeatClosures: Array<{ scope: LuaScope; end: number }> = [];
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i], v = t.value;
-    // `until` closes only after its expression. In particular, functions
-    // inside that expression must still inherit the repeat's local bindings.
+    // Repeat locals remain visible to functions inside the until expression.
     while (pendingRepeatClosures.at(-1)?.scope === scope &&
         t.start >= pendingRepeatClosures[pendingRepeatClosures.length - 1].end) {
       close(pendingRepeatClosures.pop()!.end);
@@ -207,8 +199,7 @@ export function analyzeLuaBindings(text: string): LuaBindings {
         if (tokens[j]?.value !== ",") {break;}
         j++;
       }
-      // A local isn't in scope in its own initializer. With multiline or
-      // compound initializers, delimiters and blocks identify its end.
+      // A local becomes active only after its complete initializer.
       let activeFrom = tokens[j]?.start ?? text.length;
       if (tokens[j]?.value === "=") {
         let depth = 0;
@@ -238,7 +229,7 @@ export function analyzeLuaBindings(text: string): LuaBindings {
       let j = i + 1;
       if (tokens[j]?.kind === "word") {
         if (tokens[i - 1]?.value === "local") {add(tokens[j], scope, tokens[j].start);}
-        // Named global functions are writes; leave their name visible.
+        // Named global functions are writes; keep their names visible.
         while (j < tokens.length && tokens[j].value !== "(") {
           if (tokens[j].value === "<") {throw new Error("Generic functions need the language server's refactor.");}
           j++;
@@ -254,7 +245,7 @@ export function analyzeLuaBindings(text: string): LuaBindings {
         if (tokens[j]?.value === ":") {j = skipType(j + 1, new Set([",", ")"]));}
         if (tokens[j]?.value === ",") {j++;}
       }
-      // Parameters are declarations, never references in the enclosing scope.
+      // Parameters belong to the function scope.
       for (let k = i + 1; k <= j; k++) {if (tokens[k]) {tokenScopes.set(tokens[k].start, scope);}}
       if (tokens[j + 1]?.value === ":") {
         skipType(j + 2, new Set(["return", "local", "if", "for", "while", "repeat", "do", "end", ";"]));
@@ -287,8 +278,6 @@ export function analyzeLuaBindings(text: string): LuaBindings {
     }
     else if (v === "until") {
       if (scope.kind !== "repeat") {throw new Error("Unbalanced repeat block.");}
-      // Repeat locals remain visible through the whole condition, including
-      // a condition formatted over several lines.
       let end = text.length, depth = 0;
       for (let j = i + 1; j < tokens.length; j++) {
         const current = tokens[j], previous = tokens[j - 1];
@@ -313,10 +302,11 @@ export function analyzeLuaBindings(text: string): LuaBindings {
   if (scope !== root || conditionals.length > 0) {throw new Error("Finish the block before refactoring.");}
   const references: LuaReference[] = [];
   const delimiters: Array<{ value: string; scope: LuaScope }> = [];
+  const ownerAt = scopeLocator(scopes, root);
+  const visibleBinding = bindingLocator(bindings);
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
-    const owner = scopes.filter(s => s.start <= t.start && t.start < s.end)
-      .sort((a, b) => b.start - a.start)[0] ?? root;
+    const owner = ownerAt(t.start);
     if (t.kind === "symbol") {
       if (["(", "[", "{"].includes(t.value)) {delimiters.push({ value: t.value, scope: owner });}
       else if ([")", "]", "}"].includes(t.value)) {delimiters.pop();}
@@ -326,22 +316,125 @@ export function analyzeLuaBindings(text: string): LuaBindings {
     if (declaration) { references.push({ token: t, scope: declaration.scope, binding: declaration, declaration: true }); continue; }
     const prev = tokens[i - 1]?.value, next = tokens[i + 1]?.value;
     if (prev === "." || prev === ":") {continue;}
-    // Literal table keys and type fields are labels, not value references.
-    // An enclosing table can contain a callback. Its statements are not
-    // table fields, even when an assignment follows a semicolon or comma.
+    // Table labels are not references; assignments inside callbacks still are.
     const delimiter = delimiters.at(-1);
     if (delimiter?.value === "{" && delimiter.scope === owner &&
         (next === "=" || next === ":") && (prev === "{" || prev === "," || prev === ";")) {continue;}
     let current: LuaScope | undefined = owner;
     let binding: LuaBinding | undefined;
     while (current && !binding) {
-      binding = bindings.filter(b => b.scope === current && b.name === t.value && b.activeFrom <= t.start)
-        .sort((a, b) => b.activeFrom - a.activeFrom)[0];
+      binding = visibleBinding(current, t.value, t.start);
       current = current.parent;
     }
     references.push({ token: t, scope: owner, binding });
   }
   return { tokens, bindings, references, root };
+}
+
+/** Locate scopes in token order; fall back to filtering if scopes are not properly nested. */
+function scopeLocator(scopes: LuaScope[], root: LuaScope): (offset: number) => LuaScope {
+  const filtered = (offset: number) => scopes.filter(s => s.start <= offset && offset < s.end)
+    .sort((a, b) => b.start - a.start)[0] ?? root;
+  if (scopes[0] !== root) {
+    return filtered;
+  }
+  // Validate source ordering and nesting before using the linear walk.
+  const check: LuaScope[] = [root];
+  for (let k = 1; k < scopes.length; k++) {
+    const s = scopes[k];
+    if (s.start < scopes[k - 1].start || s.start >= s.end) {
+      return filtered;
+    }
+    while (check.length > 0 && check[check.length - 1].end <= s.start) {
+      check.pop();
+    }
+    const parent = check[check.length - 1];
+    if (!parent || s.parent !== parent || s.end > parent.end) {
+      return filtered;
+    }
+    check.push(s);
+  }
+  const stack: LuaScope[] = [root];
+  let next = 1;
+  let last = -Infinity;
+  return (offset) => {
+    if (offset < last) {
+      return filtered(offset);
+    }
+    last = offset;
+    for (; next < scopes.length && scopes[next].start <= offset; next++) {
+      const s = scopes[next];
+      while (stack.length > 0 && stack[stack.length - 1] !== s.parent) {
+        stack.pop();
+      }
+      stack.push(s);
+    }
+    while (stack.length > 0 && stack[stack.length - 1].end <= offset) {
+      stack.pop();
+    }
+    let owner = stack[stack.length - 1];
+    if (!owner) {
+      return filtered(offset);
+    }
+    // Equal starts resolve to the first-created scope.
+    while (owner.parent && owner.parent.start === owner.start) {
+      owner = owner.parent;
+    }
+    return owner;
+  };
+}
+
+/** Resolve the latest active binding, preferring the first declaration when starts tie. */
+function bindingLocator(bindings: LuaBinding[]): (scope: LuaScope, name: string, offset: number) => LuaBinding | undefined {
+  const byScope = new Map<LuaScope, Map<string, { list: LuaBinding[]; ordered: boolean }>>();
+  for (const b of bindings) {
+    let names = byScope.get(b.scope);
+    if (!names) {
+      names = new Map();
+      byScope.set(b.scope, names);
+    }
+    const group = names.get(b.name);
+    if (group) {
+      group.ordered &&= group.list[group.list.length - 1].activeFrom <= b.activeFrom;
+      group.list.push(b);
+    } else {
+      names.set(b.name, { list: [b], ordered: true });
+    }
+  }
+  return (scope, name, offset) => {
+    const group = byScope.get(scope)?.get(name);
+    if (!group) {
+      return undefined;
+    }
+    const list = group.list;
+    if (!group.ordered) {
+      let best: LuaBinding | undefined;
+      for (const b of list) {
+        if (b.activeFrom <= offset && (!best || b.activeFrom > best.activeFrom)) {
+          best = b;
+        }
+      }
+      return best;
+    }
+    let lo = 0;
+    let hi = list.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (list[mid].activeFrom <= offset) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    let at = lo - 1;
+    if (at < 0) {
+      return undefined;
+    }
+    while (at > 0 && list[at - 1].activeFrom === list[at].activeFrom) {
+      at--;
+    }
+    return list[at];
+  };
 }
 
 /** Apply non-overlapping edits against the same immutable input. */

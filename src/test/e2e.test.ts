@@ -1,8 +1,3 @@
-// End-to-end checks that go through the real extension host: open a
-// `luau` document, let the extension activate and publish diagnostics,
-// then inspect what VS Code reports. Complements the pure-function suites
-// in `extension.test.ts` for behaviour that only exists once the
-// providers are wired up (diagnostics, hover, completion).
 import * as assert from "assert";
 import * as fs from "fs";
 import * as os from "os";
@@ -17,9 +12,7 @@ async function activateExtension(): Promise<void> {
   await ext!.activate();
 }
 
-// The providers are registered for `scheme: "file"` only, so fixtures
-// are written to a temp directory as real `.luau` files rather than
-// opened as untitled documents.
+// Providers require file URIs, so fixtures must exist on disk.
 let fixtureDir: string | undefined;
 let fixtureCounter = 0;
 
@@ -32,20 +25,20 @@ async function openLuau(content: string): Promise<vscode.TextDocument> {
   const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
   assert.strictEqual(doc.languageId, "luau");
   await activateExtension();
+  await vscode.window.showTextDocument(doc, { preview: true });
   return doc;
 }
 
-suiteTeardown(() => {
+suiteTeardown(async () => {
+  // Release editor handles before removing fixtures.
+  await vscode.commands.executeCommand("workbench.action.closeAllEditors");
   if (fixtureDir) {
-    fs.rmSync(fixtureDir, { recursive: true, force: true });
+    fs.rmSync(fixtureDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
     fixtureDir = undefined;
   }
 });
 
-/**
- * Diagnostics are published asynchronously after open. Poll until the
- * `luix` set has been stable for a few consecutive reads.
- */
+/** Wait for the asynchronously published Luix diagnostics to settle. */
 async function luixDiagnostics(content: string): Promise<vscode.Diagnostic[]> {
   const doc = await openLuau(content);
   let last = "";
@@ -99,12 +92,7 @@ async function hoverTextAt(
     .join("\n");
 }
 
-/**
- * Open a document whose text contains a single `|` cursor marker and
- * return the extension's completion items at that spot. VS Code's own
- * word-based suggestions are filtered out by keeping only items whose
- * `detail` names the class (`TextButton property` / `TextButton event`).
- */
+/** Get Luix property and event completions at the | marker. */
 async function luixCompletions(
   contentWithCursor: string,
   className: string
@@ -127,10 +115,6 @@ async function luixCompletions(
 function labelOf(item: vscode.CompletionItem): string {
   return typeof item.label === "string" ? item.label : item.label.label;
 }
-
-// ============================================================================
-// Unknown-prop diagnostic — Vide events as plain keys (issue #4)
-// ============================================================================
 
 suite("e2e diagnostics — Vide events as plain keys (issue #4)", () => {
   test("curried `create \"TextButton\" { events }` → no unknown-prop", async () => {
@@ -313,9 +297,29 @@ suite("e2e diagnostics — Vide events as plain keys (issue #4)", () => {
   });
 });
 
-// ============================================================================
-// Unknown-prop diagnostic — `Parent = …` for Fusion / Vide
-// ============================================================================
+suite("e2e diagnostics — documents nobody shows", () => {
+  test("a document another extension opens is still linted, once the editor is quiet", async function () {
+    this.timeout(30000);
+    await activateExtension();
+    if (!fixtureDir) {
+      fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "luix-e2e-"));
+    }
+    const file = path.join(fixtureDir, `background-${++fixtureCounter}.luau`);
+    fs.writeFileSync(file, ['local b = create "TextButton" {', "  NotARealProp = 1,", "}"].join("\n"), "utf8");
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
+    assert.ok(!vscode.window.visibleTextEditors.some((editor) => editor.document === doc));
+    let keys: string[] = [];
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      keys = unknownPropKeys(vscode.languages.getDiagnostics(doc.uri).filter((d) => d.source === "luix"));
+      if (keys.length > 0) {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.deepStrictEqual(keys, ["NotARealProp"]);
+  });
+});
 
 suite("e2e diagnostics — Parent as a table key", () => {
   test("Fusion `New \"ScreenGui\" { Parent = … }` → no unknown-prop", async () => {
@@ -387,10 +391,6 @@ suite("e2e diagnostics — Parent as a table key", () => {
     assert.deepStrictEqual(unknownPropKeys(diags), ["NotARealProp"]);
   });
 });
-
-// ============================================================================
-// Hover — Vide event keys and Parent
-// ============================================================================
 
 suite("e2e hover — event keys and Parent", () => {
   test("hovering `Activated` in a Vide TextButton shows an event hover", async () => {
@@ -467,7 +467,6 @@ suite("e2e hover — event keys and Parent", () => {
       ].join("\n")
     );
     assert.strictEqual(await hoverTextAt(doc, "Changed"), "");
-    // The value's `Parent` (in `script.Parent,`) — no hover; the key does.
     assert.strictEqual(await hoverTextAt(doc, "Parent,"), "");
     assert.ok((await hoverTextAt(doc, "Parent =")).includes("**Frame.Parent**"));
   });
@@ -483,9 +482,7 @@ suite("e2e hover — event keys and Parent", () => {
   });
 
   test("Fusion `[OnEvent 'X']` (single quotes) gets the event hover too", async () => {
-    // The parenthesised `[OnEvent("X")]` spelling is not covered: the
-    // enclosing-call detector bails when the cursor is inside `( … )`
-    // within a props table, a pre-existing parser limitation.
+    // Parenthesized OnEvent keys are outside the detector's supported syntax.
     const single = await openLuau(
       ['local b = New "TextButton" {', "  [OnEvent 'Activated'] = fn,", "}"].join("\n")
     );
@@ -551,8 +548,6 @@ suite("e2e hover — event keys and Parent", () => {
     );
     const computed = await hoverTextAt(doc, "Activated");
     assert.ok(computed.includes("Event forwarded from `TextButton.Activated`"), computed);
-    // React doesn't take events as plain keys, so `MouseEnter = fn` on a
-    // React component is not an event and gets no event hover.
     assert.strictEqual(await hoverTextAt(doc, "MouseEnter"), "");
   });
 
@@ -564,10 +559,6 @@ suite("e2e hover — event keys and Parent", () => {
     assert.ok(text.includes("**TextButton.Text**"), text);
   });
 });
-
-// ============================================================================
-// Completion — Vide events carry the Event kind; Parent offered for Fusion/Vide
-// ============================================================================
 
 suite("e2e completion — event items and Parent", () => {
   test("Vide TextButton props list includes events as Event items with a handler snippet", async () => {
@@ -587,11 +578,9 @@ suite("e2e completion — event items and Parent", () => {
       ),
       (insert as vscode.SnippetString).value
     );
-    // Regular props keep the Property kind.
     const text = items.find((i) => labelOf(i) === "Text");
     assert.ok(text, "Text not offered");
     assert.strictEqual(text!.kind, vscode.CompletionItemKind.Property);
-    // Most-specific events lead the merged list (own → inherited).
     const labels = items.map(labelOf);
     assert.ok(
       labels.indexOf("Activated") < labels.indexOf("MouseEnter"),
@@ -637,8 +626,7 @@ suite("e2e completion — event items and Parent", () => {
     const parent = fusionItems.find((i) => labelOf(i) === "Parent");
     assert.ok(parent, "Fusion should offer Parent");
     assert.strictEqual(parent!.detail, "ScreenGui property — Instance");
-    // ScreenGui has the Instance signals; Fusion (eventsAsProps=false)
-    // must not merge them into its prop list.
+    // Fusion events must not appear as plain property keys.
     assert.ok(!fusion.includes("Destroying"), "Fusion should not merge events");
 
     const vide = (
@@ -704,10 +692,6 @@ suite("e2e completion — event items and Parent", () => {
     assert.strictEqual(items[0].detail, "TextButton event");
   });
 });
-
-// ============================================================================
-// Sort props code action — class-scoped events, children preserved
-// ============================================================================
 
 import { SortPropsCodeActionProvider } from "../sortProps";
 

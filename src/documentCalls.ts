@@ -4,16 +4,18 @@ import {
   collectLocalBindings,
   DirectCallOptions,
   findAllCreateElementCalls,
+  memoForText,
   scanDocument,
 } from "./parser";
 import {
+  FrameworkSpec,
   getAliasPartition,
   getDirectInstanceClassNames,
   getEnabledFrameworks,
 } from "./frameworks";
 import type { WorkspaceIndex } from "./workspaceIndex";
 
-/** Resolve direct constructors separately from user-defined component names. */
+/** Cached direct-call options; callers must not mutate the returned sets. */
 export function documentDirectCalls(
   text: string,
   workspaceIndex?: Pick<WorkspaceIndex, "knownComponentNames">
@@ -22,16 +24,34 @@ export function documentDirectCalls(
   const supportsDirectComponents = frameworks.some(
     (framework) => framework.id === "vide" || framework.id === "fusion"
   );
+  const known = supportsDirectComponents ? workspaceIndex?.knownComponentNames() : undefined;
+  const partition = getAliasPartition();
+  const instanceClasses = getDirectInstanceClassNames();
+  return memoForText(
+    text,
+    "documentDirectCalls",
+    [frameworks, supportsDirectComponents, known, partition, instanceClasses],
+    () => computeDirectCalls(text, frameworks, supportsDirectComponents, known, instanceClasses)
+  );
+}
+
+function computeDirectCalls(
+  text: string,
+  frameworks: FrameworkSpec[],
+  supportsDirectComponents: boolean,
+  known: ReadonlySet<string> | undefined,
+  instanceClasses: ReadonlySet<string> | undefined
+): DirectCallOptions {
   const componentNames = new Set<string>();
   if (supportsDirectComponents) {
-    for (const name of workspaceIndex?.knownComponentNames() ?? []) {
+    for (const name of known ?? []) {
       componentNames.add(name);
     }
     for (const name of scanDocument(text, getAliasPartition()).keys()) {
       componentNames.add(name);
     }
   }
-  const instanceNames = new Set(getDirectInstanceClassNames());
+  const instanceNames = new Set(instanceClasses);
   const mask = buildCodeMask(text);
   const masked = applyMask(text, mask);
   const bindings = collectLocalBindings(text);
@@ -43,8 +63,7 @@ export function documentDirectCalls(
       }
     }
   }
-  // Parameters can shadow a built-in constructor too. Be conservative when
-  // a name is reused in the document instead of linting it as a Roblox class.
+  // Treat parameter shadowing anywhere in the document conservatively.
   const parameters = /\bfunction(?:\s+[A-Za-z_][\w.:]*)?\s*\(([^)]*)\)/g;
   const parameterNames = new Set<string>();
   for (const match of masked.matchAll(parameters)) {
@@ -65,8 +84,7 @@ export function documentDirectCalls(
     if (!bindings.has(name)) {
       continue;
     }
-    // `local Frame = create "Frame"` is the usual Vide constructor alias.
-    // Other local bindings (including require'd components) take precedence.
+    // Recognize Vide constructor aliases; other local bindings take precedence.
     const pattern = new RegExp(
       `\\blocal\\s+${escape(name)}\\s*=\\s*(?:${aliases.map(escape).join("|")})` +
       `\\s*(?:\\(\\s*)?["']${escape(name)}["']`, "g"

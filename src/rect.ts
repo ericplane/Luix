@@ -10,14 +10,7 @@ import { getAliasPartition } from "./frameworks";
 import { getConfig } from "./configCompat";
 import { fetchAssetThumbnailUrl } from "./assetThumbnails";
 
-// ============================================================================
-// Rect editor — visual editor for ImageRectOffset / ImageRectSize.
-//
-// Detection: any `e("ImageLabel" | "ImageButton", { … })` whose Image
-// prop is a literal `rbxassetid://NNNN` string. The CodeLens above each
-// such call opens a side-panel editor that loads the actual thumbnail
-// and lets the user drag a rectangle on it.
-// ============================================================================
+// Edit crop rectangles for image elements with literal asset IDs.
 
 const IMAGE_CLASSES = new Set(["ImageLabel", "ImageButton"]);
 
@@ -29,11 +22,11 @@ export interface RectImageCall {
   assetId: string;
   imageRectOffset?: { x: number; y: number };
   imageRectSize?: { x: number; y: number };
-  /** Roblox `ScaleType` enum name (e.g. "Crop", "Fit", "Stretch"). */
+  /** ScaleType enum name. */
   scaleType?: string;
-  /** Fixed-pixel aspect ratio derived from `Size = UDim2.fromOffset(W, H)`. */
+  /** Aspect ratio from a literal pixel Size. */
   sizeAspect?: number;
-  /** AspectRatio prop on a sibling `UIAspectRatioConstraint`, if any. */
+  /** Aspect ratio from a sibling constraint. */
   aspectConstraint?: number;
 }
 
@@ -53,8 +46,6 @@ export function findRectImageCalls(text: string): RectImageCall[] {
     }
   }
 
-  // Quick reject: no point doing any work on files that don't reference
-  // an image asset at all.
   if (!/rbxasset(?:id)?:\/\//.test(text)) {
     const empty: RectImageCall[] = [];
     rectCache.push({ text, result: empty });
@@ -111,7 +102,6 @@ export function findRectImageCalls(text: string): RectImageCall[] {
           scaleType = m[1];
         }
       } else if (entry.key === "Size") {
-        // Fixed-pixel UDim2.fromOffset(W, H) gives us a concrete aspect.
         const m = /UDim2\.fromOffset\s*\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\)/.exec(
           valueText
         );
@@ -146,17 +136,7 @@ export function findRectImageCalls(text: string): RectImageCall[] {
   return out;
 }
 
-/**
- * Roblox's `UIAspectRatioConstraint` applies to its immediate parent in
- * the tree — so when one sits next to our ImageLabel in the same
- * parent's children list, the ImageLabel inherits that constraint
- * (because `Size = UDim2.fromScale(1, 1)` makes it fill the parent).
- *
- * Walk up to the ImageLabel's smallest enclosing call, then look at
- * the other calls whose smallest enclosing call is also that parent —
- * those are siblings. Return the AspectRatio of the first
- * UIAspectRatioConstraint we find among them.
- */
+/** Use a sibling aspect constraint as the parent's aspect ratio. */
 function findSiblingAspectConstraint(
   text: string,
   target: { aliasStart: number; fullEnd: number },
@@ -228,9 +208,6 @@ function parseVector2(
   return { x: Number(m[1]), y: Number(m[2]) };
 }
 
-// ============================================================================
-// CodeLens
-// ============================================================================
 export class RectCodeLensProvider
   implements vscode.CodeLensProvider, vscode.Disposable
 {
@@ -278,9 +255,6 @@ export class RectCodeLensProvider
   }
 }
 
-// ============================================================================
-// Editor manager
-// ============================================================================
 export class RectEditorManager implements vscode.Disposable {
   private panels = new Map<string, vscode.WebviewPanel>();
 
@@ -333,68 +307,47 @@ export class RectEditorManager implements vscode.Disposable {
       this.panels.delete(key);
     });
 
-    // Register the message handler BEFORE setting the HTML so the
-    // webview's first `ready` message is always caught. The previous
-    // ordering put an `await` (the thumbnail fetch) between
-    // `webview.html = …` and `onDidReceiveMessage(…)` — the webview's
-    // iframe would load and post `ready` during that await, and the
-    // listener wasn't attached yet, so the message was silently dropped
-    // and the editor sat on "Loading…" forever. The fetch now happens
-    // inside the handler instead.
+    // Attach the message handler before HTML can send ready.
     panel.webview.onDidReceiveMessage(async (msg) => {
       if (disposed) {return;}
       if (msg?.type === "ready") {
-        // Resolve dims in this order:
-        //   1. Cached dims (from a prior Open Cloud lookup OR a user's
-        //      manual Source W/H). One-time cost per asset.
-        //   2. Live Open Cloud lookup if a key is configured and no cache.
-        //   3. Webview falls back to the thumbnail's natural size.
-        // We kick the thumbnail off in parallel since it's always needed.
+        // Prefer cached dimensions, then Open Cloud, then thumbnail size.
         let cachedDims = readCachedAssetDims(this.context, hit.assetId);
         const apiKeySet =
           !!getConfig<string>("openCloud.apiKey", "").trim();
         const [imageUrl, freshDims] = await Promise.all([
           fetchLargestAvailableThumbnail(hit.assetId),
-          // Skip the Open Cloud call when we already have a manual
-          // override (user is always trusted) — but DO refresh if the
-          // only cache we have is a stale Open Cloud fetch and... no
-          // actually, asset bytes don't change, so any cached value is
-          // fine. Only call when no cache at all.
+          // Asset dimensions are immutable; reuse cached or manual values.
           cachedDims ? Promise.resolve(undefined) : fetchAssetNativeDimensions(this.context, hit.assetId),
         ]);
         if (disposed) {return;}
         if (!cachedDims && freshDims) {
           cachedDims = freshDims;
         }
-        // Pick the most reliable aspect signal we have:
-        //   1. A sibling UIAspectRatioConstraint (most explicit).
-        //   2. A fixed-pixel Size = UDim2.fromOffset(W, H) on the ImageLabel.
-        //   3. None → leave undefined, webview defaults to 1:1.
+        // Prefer a sibling aspect constraint over a literal Size.
         const frameAspect =
           hit.aspectConstraint ?? hit.sizeAspect ?? undefined;
         panel.webview.postMessage({
           type: "init",
           assetId: hit.assetId,
           imageUrl,
-          cachedDims, // {width, height, source?} | undefined
+          cachedDims,
           apiKeySet,
           rectOffset: hit.imageRectOffset ?? { x: 0, y: 0 },
-          // {0,0} is Roblox's "use the whole image" sentinel
+          // Zero offset and size mean the whole image.
           rectSize: hit.imageRectSize ?? { x: 0, y: 0 },
-          frameAspect, // number | undefined
+          frameAspect,
           frameAspectSource: hit.aspectConstraint
             ? "UIAspectRatioConstraint"
             : hit.sizeAspect
               ? "Size"
               : "default",
-          scaleType: hit.scaleType ?? "Stretch", // Roblox's default
+          scaleType: hit.scaleType ?? "Stretch",
         });
         return;
       }
       if (msg?.type === "saveDims") {
-        // Webview tells us the user changed Source W/H — persist the
-        // new dims for this asset, marked as a manual override so future
-        // opens skip the API call too.
+        // Persist manual dimensions so later opens avoid the API.
         if (
           typeof msg.width === "number" &&
           typeof msg.height === "number" &&
@@ -464,9 +417,7 @@ async function applyRectEdit(
   const innerStep = insertSpaces ? " ".repeat(tabSize) : "\t";
   const propIndent = outerIndent + innerStep;
 
-  // Roblox treats `ImageRectSize = Vector2.new(0, 0)` as "render the
-  // whole image" — same as omitting the prop. Strip both props when
-  // the rect covers the whole image so the file stays clean.
+  // Zero offset and size mean the whole image; omit both props.
   const isWholeImage =
     Math.round(newOffset.x) === 0 &&
     Math.round(newOffset.y) === 0 &&
@@ -494,12 +445,7 @@ async function applyRectEdit(
   await vscode.workspace.applyEdit(edit);
 }
 
-/**
- * Probe the thumbnails API at successively smaller sizes until one
- * returns a `Completed` URL. Each (asset, size) pair is cached
- * independently by `fetchAssetThumbnailUrl`, so a fallback isn't
- * re-requested next time the same asset is opened.
- */
+/** Try smaller thumbnails until one is available; cache each size separately. */
 async function fetchLargestAvailableThumbnail(
   assetId: string
 ): Promise<string | null> {
@@ -513,33 +459,14 @@ async function fetchLargestAvailableThumbnail(
   return null;
 }
 
-// ============================================================================
-// Per-asset Source W/H memory + Open Cloud auto-detect
-//
-// Two layers of dimension resolution, both keyed by asset ID:
-//
-//   1. Open Cloud lookup — when the user has set `luix.openCloud.apiKey`,
-//      we hit `apis.roblox.com/asset-delivery-api/v1/assetId/{id}` (which
-//      requires the `legacy-asset:manage` permission on the key), download
-//      the returned `location` URL, and parse the PNG/JPEG header for the
-//      native pixel size. One call per asset, ever — the result is
-//      persisted to globalState so subsequent opens skip the fetch.
-//
-//   2. Manual memory — every Source W/H value the user types is persisted
-//      under the same key. So even without an API key, typing dimensions
-//      once per asset is a one-time cost.
-//
-// User-typed dims take precedence over API-fetched ones (the user is
-// always trusted). Both live in `globalState` so they survive restarts
-// and are shared across every workspace on the machine.
-// ============================================================================
+// Persist native or manual dimensions per asset across workspaces.
 
 const ASSET_DIMS_PREFIX = "luix.rectAssetDims.";
 
 interface CachedDims {
   width: number;
   height: number;
-  /** Where the dims came from. Used to decide whether to overwrite. */
+  /** Dimension source controls overwrite priority. */
   source?: "openCloud" | "manual";
 }
 
@@ -558,11 +485,6 @@ export async function writeCachedAssetDims(
   await context.globalState.update(ASSET_DIMS_PREFIX + assetId, dims);
 }
 
-/**
- * Erase every cached asset-dimension entry. Used by the imageGutter
- * purge command so users have a single way to drop _all_ asset
- * metadata Luix has ever stored.
- */
 export async function purgeAllCachedAssetDims(
   context: vscode.ExtensionContext
 ): Promise<number> {
@@ -576,19 +498,7 @@ export async function purgeAllCachedAssetDims(
   return removed;
 }
 
-/**
- * Fetch native pixel dimensions for an asset via Roblox's Open Cloud
- * asset-delivery API. Returns `undefined` when:
- *
- *   - No API key is configured (`luix.openCloud.apiKey` is empty)
- *   - The API rejects the request (401, 403, 404, 429, 5xx)
- *   - The returned `location` URL doesn't serve a recognisable PNG/JPEG
- *   - Any network error
- *
- * Results are cached in `globalState` under the same key as manual
- * Source W/H memory, tagged with `source: "openCloud"` so the editor
- * knows where the dims came from.
- */
+/** Return undefined when dimensions cannot be fetched or decoded. */
 export async function fetchAssetNativeDimensions(
   context: vscode.ExtensionContext,
   assetId: string
@@ -638,12 +548,7 @@ export async function fetchAssetNativeDimensions(
   }
 }
 
-/**
- * Tiny zero-dependency PNG / JPEG header reader. Returns `undefined`
- * for any format we don't recognise. PNG stores width/height in the
- * IHDR chunk right after the 8-byte signature; JPEG stores them in the
- * first SOF (Start Of Frame) segment.
- */
+/** Read PNG IHDR or JPEG SOF dimensions; reject other formats. */
 function readImageDimensions(
   bytes: Uint8Array
 ): { width: number; height: number } | undefined {
@@ -665,9 +570,7 @@ function readImageDimensions(
       return { width: w, height: h };
     }
   }
-  // JPEG: SOI (FF D8), then a sequence of segments. We scan for the
-  // first SOF marker (FFC0..FFCF excluding C4/C8/CC). Each segment is
-  // FFxx + 2-byte BE length + payload.
+  // JPEG segments include a big-endian length; skip non-SOF markers.
   if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
     let i = 2;
     while (i + 9 < bytes.length) {
@@ -711,9 +614,6 @@ function readImageDimensions(
   return undefined;
 }
 
-// ============================================================================
-// Webview HTML
-// ============================================================================
 function renderRectEditorHtml(): string {
   return /* html */ `<!doctype html>
 <html lang="en">
@@ -769,9 +669,7 @@ function renderRectEditorHtml(): string {
     position: relative;
     width: 100%;
     max-width: 560px;
-    /* Aspect ratio is set dynamically to match the source asset so the
-       image fills the stage exactly — otherwise the rect overlay (which
-       uses % of the stage) would not align with a letterboxed image. */
+    /* Match the source aspect ratio so the selection aligns with the image. */
     aspect-ratio: 1 / 1;
     margin: 0 auto 14px;
     border-radius: 8px;
@@ -787,9 +685,7 @@ function renderRectEditorHtml(): string {
     box-shadow: inset 0 0 0 1px rgba(255,255,255,0.1);
     touch-action: none;
   }
-  /* The image layer is positioned absolutely so we can shrink it within
-     the stage when the user scroll-zooms out (leaving room around it
-     for rects that extend past the image bounds). */
+  /* Leave room for selections beyond the image when zoomed out. */
   .image-layer {
     position: absolute;
     pointer-events: none;
@@ -800,8 +696,6 @@ function renderRectEditorHtml(): string {
     width: 100%;
     height: 100%;
   }
-  /* Floating zoom control — visible cue that scroll-to-zoom works, plus
-     buttons for users who prefer clicking. */
   .zoom-bar {
     position: absolute;
     top: 8px;
@@ -856,14 +750,12 @@ function renderRectEditorHtml(): string {
     border-radius: 3px;
   }
   .zoom-label:hover { background: rgba(255, 255, 255, 0.06); }
-  /* Darkening mask outside the rect — uses two background overlays so
-     the area inside the rect stays at full brightness. */
   .mask {
     position: absolute;
     inset: 0;
     pointer-events: none;
     box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55) inset;
-    /* The inset shadow on .rect cuts a hole — see .rect rule below */
+    /* The selection shadow leaves its interior undimmed. */
   }
   .rect {
     position: absolute;
@@ -873,16 +765,10 @@ function renderRectEditorHtml(): string {
     touch-action: none;
   }
   .rect.dragging { cursor: grabbing; }
-  /* Overflow indicator — when the rect extends past the image edges,
-     show a dashed/lighter colour on the part that's beyond the bitmap. */
   .rect.overflow {
     border-style: dashed;
     border-color: #FFB454;
   }
-  /* Crop preview — the actual area Roblox shows after ScaleType.Crop
-     scales the rect to fit the destination frame. Rendered inside the
-     selection as a dashed box so the user sees exactly what will land
-     on screen. */
   .crop-preview {
     position: absolute;
     border: 1.5px dashed #FFD166;
@@ -1077,19 +963,11 @@ function renderRectEditorHtml(): string {
 <script>
   const vscode = acquireVsCodeApi();
 
-  // Coordinate basis: the rect's X/Y/W/H are stored in SOURCE asset
-  // pixel space, not in the thumbnail's pixel space. The thumbnail is
-  // a scaled preview; what Roblox actually renders is the original
-  // asset, whose dimensions we can't auto-detect — so the user can
-  // override srcW/srcH and we scale the on-screen rect proportionally.
-  let srcW = 0, srcH = 0; // source asset's pixel dimensions
-  let rectX = 0, rectY = 0, rectW = 0, rectH = 0; // in SOURCE-space pixels
-  // 0,0,0,0 means "whole image" — Roblox's default sentinel
-  let frameAspect = 1.0; // destination frame width/height ratio
-  let scaleType = "Stretch"; // Roblox ScaleType enum value name
-  // Zoom factor — at 1.0 the image fills the stage; at 0.5 the image
-  // occupies 50% of the stage with margin around it so the user can
-  // drag rects that extend past the image bounds. Scroll-wheel adjusts.
+  // Store rectangle coordinates in source pixels; scale only the preview.
+  let srcW = 0, srcH = 0;
+  let rectX = 0, rectY = 0, rectW = 0, rectH = 0; // All zeros mean the whole image.
+  let frameAspect = 1.0; // Destination frame width/height.
+  let scaleType = "Stretch";
   let viewScale = 1.0;
 
   const stage = document.getElementById("stage");
@@ -1110,26 +988,16 @@ function renderRectEditorHtml(): string {
   const err = document.getElementById("err");
 
   function clamp(n, min, max) { return Math.max(min, Math.min(max, n)); }
-  // Soft upper bound for rect dims — allow up to 4× the source so users
-  // can pick "above 100%" rects (Roblox accepts ImageRectSize values
-  // exceeding the texture; the image just gets stretched/edge-clamped).
-  // Hard upper bound is 65535 so it fits in Int16-ish ranges.
+  // Allow oversized rectangles, capped at four times the source or 65535.
   const maxRect = () => Math.max(srcW * 4, 65535);
 
-  // The stage holds the image at a fraction (viewScale) of its full
-  // size, centred. Rect positioning uses the same fraction so it
-  // aligns with the image. With viewScale = 1.0, the image fills the
-  // stage and rect coords are simple % of source. With viewScale < 1,
-  // the image occupies the centre and there's margin around it where
-  // an oversized rect can extend visually.
+  // Apply the same scale and centering to the image and selection.
   function imageOriginPct() {
-    return (1 - viewScale) / 2 * 100; // % offset from stage edge
+    return (1 - viewScale) / 2 * 100;
   }
 
   function paintImage() {
     if (!srcW || !srcH) return;
-    // Stage aspect ratio matches the source so a square in source coords
-    // renders as a square on screen.
     stage.style.aspectRatio = srcW + " / " + srcH;
     const off = imageOriginPct();
     const size = viewScale * 100;
@@ -1158,11 +1026,7 @@ function renderRectEditorHtml(): string {
     paintCropPreview(effectiveW, effectiveH);
   }
 
-  /**
-   * Render the dashed inner box showing what ScaleType.Crop will
-   * actually display on the destination frame. Only meaningful for
-   * Crop; for Fit/Stretch/Tile/Slice we hide the overlay.
-   */
+  /** Show the visible area after ScaleType.Crop fits the destination frame. */
   function paintCropPreview(effectiveW, effectiveH) {
     if (scaleType !== "Crop" || !frameAspect || !effectiveW || !effectiveH) {
       cropPreview.style.display = "none";
@@ -1171,17 +1035,14 @@ function renderRectEditorHtml(): string {
     const rectAspect = effectiveW / effectiveH;
     let cropOffX = 0, cropOffY = 0, cropW = effectiveW, cropH = effectiveH;
     if (rectAspect > frameAspect) {
-      // Rect wider than frame — height fills, width gets cropped.
       cropH = effectiveH;
       cropW = effectiveH * frameAspect;
       cropOffX = (effectiveW - cropW) / 2;
     } else if (rectAspect < frameAspect) {
-      // Rect taller than frame — width fills, height gets cropped.
       cropW = effectiveW;
       cropH = effectiveW / frameAspect;
       cropOffY = (effectiveH - cropH) / 2;
     }
-    // Position relative to the parent .rect (which is itself 100% wide).
     cropPreview.style.display = "block";
     cropPreview.style.left = (cropOffX / effectiveW * 100).toFixed(3) + "%";
     cropPreview.style.top  = (cropOffY / effectiveH * 100).toFixed(3) + "%";
@@ -1202,7 +1063,6 @@ function renderRectEditorHtml(): string {
     paintZoomBar();
   }
 
-  // --- Zoom bar ---
   const ZOOM_MIN = 0.15;
   const ZOOM_MAX = 3.0;
   const zoomLabel = document.getElementById("zoomLabel");
@@ -1225,23 +1085,18 @@ function renderRectEditorHtml(): string {
 
   function paint() { paintImage(); paintRect(); paintInputs(); }
 
-  // --- Numeric filter (digits only) for X/Y/W/H + Source W/H ---
   [inX, inY, inW, inH, srcWInput, srcHInput].forEach((el) =>
     el.addEventListener("beforeinput", (ev) => {
       if (!ev.data) return;
       if (!/^[0-9]+$/.test(ev.data)) ev.preventDefault();
     })
   );
-  // Frame aspect allows decimals AND colons (for "16:9" style input).
   frameAspectInput.addEventListener("beforeinput", (ev) => {
     if (!ev.data) return;
     if (!/^[0-9.:,]+$/.test(ev.data)) ev.preventDefault();
   });
 
-  // minFn lets X/Y go negative (so when the user pans / drags past
-  // the left or top edge — including via scroll-zoom-out — the rect
-  // can extend into the negative side of ImageRectOffset, which is a
-  // legal Roblox value). W/H stay non-negative.
+  // Offsets may be negative; dimensions must remain non-negative.
   function wireField(el, get, set, minFn = () => 0) {
     el.addEventListener("input", () => {
       const n = Number(el.value);
@@ -1269,10 +1124,6 @@ function renderRectEditorHtml(): string {
     });
   }
 
-  // X/Y: symmetric range [-maxRect(), maxRect()]. Negative values
-  // correspond to negative ImageRectOffset, which Roblox treats as
-  // panning the visible rect to the right / down relative to the
-  // source texture origin.
   const negMaxRect = () => -maxRect();
   wireField(inX,
     () => Math.round(rectX),
@@ -1282,20 +1133,13 @@ function renderRectEditorHtml(): string {
     () => Math.round(rectY),
     (v) => { rectY = clamp(v, -maxRect(), maxRect()); },
     negMaxRect);
-  // W/H allowed to exceed source dimensions — Roblox accepts oversize
-  // ImageRectSize and just stretches the texture to fit. Cap at maxRect
-  // (4× source or 65535) to keep numeric inputs sensible. Min stays 0
-  // (the field rejects negatives, the resize handlers clamp to 1).
   wireField(inW,
     () => Math.round(rectW),
     (v) => { rectW = clamp(v, 0, maxRect()); });
   wireField(inH,
     () => Math.round(rectH),
     (v) => { rectH = clamp(v, 0, maxRect()); });
-  // Source-dimension fields — changing these rescales the rect's
-  // displayed position (the X/Y/W/H values stay numerically the same,
-  // they're just interpreted in the new coordinate space). On blur,
-  // the new dims are persisted per-asset so the next open restores them.
+  // Source dimensions rescale the preview without changing rectangle values.
   wireField(srcWInput,
     () => srcW,
     (v) => { srcW = Math.max(1, v); });
@@ -1309,7 +1153,6 @@ function renderRectEditorHtml(): string {
   });
   srcWInput.addEventListener("blur", persistDims);
   srcHInput.addEventListener("blur", persistDims);
-  // Frame aspect — accepts either a decimal ("1.5") or W:H ratio ("16:9").
   frameAspectInput.addEventListener("input", () => {
     const raw = frameAspectInput.value.trim();
     let v;
@@ -1325,16 +1168,14 @@ function renderRectEditorHtml(): string {
     paintRect();
   });
   frameAspectInput.addEventListener("blur", () => {
-    // Re-format on blur for consistency: "1.5" or "16/9 ≈ 1.778".
     frameAspectInput.value = frameAspect.toFixed(4).replace(/\.?0+$/, "");
   });
 
-  // --- Drag the rectangle ---
   let drag = null;
 
   rectEl.addEventListener("pointerdown", (ev) => {
     if (ev.button !== 0) return;
-    if (ev.target.classList.contains("handle")) return; // handles handle themselves
+    if (ev.target.classList.contains("handle")) return;
     ev.stopPropagation();
     drag = {
       kind: "move",
@@ -1378,17 +1219,10 @@ function renderRectEditorHtml(): string {
     const rect = stage.getBoundingClientRect();
     const dxPx = ev.clientX - drag.startClientX;
     const dyPx = ev.clientY - drag.startClientY;
-    // Stage→source mapping. The image occupies viewScale of the stage,
-    // so each stage pixel is worth (srcW / (stage.width * viewScale))
-    // source pixels. The same factor applies when the user scroll-zooms
-    // out — drags stay 1:1 with the on-screen image.
+    // Convert stage pixels to source pixels at the current zoom.
     const dx = (dxPx / (rect.width * viewScale)) * srcW;
     const dy = (dyPx / (rect.height * viewScale)) * srcH;
-    // Don't clamp to image bounds — let the user drag past for oversize
-    // rects. Clamp only at the max sensible bound (4× source). X/Y
-    // accept negatives so dragging past the left / top edge (or
-    // scroll-zooming out and panning into the negative side) yields a
-    // negative ImageRectOffset, which Roblox accepts.
+    // Allow selections beyond the image, within the configured limits.
     const M = maxRect();
     if (drag.kind === "move") {
       rectX = clamp(Math.round(drag.startX + dx), -M, M);
@@ -1424,9 +1258,6 @@ function renderRectEditorHtml(): string {
     paint();
   });
 
-  // Scroll-to-zoom on the stage. Wheel up = zoom in, wheel down = zoom
-  // out (image shrinks within the stage, leaving room for rects that
-  // extend past the source bounds). Shift = 5× faster.
   stage.addEventListener("wheel", (ev) => {
     ev.preventDefault();
     const factor = ev.shiftKey ? 0.6 : 0.88;
@@ -1462,7 +1293,6 @@ function renderRectEditorHtml(): string {
     }
   });
 
-  // --- Init ---
   window.addEventListener("message", (ev) => {
     const msg = ev.data;
     if (msg?.type !== "init") return;
@@ -1479,10 +1309,7 @@ function renderRectEditorHtml(): string {
       const tnW = imageEl.naturalWidth;
       const tnH = imageEl.naturalHeight;
       let originLabel;
-      // Order: cached dims (manual or Open Cloud) > thumbnail dims.
-      // The extension side handles the Open Cloud lookup before sending
-      // init — by the time we see cachedDims, it is either the user is
-      // typed value or the API-returned native size.
+      // Prefer cached manual or native dimensions over the thumbnail size.
       if (msg.cachedDims && msg.cachedDims.width && msg.cachedDims.height) {
         srcW = msg.cachedDims.width;
         srcH = msg.cachedDims.height;

@@ -28,10 +28,6 @@ const TEMPLATES = {
       ``,
       `local Roact = require(ReplicatedStorage.Packages.Roact)`,
       ``,
-      // No `local e = Roact.createElement` alias — the matching `rofc`
-      // snippet body in src/elementSnippets.ts calls
-      // `Roact.createElement` directly, so both entry points (this
-      // template + the rofc snippet) emit identical files.
       `local function ${name}(props)`,
       `\treturn Roact.createElement("Frame", {`,
       `\t\tSize = UDim2.fromScale(1, 1),`,
@@ -97,11 +93,6 @@ const PROMPT_TITLES: Record<Framework, string> = {
   vide: "New Vide component",
 };
 
-/**
- * Best-effort default folder: the directory of the active editor's file
- * if any, otherwise the first workspace folder. Used as the starting
- * point for the folder picker.
- */
 function inferDefaultDir(): vscode.Uri | undefined {
   const editor = vscode.window.activeTextEditor;
   if (editor && editor.document.uri.scheme === "file") {
@@ -111,12 +102,6 @@ function inferDefaultDir(): vscode.Uri | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri;
 }
 
-/**
- * Resolve the target directory.
- *   - If the caller already supplied one (explorer right-click, etc.),
- *     use it as-is.
- *   - Otherwise show a folder picker rooted at a sensible default.
- */
 async function resolveTargetDir(
   explicit: vscode.Uri | undefined,
   framework: Framework
@@ -148,7 +133,7 @@ export async function scaffoldComponent(
 ): Promise<void> {
   const targetDir = await resolveTargetDir(targetDirUri, framework);
   if (!targetDir) {
-    return; // user canceled or no workspace
+    return;
   }
 
   const name = await vscode.window.showInputBox({
@@ -184,7 +169,6 @@ export async function scaffoldComponent(
       return;
     }
   } catch {
-    // File doesn't exist — good.
   }
 
   const legacyFusion = framework === "fusion" && await prefersLegacyFusion(targetDir);
@@ -196,10 +180,6 @@ export async function scaffoldComponent(
   await vscode.window.showTextDocument(doc);
 }
 
-/**
- * Right-click-on-folder entry point. Quickpicks the framework, then
- * delegates to `scaffoldComponent` with the clicked folder URI.
- */
 export async function pickFrameworkAndScaffold(
   targetUri?: vscode.Uri
 ): Promise<void> {
@@ -220,7 +200,6 @@ export async function pickFrameworkAndScaffold(
   await scaffoldComponent(choice.framework, targetUri);
 }
 
-// Exported for tests.
 export function _renderTemplate(framework: Framework, name: string, legacyFusion = false): string {
   return TEMPLATES[framework](name, legacyFusion);
 }
@@ -237,7 +216,7 @@ async function prefersLegacyFusion(targetDir: vscode.Uri): Promise<boolean> {
         return dependency[1] === "0.2";
       }
     } catch {
-      // A manifest is optional; use the active file's established syntax.
+      // Without a manifest, use the active file's established syntax.
     }
   }
   const active = vscode.window.activeTextEditor?.document;

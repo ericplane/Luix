@@ -9,12 +9,6 @@ import {
 } from "./parser";
 import { WorkspaceIndex } from "./workspaceIndex";
 
-/**
- * Surface a `▸ N references` CodeLens above every component definition
- * in a Lua/Luau file. Clicking it opens VS Code's standard references
- * peek for that location, listing every workspace `e(MyButton, …)` call
- * site the index knows about.
- */
 export class ComponentReferencesLensProvider
   implements vscode.CodeLensProvider, vscode.Disposable
 {
@@ -48,23 +42,13 @@ export class ComponentReferencesLensProvider
     const lines = text.split("\n");
     const out: vscode.CodeLens[] = [];
     for (const [name, info] of components) {
-      // Bail early if VS Code has moved on — typical when the user
-      // keeps typing past the previous lens refresh.
       if (token.isCancellationRequested) {return [];}
       const line = lines[info.defLineIndex] ?? "";
-      // Anchor the lens at the line of the function definition. Indent
-      // by the existing leading whitespace so it lines up with the body
-      // visually rather than the literal column 0.
       const indent = /^\s*/.exec(line)?.[0] ?? "";
       const pos = new vscode.Position(info.defLineIndex, indent.length);
       const range = new vscode.Range(pos, pos);
 
-      // Synchronous count walk — no `openTextDocument` per component,
-      // which used to dominate the lens refresh on large workspaces.
-      // Self-references in the defining file aren't excluded here
-      // (would require opening the file to know lines); the count is
-      // for the workspace-wide "N references" label, and the actual
-      // Locations are resolved lazily when the user clicks.
+      // Counts include self-references; locations resolve only on demand.
       const totalCount = this.workspaceIndex.countCallSites(name);
 
       const title =
@@ -92,15 +76,6 @@ export class ComponentReferencesLensProvider
     this._onDidChange.dispose();
   }
 }
-
-// ============================================================================
-// Frame-stats CodeLens
-// ============================================================================
-//
-// Off by default. When enabled, every element call gets `▸ N
-// descendants, D layers` above its opening line. Useful for sanity-
-// checking layout depth and catching subtrees that have grown out of
-// hand (Roblox renders slow when you nest too many UI instances).
 
 export class FrameStatsLensProvider
   implements vscode.CodeLensProvider, vscode.Disposable

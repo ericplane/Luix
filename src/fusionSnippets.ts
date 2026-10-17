@@ -1,7 +1,22 @@
-import { analyzeLuaBindings } from "./editSyntax";
-import { applyMask, buildCodeMask, findAllCreateElementCalls } from "./parser";
+import { analyzeLuaBindings, LuaBindings } from "./editSyntax";
+import { applyMask, buildCodeMask, findAllCreateElementCalls, memoForText } from "./parser";
+
+/** Cached bindings, or undefined for incomplete syntax; callers must not mutate the result. */
+export function documentLuaBindings(text: string): LuaBindings | undefined {
+  return memoForText(text, "luaBindings", [], () => {
+    try {
+      return analyzeLuaBindings(text);
+    } catch {
+      return undefined;
+    }
+  });
+}
 
 export function usesLegacyFusionSyntax(text: string): boolean {
+  return memoForText(text, "usesLegacyFusionSyntax", [], () => computeUsesLegacyFusionSyntax(text));
+}
+
+function computeUsesLegacyFusionSyntax(text: string): boolean {
   const masked = applyMask(text, buildCodeMask(text));
   if (/\b(?:scoped|Scope)\b|\b\w+\s*:\s*New\b/.test(masked)) {
     return false;
@@ -13,7 +28,7 @@ export function usesLegacyFusionSyntax(text: string): boolean {
   return calls.some((call) => !call.receiver && /^\s*(?:["']|\(\s*["'])/.test(text.slice(call.aliasStart + (call.alias?.length ?? 0))));
 }
 
-/** Keep legacy files usable while generating scope-aware code in Fusion 0.3. */
+/** Generate Fusion 0.3 scope-aware code while retaining legacy syntax where required. */
 export function fusionSnippetBody(
   prefix: string,
   body: string,
@@ -29,34 +44,7 @@ export function fusionSnippetBody(
       .replace(/\bNew\s+("[^"\n]*")/g, "scope:New $1");
   }
 
-  let scope: { name: string; methods: boolean } | undefined;
-  try {
-    const bindings = analyzeLuaBindings(text).bindings
-      .filter((binding) => binding.activeFrom <= offset && binding.scope.start <= offset && binding.scope.end >= offset)
-      .sort((a, b) => b.scope.start - a.scope.start || b.declaration.start - a.declaration.start);
-    const shadowed = new Set<string>();
-    for (const binding of bindings) {
-      if (shadowed.has(binding.name)) {
-        continue;
-      }
-      shadowed.add(binding.name);
-      const suffix = text.slice(binding.declaration.end);
-      const typed = /^\s*:\s*(?:[A-Za-z_]\w*\.)?Scope\b/.test(suffix);
-      const scoped = /^\s*=\s*(?:[A-Za-z_]\w*\.)?(?:scoped|deriveScope)\s*\(/.test(suffix);
-      if (!typed && !scoped && !/^scope$/i.test(binding.name)) {
-        continue;
-      }
-      scope = {
-        name: binding.name,
-        methods: /^\s*=\s*(?:[A-Za-z_]\w*\.)?scoped\s*\(\s*Fusion\s*\)/.test(suffix)
-          || /^\s*:\s*(?:[A-Za-z_]\w*\.)?Scope\s*<\s*typeof\s*\(\s*Fusion\s*\)/.test(suffix),
-      };
-      break;
-    }
-  } catch {
-    // While a function is being typed its blocks may be incomplete. Do not
-    // guess a scope from a different function; normal snippets remain editable.
-  }
+  const scope = memoForText(text, "fusionScope", [offset], () => fusionScopeAt(text, offset));
   if (!scope) {
     return body;
   }
@@ -79,4 +67,35 @@ export function fusionSnippetBody(
     rendered = rendered.replace("function(key, value)", "function(use, scope, key, value)");
   }
   return rendered;
+}
+
+/** Find the nearest visible binding typed as Scope, created by scoped/deriveScope, or named scope. */
+function fusionScopeAt(text: string, offset: number): { name: string; methods: boolean } | undefined {
+  // Incomplete syntax must not borrow a scope from another function.
+  const parsed = documentLuaBindings(text);
+  if (!parsed) {
+    return undefined;
+  }
+  const bindings = parsed.bindings
+    .filter((binding) => binding.activeFrom <= offset && binding.scope.start <= offset && binding.scope.end >= offset)
+    .sort((a, b) => b.scope.start - a.scope.start || b.declaration.start - a.declaration.start);
+  const shadowed = new Set<string>();
+  for (const binding of bindings) {
+    if (shadowed.has(binding.name)) {
+      continue;
+    }
+    shadowed.add(binding.name);
+    const suffix = text.slice(binding.declaration.end);
+    const typed = /^\s*:\s*(?:[A-Za-z_]\w*\.)?Scope\b/.test(suffix);
+    const scoped = /^\s*=\s*(?:[A-Za-z_]\w*\.)?(?:scoped|deriveScope)\s*\(/.test(suffix);
+    if (!typed && !scoped && !/^scope$/i.test(binding.name)) {
+      continue;
+    }
+    return {
+      name: binding.name,
+      methods: /^\s*=\s*(?:[A-Za-z_]\w*\.)?scoped\s*\(\s*Fusion\s*\)/.test(suffix)
+        || /^\s*:\s*(?:[A-Za-z_]\w*\.)?Scope\s*<\s*typeof\s*\(\s*Fusion\s*\)/.test(suffix),
+    };
+  }
+  return undefined;
 }

@@ -4,14 +4,7 @@ import { getAliasPartition } from "./frameworks";
 import { isAtPropKeyPosition } from "./completion";
 import { WorkspaceIndex } from "./workspaceIndex";
 
-// ============================================================================
-// Anchor-preset completion — `anchor:tl|t|tr|l|c|r|bl|b|br`
-// ============================================================================
-//
-// When the cursor is inside a props table, typing `anchor:` opens a
-// picker with nine presets. Accepting one replaces `anchor:xx` with a
-// matched `AnchorPoint` + `Position = UDim2.fromScale(...)` pair.
-// Saves the constant AnchorPoint mental math.
+// Complete anchor presets with matching AnchorPoint and scale Position.
 
 interface Preset {
   slug: string;
@@ -52,25 +45,18 @@ export class AnchorPresetCompletionProvider
     if (!detected) {
       return undefined;
     }
-    // Only suggest in key position — don't pollute the dropdown when
-    // the user is typing inside a value expression (e.g. `Font.|`).
+    // Offer presets only in prop-key positions.
     if (!isAtPropKeyPosition(document, position)) {
       return undefined;
     }
 
-    // Find the start of the `anchor:<x>` token under the cursor. Walk
-    // back across the identifier-and-colon range so the replacement
-    // range covers whatever partial the user has typed (`anchor`,
-    // `anchor:`, `anchor:b`, etc.).
+    // Replace the entire partial anchor token.
     let start = cursorOffset;
     while (start > 0 && /[A-Za-z:]/.test(text[start - 1])) {
       start--;
     }
     const typed = text.slice(start, cursorOffset);
     if (!/^[Aa]/.test(typed) && typed.length > 0) {
-      // Don't fire for unrelated tokens. The initial `a` keeps the
-      // suggestion list focused; if the user typed something else,
-      // they're not asking for an anchor preset.
       return undefined;
     }
 
@@ -108,9 +94,7 @@ export class AnchorPresetCompletionProvider
 function renderSnippet(preset: Preset, forDocs: boolean): string {
   const ax = fmt(preset.anchorX);
   const ay = fmt(preset.anchorY);
-  // For the position, the scale matches the anchor — that way the
-  // element's anchor point sits exactly on the corresponding spot of
-  // the parent.
+  // Matching scales place the anchor at the same point in the parent.
   const px = fmt(preset.anchorX);
   const py = fmt(preset.anchorY);
   const tail = forDocs ? "" : "$0";

@@ -5,46 +5,14 @@ import * as os from "os";
 import { configChangeAffects, getConfig } from "./configCompat";
 import { logWarn } from "./output";
 
-// ============================================================================
-// Roblox content-URL autocomplete — `rbxthumb://` + `rbxasset://`
-// ============================================================================
-//
-// Two distinct Roblox content schemes, both used as `Image` / `Texture`
-// values and both painful to type by hand:
-//
-//   1. rbxthumb:// — dynamically-resolved thumbnails (avatar headshots,
-//      game icons, group emblems, …). Format:
-//        rbxthumb://type=<Type>&id=<Id>&w=<W>&h=<H>[&filters=circular]
-//      Every type only supports a FIXED set of (square) sizes — a
-//      `w`/`h` Roblox doesn't render for that type silently fails, so
-//      the completion only ever offers valid sizes and the diagnostic
-//      flags hand-typed bad ones.
-//
-//   2. rbxasset:// — the client's bundled content files
-//      (`rbxasset://textures/ui/common/robux_color.png`, fonts, sounds,
-//      meshes, …). These live on disk under the local Roblox install's
-//      `content/` folder; we discover that folder, scan it once, and
-//      offer the relative paths as path completions.
-
-// ----------------------------------------------------------------------
-// rbxthumb:// type / size data
-// ----------------------------------------------------------------------
-//
-// Sizes corroborated against Roblox's documented set and Quenty's
-// RbxThumbUtils (NevermoreEngine) — the conservative, known-rendering
-// set. All documented sizes are square (w === h), which is what lets
-// the completion mirror a single size choice into both `w` and `h`.
+// Supported sizes follow Roblox docs and Quenty's RbxThumbUtils (NevermoreEngine).
 
 export interface RbxThumbType {
-  /** The `type=` value, e.g. "AvatarHeadShot". */
   type: string;
-  /** Supported square sizes (w === h). */
+  // Supported square sizes (w === h).
   sizes: number[];
-  /** Placeholder shown for the `id=` field in the inserted snippet. */
   idLabel: string;
-  /** Whether `&filters=circular` is meaningful for this type. */
   circular?: boolean;
-  /** Human description for completion detail / hover. */
   description: string;
 }
 
@@ -114,14 +82,9 @@ export function getRbxThumbType(name: string): RbxThumbType | undefined {
   return RBXTHUMB_BY_TYPE.get(name);
 }
 
-/** Format a size list as `48×48, 60×60, 150×150` for messages / detail. */
 export function formatSizes(sizes: number[]): string {
   return sizes.map((s) => `${s}×${s}`).join(", ");
 }
-
-// ----------------------------------------------------------------------
-// rbxthumb:// parsing + validation (pure — unit-tested)
-// ----------------------------------------------------------------------
 
 export interface ParsedRbxThumb {
   type?: string;
@@ -131,12 +94,7 @@ export interface ParsedRbxThumb {
   filters?: string;
 }
 
-/**
- * Parse the inner of a string that begins with `rbxthumb://`. Returns
- * `undefined` when the string isn't an rbxthumb URL at all. Tolerant of
- * partial input (fields may be absent) so it can drive both the
- * diagnostic and live completion.
- */
+// Accept partial URLs so completion can use the same parser as diagnostics.
 export function parseRbxThumb(inner: string): ParsedRbxThumb | undefined {
   const trimmed = inner.trim();
   const m = /^rbxthumb:\/\/(.*)$/.exec(trimmed);
@@ -168,13 +126,6 @@ export interface RbxThumbProblem {
   message: string;
 }
 
-/**
- * Validate a parsed rbxthumb URL. Returns every problem found. The
- * `kind` lets callers filter — the diagnostic only surfaces the
- * high-signal kinds (`unknown-type`, `bad-size`, `bad-filter`) so it
- * doesn't fire on half-typed URLs, while completion can use the full
- * set.
- */
 export function validateRbxThumb(p: ParsedRbxThumb): RbxThumbProblem[] {
   const problems: RbxThumbProblem[] = [];
   if (!p.type) {
@@ -234,24 +185,15 @@ export function validateRbxThumb(p: ParsedRbxThumb): RbxThumbProblem[] {
   return problems;
 }
 
-// ----------------------------------------------------------------------
-// Enclosing single-line string literal (shared by both providers + hover)
-// ----------------------------------------------------------------------
-
 export interface EnclosingString {
-  /** Document offset of the first char inside the quotes. */
+  // First character inside the quotes, in document offsets.
   innerStart: number;
-  /** Document offset of the closing quote (or line end if unterminated). */
+  // Closing quote, or line end for an unterminated string.
   innerEnd: number;
-  /** The quote character. */
   quote: string;
 }
 
-/**
- * If `offset` sits inside a single-line string literal, return its inner
- * bounds. rbxthumb / rbxasset URLs never span lines, so single-line
- * scanning from the line start is sufficient and cheap.
- */
+// Content URLs are single-line strings, so scanning from the line start is sufficient.
 export function getEnclosingString(
   text: string,
   offset: number
@@ -280,7 +222,6 @@ export function getEnclosingString(
     }
   }
   if (!inString) {return undefined;}
-  // Extend to the closing quote (or end of line) for hover / full-inner.
   let end = offset;
   while (end < text.length && text[end] !== quote && text[end] !== "\n") {
     if (text[end] === "\\") {end++;}
@@ -291,19 +232,6 @@ export function getEnclosingString(
 
 const RBXTHUMB_PREFIX = "rbxthumb://";
 const RBXASSET_PREFIX = "rbxasset://";
-
-// ----------------------------------------------------------------------
-// rbxthumb:// completion
-// ----------------------------------------------------------------------
-//
-// Two contexts:
-//   A. Choosing the type — cursor right after `rbxthumb://` (optionally
-//      with a partial `type=Foo`). Each type inserts a complete URL
-//      skeleton whose `w` / `h` are a choice dropdown of ONLY that
-//      type's valid sizes (mirrored via a shared tabstop so picking
-//      once fills both).
-//   B. Editing a `w=` / `h=` value with a known `type=` already present.
-//      Offers that type's valid sizes as plain numbers.
 
 export class RbxThumbCompletionProvider
   implements vscode.CompletionItemProvider
@@ -321,7 +249,6 @@ export class RbxThumbCompletionProvider
     if (!before.startsWith(RBXTHUMB_PREFIX)) {return undefined;}
     const afterScheme = before.slice(RBXTHUMB_PREFIX.length);
 
-    // Context B — editing a size field.
     const sizeMatch = /(?:^|&)(w|h)=(\d*)$/.exec(afterScheme);
     if (sizeMatch) {
       const typeMatch = /(?:^|&)type=([A-Za-z]+)/.exec(afterScheme);
@@ -345,8 +272,6 @@ export class RbxThumbCompletionProvider
       });
     }
 
-    // Context A — choosing the type. Only when nothing past the type
-    // value has been typed yet (`""`, `type=`, or `type=Partial`).
     if (!/^(?:type=)?[A-Za-z]*$/.test(afterScheme)) {return undefined;}
     const range = new vscode.Range(
       document.positionAt(enc.innerStart + RBXTHUMB_PREFIX.length),
@@ -363,7 +288,7 @@ export class RbxThumbCompletionProvider
           `Supported sizes: ${formatSizes(t.sizes)}` +
           (t.circular ? `\n\nSupports \`&filters=circular\`.` : "")
       );
-      // Mirror the size into both w and h via a shared choice tabstop.
+      // Share a tabstop to keep width and height equal.
       const sizeChoice = `\${2|${t.sizes.join(",")}|}`;
       item.insertText = new vscode.SnippetString(
         `type=${t.type}&id=\${1:${t.idLabel}}&w=${sizeChoice}&h=${sizeChoice}$0`
@@ -375,10 +300,6 @@ export class RbxThumbCompletionProvider
     });
   }
 }
-
-// ----------------------------------------------------------------------
-// rbxthumb:// hover
-// ----------------------------------------------------------------------
 
 export class RbxThumbHoverProvider implements vscode.HoverProvider {
   provideHover(
@@ -417,14 +338,8 @@ export class RbxThumbHoverProvider implements vscode.HoverProvider {
   }
 }
 
-// ----------------------------------------------------------------------
-// rbxthumb:// diagnostics — flag hand-typed unsupported sizes / types
-// ----------------------------------------------------------------------
-
 export const RBXTHUMB_DIAGNOSTIC_CODE = "luix.rbxthumb";
 
-// Matches a complete rbxthumb URL body — stops at the closing quote /
-// whitespace because the query alphabet is letters, digits, `=`, `&`.
 const RBXTHUMB_SCAN_RE = /rbxthumb:\/\/[A-Za-z0-9=&]*/g;
 
 export class RbxThumbDiagnostics implements vscode.Disposable {
@@ -495,9 +410,7 @@ export class RbxThumbDiagnostics implements vscode.Disposable {
     while ((m = RBXTHUMB_SCAN_RE.exec(text)) !== null) {
       const parsed = parseRbxThumb(m[0]);
       if (!parsed) {continue;}
-      // Only the high-signal problems — never the "incomplete while
-      // typing" ones (missing type / size), which would flicker as the
-      // user types the URL out.
+      // Suppress incomplete-URL diagnostics while typing.
       const problems = validateRbxThumb(parsed).filter(
         (p) =>
           p.kind === "unknown-type" ||
@@ -531,18 +444,6 @@ export class RbxThumbDiagnostics implements vscode.Disposable {
   }
 }
 
-// ----------------------------------------------------------------------
-// rbxasset:// content-file discovery + scan
-// ----------------------------------------------------------------------
-//
-// The local Roblox install bundles its content under
-// `…/Roblox/Versions/<version>/content/`. We discover the newest such
-// folder, scan it once (async, cached for the session), and surface the
-// relative paths as path completions.
-
-// Asset extensions worth completing — images, fonts, sounds, meshes.
-// Everything else under content/ (config blobs, shaders, etc.) is noise
-// for an Image/Sound/Mesh value.
 const CONTENT_EXTENSIONS = new Set([
   ".png",
   ".jpg",
@@ -562,11 +463,10 @@ const CONTENT_EXTENSIONS = new Set([
 
 const MAX_CONTENT_FILES = 20000;
 
-// `undefined` = not yet looked; `null` = looked, none found.
+// undefined = not searched; null = searched, none found.
 let _contentDir: string | null | undefined;
 let _filesPromise: Promise<string[]> | undefined;
 
-/** Drop the discovery + scan cache (config change of the path / toggle). */
 export function resetContentCache(): void {
   _contentDir = undefined;
   _filesPromise = undefined;
@@ -584,8 +484,6 @@ function looksLikeContentDir(dir: string): boolean {
   }
 }
 
-/** Given a `…/Versions` directory, return the `content` folder of its
- *  newest version subdir that has one (Player + Studio both live here). */
 function newestVersionContent(versionsDir: string): string | undefined {
   let best: { dir: string; mtime: number } | undefined;
   let entries: fs.Dirent[];
@@ -610,12 +508,7 @@ function newestVersionContent(versionsDir: string): string | undefined {
   return best?.dir;
 }
 
-/**
- * Locate the Roblox `content` directory. Honours the
- * `luix.robloxContent.path` override (which may point at a `content`
- * folder, a version folder, or a `Versions` folder), else auto-discovers
- * the newest install on Windows / macOS. Cached.
- */
+// The override accepts a content, version, or Versions directory.
 export function discoverContentDir(): string | undefined {
   if (_contentDir !== undefined) {return _contentDir ?? undefined;}
 
@@ -648,7 +541,6 @@ export function discoverContentDir(): string | undefined {
       const content = newestVersionContent(versionsDir);
       if (content) {return content;}
     }
-    // macOS Studio ships content directly inside the app bundle.
     const macStudio =
       "/Applications/RobloxStudio.app/Contents/Resources/content";
     if (looksLikeContentDir(macStudio)) {return macStudio;}
@@ -665,8 +557,6 @@ export function discoverContentDir(): string | undefined {
   return found;
 }
 
-/** Scan (once, cached) the discovered content folder for completable
- *  asset files, returned as forward-slash relative paths. */
 export function getContentFiles(): Promise<string[]> {
   if (!_filesPromise) {_filesPromise = scanContentFiles();}
   return _filesPromise;
@@ -676,9 +566,7 @@ async function scanContentFiles(): Promise<string[]> {
   const dir = discoverContentDir();
   if (!dir) {return [];}
   try {
-    // VS Code 1.85 embeds Node 18.15, before readdir's recursive option.
-    // Keep the same depth-first directory order, following directory links
-    // while preventing a link back to an ancestor from looping forever.
+    // Node 18.15 lacks recursive readdir. Walk depth-first and reject ancestor link cycles.
     const rootPath = await fs.promises.realpath(dir);
     const pending = [{
       relative: "",
@@ -696,7 +584,7 @@ async function scanContentFiles(): Promise<string[]> {
           try {
             isDirectory = (await fs.promises.stat(absolute)).isDirectory();
           } catch {
-            // A broken link is not traversable, as with native readdir.
+            // Skip broken links.
           }
         }
         if (CONTENT_EXTENSIONS.has(path.extname(relative).toLowerCase())) {
@@ -724,17 +612,6 @@ async function scanContentFiles(): Promise<string[]> {
   }
 }
 
-// ----------------------------------------------------------------------
-// rbxasset:// completion — folder-by-folder navigation
-// ----------------------------------------------------------------------
-//
-// Rather than dumping full flat paths (which forces the user to already
-// know the path), we navigate one directory level at a time, like a
-// file explorer: at `rbxasset://` we offer `textures/`, `fonts/`, …; at
-// `rbxasset://textures/` we offer that folder's children; and so on.
-// Folders carry a trailing `/` and re-trigger completion on accept so
-// the next level pops open immediately.
-
 const MAX_RBXASSET_RESULTS = 2000;
 
 export interface RbxAssetChild {
@@ -742,12 +619,6 @@ export interface RbxAssetChild {
   isFolder: boolean;
 }
 
-/**
- * Derive the immediate children (one path segment deep) of `committedDir`
- * from the flat file list. A child is a *folder* when some file lives
- * deeper under it, a *file* when a file ends exactly at this level.
- * Pure — unit-tested.
- */
 export function computeRbxAssetChildren(
   files: string[],
   committedDir: string
@@ -768,7 +639,6 @@ export function computeRbxAssetChildren(
   const out: RbxAssetChild[] = [];
   for (const name of folders) {out.push({ name, isFolder: true });}
   for (const name of fileNames) {out.push({ name, isFolder: false });}
-  // Folders first, then files; alphabetical within each group.
   out.sort((a, b) =>
     a.isFolder === b.isFolder
       ? a.name.localeCompare(b.name)
@@ -797,8 +667,6 @@ export class RbxAssetCompletionProvider
     const files = await getContentFiles();
     if (files.length === 0) {return undefined;}
 
-    // Split the typed path into the committed directory (up to and
-    // including the last `/`) and the partial segment being typed.
     const typedPath = before.slice(RBXASSET_PREFIX.length);
     const lastSlash = typedPath.lastIndexOf("/");
     const committedDir =
@@ -808,8 +676,7 @@ export class RbxAssetCompletionProvider
     const children = computeRbxAssetChildren(files, committedDir);
     if (children.length === 0) {return undefined;}
 
-    // Replace only the partial segment — selecting a child appends to
-    // the committed dir rather than rewriting the whole path.
+    // Replace only the partial segment, preserving the selected directory.
     const range = new vscode.Range(
       document.positionAt(offset - partial.length),
       position
@@ -827,11 +694,10 @@ export class RbxAssetCompletionProvider
       item.filterText = label;
       item.insertText = label;
       item.range = range;
-      // Folders sort first; keep the explorer-like ordering stable
-      // regardless of VS Code's own label sort.
+      // Keep folders first regardless of VS Code's label sorting.
       item.sortText = `${child.isFolder ? "0" : "1"}_${child.name.toLowerCase()}`;
       if (child.isFolder) {
-        // Pop the next level open immediately after accepting a folder.
+        // Accepting a folder opens the next level.
         item.command = {
           command: "editor.action.triggerSuggest",
           title: "",
@@ -844,7 +710,6 @@ export class RbxAssetCompletionProvider
   }
 }
 
-// Exposed for tests.
 export const _internal = {
   RBXTHUMB_SCAN_RE,
   CONTENT_EXTENSIONS,

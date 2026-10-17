@@ -16,39 +16,7 @@ import { detectFrameworkForDocument } from "./activeFramework";
 import { getConfig } from "./configCompat";
 import { fusionSnippetBody } from "./fusionSnippets";
 
-// ============================================================================
-// Luix snippets — context-aware completion items
-// ============================================================================
-//
-// These used to live in `snippets/luix.code-snippets` as static VS Code
-// snippets. Static snippets have no context awareness: VS Code's fuzzy
-// matcher fires them anywhere their prefix's chars appear, so typing
-// `Fra` inside a string surfaced every `*Frame` snippet, typing `r`
-// inside a string surfaced `reactEvent` / `rfc` / `useRef`, and typing
-// `eFra` at a prop-key slot offered to expand into a full
-// createElement call. Migrated to dynamic completions so we can gate
-// by code mask + prop-key position + enabled frameworks.
-//
-// Gates applied per `kind` (as of 1.5.0):
-//
-//   - `element`  — Framework-gated to the *active* framework for the
-//     document (per-file detection). Suppressed inside strings and at
-//     prop-key positions (except in Vide where inline children are
-//     valid props-table entries).
-//   - `hook`     — React-only (Roact 1.x has no hooks API). Statement-
-//     slot only — body is `local … = React.…`, would corrupt a table.
-//   - `scaffold` — Per-framework (rfc/rofc/nfc/vfc each gate to their
-//     own framework). Statement-slot only — body is a function decl.
-//   - `event`    — Per-framework (reactEvent/roactEvent/onEvent/
-//     videEvent). REQUIRES a props-table key position — body is a
-//     `[Key] = function() … end` table entry.
-//   - `state`    — Per-framework (Fusion Value/Computed/…, Vide
-//     source/derive/…). Statement-slot only — body is `local … = …`.
-//   - `expr`     — Framework-agnostic (cfangles, cfanglesrad).
-//     Suppressed inside strings; surfaces in any UI file.
-//   - `computed` — Generated dynamically inside `[…]` keys; framework-
-//     specific bodies (React.Event / Roact.Event / OnEvent / OnChange
-//     / Out) emitted only when active framework matches.
+// Gate snippets by the active framework and whether their bodies fit the cursor's syntax position.
 
 type SnippetKind =
   | "element"
@@ -60,22 +28,15 @@ type SnippetKind =
   | "state";
 
 interface LuixSnippet {
-  /** Trigger prefix shown as the completion label. */
   prefix: string;
-  /** What kind of snippet this is — drives the gating logic. */
   kind: SnippetKind;
-  /** Framework whose factory the snippet expands to. Required for
-   *  `kind: "element"`, ignored for the others (which use framework
-   *  buckets internally). */
+  /** Framework restriction, when applicable. */
   framework?: FrameworkId;
-  /** Snippet body (joined with `\n`). */
   body: string[];
-  /** Hover description. */
   description: string;
 }
 
 const SNIPPETS: LuixSnippet[] = [
-  // ---- React / Roact (parens form) ----
   {
     prefix: "eFrame",
     kind: "element",
@@ -260,7 +221,6 @@ const SNIPPETS: LuixSnippet[] = [
     ],
   },
 
-  // ---- Fusion (curried form, table-key children) ----
   {
     prefix: "nFrame",
     kind: "element",
@@ -312,7 +272,6 @@ const SNIPPETS: LuixSnippet[] = [
     ],
   },
 
-  // ---- Vide (curried form, inline children) ----
   {
     prefix: "cFrame",
     kind: "element",
@@ -362,7 +321,6 @@ const SNIPPETS: LuixSnippet[] = [
     ],
   },
 
-  // ---- Fusion — remaining element types to match React's 11-set ----
   {
     prefix: "nScrollingFrame",
     kind: "element",
@@ -497,7 +455,6 @@ const SNIPPETS: LuixSnippet[] = [
     ],
   },
 
-  // ---- Vide — remaining element types to match React's 11-set ----
   {
     prefix: "cScrollingFrame",
     kind: "element",
@@ -634,7 +591,6 @@ const SNIPPETS: LuixSnippet[] = [
     ],
   },
 
-  // ---- Roact — full 11-set (parens form, Roact.createElement) ----
   {
     prefix: "rFrame",
     kind: "element",
@@ -823,7 +779,6 @@ const SNIPPETS: LuixSnippet[] = [
     ],
   },
 
-  // ---- React / Roact hooks ----
   {
     prefix: "useState",
     kind: "hook",
@@ -865,7 +820,6 @@ const SNIPPETS: LuixSnippet[] = [
     ],
   },
 
-  // ---- Function component scaffolds — one per framework ----
   {
     prefix: "rfc",
     kind: "scaffold",
@@ -943,10 +897,6 @@ const SNIPPETS: LuixSnippet[] = [
     ],
   },
 
-  // ---- Per-framework event handler shorthand snippets ----
-  // Each fires only when that framework is active, so a Vide file
-  // won't surface `reactEvent` and a React file won't surface
-  // Fusion's `onEvent`.
   {
     prefix: "reactEvent",
     kind: "event",
@@ -992,12 +942,6 @@ const SNIPPETS: LuixSnippet[] = [
     ],
   },
 
-  // Computed-key starters (`React.Event.X` / `React.Change.X` inside
-  // `[…]`) are generated *dynamically* in the provider so the choice
-  // list reflects the actual element's events / properties — see the
-  // `inComputed` branch in `provideCompletionItems`.
-
-  // ---- Fusion state primitives ----
   {
     prefix: "value",
     kind: "state",
@@ -1075,7 +1019,6 @@ const SNIPPETS: LuixSnippet[] = [
     ],
   },
 
-  // ---- Vide state primitives ----
   {
     prefix: "source",
     kind: "state",
@@ -1173,7 +1116,6 @@ const SNIPPETS: LuixSnippet[] = [
     ],
   },
 
-  // ---- Framework-agnostic expressions ----
   {
     prefix: "cfangles",
     kind: "expr",
@@ -1200,34 +1142,19 @@ export class ElementSnippetCompletionProvider
     document: vscode.TextDocument,
     position: vscode.Position
   ): Promise<vscode.CompletionItem[] | undefined> {
-    // (0) Master toggle — `luix.snippets.enabled` (default true) turns
-    // off every Luix dynamic snippet (element / hook / scaffold / event
-    // / state / expr) for users who want a quieter completion list. The
-    // workspace-component completions (a separate provider) are
-    // unaffected.
     if (!getConfig<boolean>("snippets.enabled", true)) {return undefined;}
 
     const text = document.getText();
     const offset = document.offsetAt(position);
 
-    // (1) Gate: not inside a string literal. Applies to every snippet
-    // kind — `useEffect`, `cfangles`, `eFrame`, etc. — because none of
-    // them are valid inside a Lua string. The code mask flags string
-    // interiors as false; the partial's last char is at offset-1.
     if (offset > 0) {
       const mask = buildCodeMask(text);
       if (mask[offset - 1] === false) {return undefined;}
     }
 
-    // (1b) Computed-key context split. Inside an unclosed `[…]` we
-    // *only* fire the `computed` kind (which scaffolds the inner
-    // expression, e.g. `React.Event.Activated`); every other kind
-    // would either nest its own `[…]` (`reactEvent`) or land inside a
-    // key expression rather than at a fresh slot (`eFrame`, hooks).
-    // Outside `[…]`, we fire everything except `computed`.
+    // Inside computed keys, offer only key expressions, not statements or nested table entries.
     const inComputed = isInsideComputedKey(document, position);
 
-    // Walk back to find the partial identifier under the cursor.
     let identStart = offset;
     while (identStart > 0 && /[A-Za-z0-9_]/.test(text[identStart - 1])) {
       identStart--;
@@ -1235,15 +1162,11 @@ export class ElementSnippetCompletionProvider
     if (identStart === offset) {return undefined;}
     const partial = text.slice(identStart, offset);
 
-    // Skip member-access tails — `obj.eFrame` / `self:useState` should
-    // not surface the snippets.
     if (identStart > 0) {
       const ch = text[identStart - 1];
       if (ch === "." || ch === ":") {return undefined;}
     }
 
-    // Enclosing-call + prop-key-position lookups — used only by
-    // `element` snippets. Computed once and shared.
     const aliases = getAliasPartition();
     const enclosing = findEnclosingPropsCall(
       text,
@@ -1259,11 +1182,6 @@ export class ElementSnippetCompletionProvider
         ? findFrameworkForAlias(enclosing.alias)
         : undefined;
 
-    // Active framework for this document — detected per-file in 1.5+
-    // (previously every enabled framework's snippets surfaced
-    // simultaneously, polluting the dropdown). Hooks / scaffold /
-    // `reactEvent` / computed-key starters are React-or-Roact
-    // patterns; element snippets are framework-specific.
     const active = detectFrameworkForDocument(document).effective;
     if (!active) {return undefined;}
     const isReactish = active === "react" || active === "roact";
@@ -1276,13 +1194,7 @@ export class ElementSnippetCompletionProvider
     const out: vscode.CompletionItem[] = [];
     let idx = 0;
 
-    // ---- Inside `[…]` — dynamic React.Event / React.Change starters ----
-    //
-    // Build the choice list from the *actual element*'s events and
-    // properties (resolved through `resolveEffectiveClass`, which also
-    // handles user-defined components via `---@extends ClassName` /
-    // detected-base inference). Falls back to GuiObject for unknown
-    // classes so the snippet still does something useful.
+    // Use the resolved class for event and property choices; fall back to GuiObject.
     if (inComputed && enclosing) {
       const baseClass = await resolveEffectiveClass(
         enclosing.className,
@@ -1293,20 +1205,10 @@ export class ElementSnippetCompletionProvider
       const events = flattenClassEvents(resolved);
       const props = flattenClassProps(resolved);
       const eventChoices = events.length > 0 ? events : ["Activated"];
-      // VS Code's `${…|choice|}` snippet syntax doesn't tolerate `,`,
-      // `}` or `|` inside option names; class events / props never
-      // contain those, but escape defensively in case future data
-      // includes weird entries.
       const eventList = eventChoices.map(escapeChoice).join(",");
       const propList = (props.length > 0 ? props : ["Property"])
         .map(escapeChoice)
         .join(",");
-      // Per-framework computed-key starter forms:
-      //   • React  — `[React.Event.X]`, `[React.Change.X]`
-      //   • Roact  — `[Roact.Event.X]`, `[Roact.Change.X]`
-      //   • Fusion — `[OnEvent "X"]`, `[OnChange "X"]`, `[Out "X"]`
-      //   • Vide   — no computed-key event syntax (events are plain
-      //              prop keys via `eventsAsProps`); skip.
       if (active === "react") {
         pushComputed("React.Event", `React.Event.\${1|${eventList}|}$0`, `React.Event handler key — ${resolved} (${eventChoices.length} events)`);
         pushComputed("React.Change", `React.Change.\${1|${propList}|}$0`, `React.Change listener key — ${resolved} (${props.length} props)`);
@@ -1325,50 +1227,22 @@ export class ElementSnippetCompletionProvider
       }
     }
 
-    // STRUCTURAL POSITION — derived once for the per-kind gates below.
-    //
-    //   inPropsTableKey  = cursor is at a fresh key slot inside an open
-    //                      element call's props table. Snippets whose
-    //                      bodies are `[Key] = value` table entries
-    //                      (event shorthands) belong here, AND ONLY here.
-    //                      Snippets whose bodies are top-level Lua
-    //                      statements (`local x = …`, `function foo()`)
-    //                      would corrupt the table on accept and must
-    //                      stay out.
-    //
-    //   inStatementSlot  = the inverse — we're at function-body or
-    //                      module-level statement position, where
-    //                      `local` and `function` are valid.
-    //
-    // Without this gate the snippet menu happily surfaces `useState` /
-    // `value` / `source` / `rfc` / `nfc` inside `New "Frame" { val| }`
-    // and they accept as `local name = Value(nil)` — invalid Lua.
-    // Likewise the event shorthands `reactEvent` / `onEvent` etc. would
-    // surface at statement scope and accept as a bare `[Key] = …`,
-    // which is also a syntax error. Found in the 1.5.0 review.
+    // Table entries and Lua statements require separate snippet positions.
     const inPropsTableKey = !!(enclosing && atKey);
     const inStatementSlot = !inPropsTableKey;
 
     for (const snip of SNIPPETS) {
-      // Per-kind framework gating + prop-key + computed-key
-      // suppression. Computed-context split is enforced first so the
-      // existing switch only sees the relevant kinds.
       if (inComputed && snip.kind !== "computed") {continue;}
       if (!inComputed && snip.kind === "computed") {continue;}
 
       let allowed: boolean;
       switch (snip.kind) {
         case "element": {
-          // Framework must match the *active* one for this file —
-          // an `eFrame` snippet in a Vide file would brick the file
-          // when accepted, so the dropdown stays one-framework-clean.
           if (!snip.framework || snip.framework !== active) {
             allowed = false;
             break;
           }
-          // Prop-key position: only OK when the parent supports inline
-          // children (Vide). Otherwise we'd offer a snippet that would
-          // brick the table when accepted.
+          // Only inline-child frameworks allow element snippets at a prop-key position.
           if (
             enclosing &&
             atKey &&
@@ -1381,62 +1255,28 @@ export class ElementSnippetCompletionProvider
           break;
         }
         case "hook":
-          // React hooks (useState / useEffect / etc.). The bodies all
-          // start with `local … = React.…`, which only makes sense at
-          // a statement slot — never inside a props-table key.
-          //
-          // Gated to React-only (not Roact): Roact 1.x has no built-in
-          // hooks, and the common Roact-Hooks libraries expose a
-          // different API (`hooks.useState(...)` from the curried
-          // `Hooks.new(Roact)` factory) — surfacing `React.useState`
-          // for them would be wrong. A Roact user can still hand-roll
-          // the call.
-          //
-          // Also independently disable-able via `luix.snippets.hooks`
-          // for users who don't want the hook entries in their list.
+          // Roact 1.x has no built-in hooks API.
           allowed =
             active === "react" &&
             inStatementSlot &&
             getConfig<boolean>("snippets.hooks", true);
           break;
         case "event":
-          // Per-framework event-shorthand entries (reactEvent /
-          // roactEvent / onEvent / videEvent). Each declares its
-          // own `framework` so a Vide file won't surface `reactEvent`.
-          // Body is a `[Key] = function() … end,` table entry, so
-          // they only make sense AT a props-table key slot.
           allowed =
             !!snip.framework &&
             snip.framework === active &&
             inPropsTableKey;
           break;
         case "scaffold":
-          // Per-framework function-component scaffold (`rfc` / `rofc`
-          // / `nfc` / `vfc`). Each is gated to its own framework so
-          // a Vide file won't surface React's `rfc` and vice versa.
-          // Body is `local function Name(props) … end` — only valid
-          // at a statement slot, never inside a table key.
           allowed =
             !!snip.framework &&
             snip.framework === active &&
             inStatementSlot;
           break;
         case "expr":
-          // Framework-agnostic value expressions (`cfangles*`).
-          // Already protected from string context by the gate above;
-          // no further restriction.
           allowed = true;
           break;
         case "state": {
-          // Per-framework state primitives — Fusion `Value` /
-          // `Computed` / etc., Vide `source` / `derive` / etc. Only
-          // surface for the matching framework. Bodies are `local x
-          // = Value(…)` / `effect(function() … end)` style, which
-          // are statement-position constructs — never a props key.
-          //
-          // Independently disable-able via `luix.snippets.state` — the
-          // cross-framework parallel to `luix.snippets.hooks` (React's
-          // hooks are this category's equivalent).
           allowed =
             !!snip.framework &&
             snip.framework === active &&
@@ -1445,10 +1285,7 @@ export class ElementSnippetCompletionProvider
           break;
         }
         case "computed":
-          // Static `kind: "computed"` entries are currently absent
-          // (the computed-key starters are generated dynamically per
-          // framework above). Keep the branch wired so future
-          // additions don't fall through.
+          // Computed snippets are generated above; retain the gate for any static entries.
           allowed = !!snip.framework && snip.framework === active;
           break;
       }
@@ -1460,9 +1297,7 @@ export class ElementSnippetCompletionProvider
       );
       item.detail = snip.description;
       item.filterText = snip.prefix;
-      // Sort under luau-lsp's word matches but above the long
-      // alphabetical tail. Preserves the static-snippet ranking so
-      // muscle memory still works.
+      // Rank below language-server word matches.
       item.sortText = `08_${String(idx).padStart(4, "0")}`;
       item.range = wordRange;
       const body = snip.body.join("\n");
@@ -1476,12 +1311,6 @@ export class ElementSnippetCompletionProvider
   }
 }
 
-/**
- * Build a Luix completion item for a dynamic computed-key snippet
- * (`React.Event.<choice>` / `React.Change.<choice>`). The body is
- * generated from the resolved class's events / props so the choice
- * list reflects what's actually available on the element.
- */
 function makeComputedItem(
   label: string,
   detail: string,
@@ -1501,16 +1330,11 @@ function makeComputedItem(
   return item;
 }
 
-/** Escape a choice-list entry so the `${1|...|}` snippet syntax
- *  doesn't get confused by `,`, `|`, or `}` inside an event / prop
- *  name. Class data shouldn't contain those, but a `.replace` here
- *  is cheap insurance against future additions. */
+/** Escape separators and closing braces in VS Code snippet choices. */
 function escapeChoice(name: string): string {
   return name.replace(/[,|}\\]/g, (c) => "\\" + c);
 }
 
-// Exposed for tests so the suite can assert framework-specific bag
-// coverage without round-tripping through the VS Code completion API.
 export const _internal = {
   SNIPPETS: SNIPPETS as readonly LuixSnippet[],
 };

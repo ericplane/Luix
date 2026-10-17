@@ -1,14 +1,4 @@
-// Tiny zero-dependency text helpers shared by the gradient / rect /
-// hover-preview parsers. The parser.ts internal helpers stay private
-// because they're deeply tied to the masked-text caching there; these
-// versions operate on raw input strings.
-
-/**
- * Find the matching `)` for an `(` at `openIdx`. Returns `-1` if the
- * paren is never closed within the string. Does NOT handle escapes or
- * skip parens inside string literals — callers operating on potentially
- * stringful input should pre-mask the text.
- */
+/** Match parentheses or return -1; callers must mask strings first. */
 export function findMatchingParen(text: string, openIdx: number): number {
   let depth = 1;
   for (let i = openIdx + 1; i < text.length; i++) {
@@ -25,10 +15,7 @@ export function findMatchingParen(text: string, openIdx: number): number {
   return -1;
 }
 
-/**
- * Find the matching `}` for a `{` at `openIdx`. Same caveat as
- * `findMatchingParen` re: string literals.
- */
+/** Match braces or return -1; callers must mask strings first. */
 export function findMatchingBrace(text: string, openIdx: number): number {
   let depth = 1;
   for (let i = openIdx + 1; i < text.length; i++) {
@@ -45,10 +32,6 @@ export function findMatchingBrace(text: string, openIdx: number): number {
   return -1;
 }
 
-/**
- * Skip ASCII whitespace forward from `start` up to `end`. Returns the
- * first non-whitespace offset (or `end` if all whitespace).
- */
 export function skipWs(text: string, start: number, end: number): number {
   let i = start;
   while (i < end && /\s/.test(text[i])) {
@@ -57,10 +40,7 @@ export function skipWs(text: string, start: number, end: number): number {
   return i;
 }
 
-/**
- * Trim leading and trailing whitespace from a `[start, end)` slice,
- * returning a tightened range. Doesn't allocate a new string.
- */
+/** Trim a [start, end) range without allocating a string. */
 export function trimRange(
   text: string,
   start: number,
@@ -77,11 +57,7 @@ export function trimRange(
   return { start: s, end: e };
 }
 
-/**
- * Split a `[start, end)` range into comma-separated sub-ranges at
- * top-level depth (i.e. ignoring commas nested inside `()` or `{}`).
- * Each returned range is trimmed of leading/trailing whitespace.
- */
+/** Split and trim top-level arguments, ignoring commas nested in parentheses or braces. */
 export function splitTopLevelArgs(
   text: string,
   start: number,

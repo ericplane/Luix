@@ -1,8 +1,4 @@
-// Render assets/icon.svg to assets/icon.png at 128x128.
-//
-// Run with `npm run build-icon`. The VS Code Marketplace requires a PNG
-// icon, so we keep the SVG as the source of truth and produce the PNG as
-// a build artifact (committed alongside the source).
+// Render the SVG to the Marketplace's required 128x128 PNG.
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";

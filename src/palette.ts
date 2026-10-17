@@ -7,12 +7,7 @@ export function getPalette(): Palette {
   return getConfig<Palette>("palette", {}) ?? {};
 }
 
-/**
- * Provides completion items for `luix.palette` entries when the cursor
- * is right after `Color3.`. Accepting an entry replaces `Color3.` with
- * the full configured expression so the inserted text is the canonical
- * Color3 form, not a Luau-invalid `Color3.primary`.
- */
+/** Insert full configured expressions; palette names are not runtime Color3 members. */
 export class PaletteCompletionProvider
   implements vscode.CompletionItemProvider
 {
@@ -39,13 +34,7 @@ export class PaletteCompletionProvider
   }
 }
 
-/**
- * Built-in Color3 constructor completions — surfaced alongside palette
- * tokens when the cursor is right after `Color3.`. Each item replaces
- * the `Color3.` prefix with the full constructor call (with tab stops
- * on the channels) so the user can keep using the per-channel Tab
- * workflow.
- */
+/** Constructor snippets preserve per-channel tab stops. */
 function buildColor3Constructors(
   range: vscode.Range
 ): vscode.CompletionItem[] {
@@ -82,8 +71,7 @@ function buildColor3Constructors(
     );
     item.detail = c.detail;
     item.filterText = `Color3.${c.label}`;
-    // Constructors come before palette tokens in the list — they're the
-    // more common case for fresh values.
+    // List constructors before palette tokens.
     item.sortText = `0_${String(i).padStart(2, "0")}`;
     item.range = range;
     item.insertText = new vscode.SnippetString(c.insert);
@@ -99,8 +87,6 @@ export function buildPaletteCompletions(
   if (entries.length === 0) {
     return [];
   }
-  // Replace the trailing `Color3.` (7 chars) so the final inserted text
-  // is the canonical Color3.fromRGB(...) expression.
   const range = new vscode.Range(
     new vscode.Position(position.line, position.character - "Color3.".length),
     position
@@ -117,22 +103,12 @@ export function buildPaletteCompletions(
       `**Luix palette** — \`${name}\`\n\n\`${value}\``
     );
     item.filterText = `Color3.palette.${name}`;
-    // Palette tokens sort *after* the built-in constructors so the
-    // common-case `fromRGB` stays at the top of the list.
     item.sortText = `1_${String(index).padStart(4, "0")}`;
     return item;
   });
 }
 
-// ============================================================================
-// Design tokens beyond color — `luix.spacing` and `luix.fonts`
-// ============================================================================
-//
-// Mirror of the palette pattern. Type `UDim.` to surface
-// `luix.spacing` entries (each value is a full `UDim.new(...)`
-// expression), or `Font.` for `luix.fonts` entries (each value is a
-// full `Font.fromName(...)` / `Font.fromId(...)` expression). Empty by
-// default — opt-in via user config.
+// Offer configured spacing and font expressions alongside constructors.
 
 export class SpacingCompletionProvider
   implements vscode.CompletionItemProvider
@@ -237,9 +213,7 @@ export class FontsCompletionProvider
 }
 
 function buildFontConstructors(range: vscode.Range): vscode.CompletionItem[] {
-  // Configurable default family for the `Font.fromName(...)` snippet's
-  // first tab stop. Roblox aliases legacy `Gotham*` enum members to
-  // Montserrat under the hood, so Montserrat is the canonical pick.
+  // Roblox maps legacy Gotham fonts to Montserrat.
   const defaultFamily =
     getConfig<string>("font.defaultFamily", "Montserrat") || "Montserrat";
   const constructors = [

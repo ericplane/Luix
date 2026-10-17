@@ -9,24 +9,11 @@ import { getAliasPartition } from "./frameworks";
 import { getConfig } from "./configCompat";
 import { luaValueEnd } from "./editSyntax";
 
-// ============================================================================
-// Sort props by category — code action + on-save formatter.
-//
-// Each prop name is assigned to a category. Categories have an order
-// (configurable via `luix.sortProps.categoryOrder`). Within a category,
-// props are placed in their canonical order. Unknown props fall into
-// "Other" and keep their original relative order.
-//
-// Props are NOT sorted when the table contains comments — we don't try
-// to reattach them and don't want to lose the user's intent.
-// ============================================================================
+// Sort by category without moving comments or reordering unknown props.
 
 const PROP_CATEGORIES: Record<string, string[]> = {
-  // Identity / metadata props — typically first thing you read.
   Identification: ["Name", "ClassName", "Key", "Archivable"],
 
-  // Layout — anything that decides where the element lands and how big
-  // it is, including layout-item flex extras and size/aspect constraints.
   Layout: [
     "AnchorPoint",
     "Position",
@@ -90,7 +77,6 @@ const PROP_CATEGORIES: Record<string, string[]> = {
     "ScrollBarImageTransparency",
   ],
 
-  // Style — visual surface treatment.
   Style: [
     "BackgroundColor3",
     "BackgroundTransparency",
@@ -167,7 +153,6 @@ const PROP_CATEGORIES: Record<string, string[]> = {
     "TextEditable",
   ],
 
-  // Behavior — interaction / runtime / lifecycle.
   Behavior: [
     "Active",
     "Selectable",
@@ -233,7 +218,6 @@ const PROP_CATEGORIES: Record<string, string[]> = {
     "RollOffMaxDistance",
     "RollOffMinDistance",
     "RollOffMode",
-    // Misc
     "Animated",
     "Circular",
     "FillEmptySpaceColumns",
@@ -241,8 +225,7 @@ const PROP_CATEGORIES: Record<string, string[]> = {
     "Wraps",
   ],
 
-  // Events / Refs / Children / Other are catch-alls — populated by the
-  // categorize() rules below.
+  // Pattern-based categories are filled by categorize().
   Events: [],
   Refs: ["ref", "key"],
   Children: [],
@@ -269,14 +252,12 @@ interface Category {
 }
 
 function categorize(key: string, eventNames: ReadonlySet<string>): Category {
-  // Built-in explicit-prop categories
   for (const [name, props] of Object.entries(PROP_CATEGORIES)) {
     const idx = props.indexOf(key);
     if (idx >= 0) {
       return { name, position: idx };
     }
   }
-  // Pattern-based catch-alls
   if (key === "[Children]" || key === "children") {
     return { name: "Children", position: 0 };
   }
@@ -286,33 +267,22 @@ function categorize(key: string, eventNames: ReadonlySet<string>): Category {
   if (/^\[OnEvent/i.test(key) || /^\[OnChange/i.test(key)) {
     return { name: "Events", position: 0 };
   }
-  // Vide-style: event names as plain identifiers (Activated, MouseEnter, …)
+  // Vide uses plain event names as prop keys.
   if (eventNames.has(key)) {
     return { name: "Events", position: 0 };
   }
   return { name: "Other", position: 0 };
 }
 
-/** The call whose props table is being sorted — enough to pick the
- *  right event list. Callers pass the parser's `CreateElementCall`. */
 export interface SortTarget {
   className: string;
   isStringLiteralName: boolean;
 }
 
-// Classes whose events are unambiguously UI signals. Their union is the
-// fallback event list for custom components (whose base class we don't
-// resolve here): it covers everything the old hand-written regex did
-// without pulling in generic names like `Changed`, `Ended` or `Loaded`
-// that a component could legitimately take as an ordinary prop.
 const UI_EVENT_CLASSES = ["GuiBase2d", "GuiObject", "GuiButton", "TextBox"];
 let _uiEventNames: Set<string> | undefined;
 
-/**
- * Plain-identifier keys that count as events for `target`. A host class
- * gets its exact event list (so `Ended` is an event on a `VideoFrame`
- * and a plain prop elsewhere); anything else gets the UI-only fallback.
- */
+/** Host classes use their own event set; components use the UI fallback. */
 export function eventNamesForTarget(target?: SortTarget): ReadonlySet<string> {
   if (target && target.isStringLiteralName && classHierarchy[target.className]) {
     return new Set(flattenClassEvents(target.className));
@@ -325,21 +295,14 @@ export function eventNamesForTarget(target?: SortTarget): ReadonlySet<string> {
   return _uiEventNames;
 }
 
-// ============================================================================
-// Scanner — captures BOTH plain keys (`Name = …`) and computed keys
-// (`[React.Event.Activated] = …`). The shared `extractPropEntries`
-// skips computed keys, so we duplicate the small bit of parsing here.
-// ============================================================================
+// Include computed keys and positional children when scanning.
 interface SortableEntry {
-  /** The key text, or `""` for a positional entry. */
+  /** The key, or "" for positional entries. */
   key: string;
-  /** A keyless entry — Vide's inline children (`create "X" { … }`,
-   *  `Child(props)`) and action calls (`action(fn)`, `changed(…)`).
-   *  They travel with the sort so nothing is dropped, and land in the
-   *  Children slot in their original order. */
+  /** Positional children keep their relative order. */
   positional: boolean;
-  start: number; // offset of the key (or the expression) in the body
-  end: number;   // offset just after the value
+  start: number; // Body offset of the key or expression.
+  end: number;   // Exclusive end of the value.
 }
 
 function extractSortableEntries(body: string): SortableEntry[] {
@@ -349,7 +312,6 @@ function extractSortableEntries(body: string): SortableEntry[] {
   const pushPositional = (start: number) => {
     let end = luaValueEnd(body, start);
     if (end === start) {
-      // Nothing consumable here (a stray closer) — step over it.
       end = start + 1;
     } else if (body.slice(start, end).trim().length > 0) {
       entries.push({ key: "", positional: true, start, end });
@@ -357,7 +319,6 @@ function extractSortableEntries(body: string): SortableEntry[] {
     return end;
   };
   while (i < masked.length) {
-    // Skip whitespace + separators.
     while (i < masked.length && /[\s,;]/.test(masked[i])) {
       i++;
     }
@@ -367,7 +328,6 @@ function extractSortableEntries(body: string): SortableEntry[] {
     const start = i;
     let key: string;
     if (masked[i] === "[") {
-      // Computed key — match up to balanced `]`
       let depth = 1;
       let j = i + 1;
       while (j < masked.length && depth > 0) {
@@ -384,17 +344,13 @@ function extractSortableEntries(body: string): SortableEntry[] {
       }
       key = body.slice(ks, i);
     } else {
-      // Positional value (a string / table / call expression).
       i = pushPositional(start);
       continue;
     }
-    // Require '=' next.
     while (i < masked.length && /\s/.test(masked[i])) {
       i++;
     }
     if (masked[i] !== "=") {
-      // No assignment — the identifier starts a positional expression
-      // (`create "Frame" { … }`, `action(fn)`, `Child`).
       i = pushPositional(start);
       continue;
     }
@@ -408,9 +364,6 @@ function extractSortableEntries(body: string): SortableEntry[] {
   return entries;
 }
 
-// ============================================================================
-// Body-has-comments detection — we bail rather than risk losing comments.
-// ============================================================================
 function bodyHasComments(body: string): boolean {
   let i = 0;
   let inString: string | null = null;
@@ -440,9 +393,6 @@ function bodyHasComments(body: string): boolean {
   return false;
 }
 
-// ============================================================================
-// Main sort
-// ============================================================================
 export function sortPropsBody(
   body: string,
   categoryOrder: string[],
@@ -456,16 +406,13 @@ export function sortPropsBody(
   try {
     entries = extractSortableEntries(body);
   } catch {
-    // An incomplete callback or string is common while typing. Never turn
-    // uncertain syntax into a destructive on-save edit.
+    // Leave incomplete syntax untouched on save.
     return undefined;
   }
   if (entries.length < 2) {
     return undefined;
   }
 
-  // Detect the per-line indent — leading whitespace of the line that
-  // contains the first entry's key.
   const firstKeyStart = entries[0].start;
   let lineStart = firstKeyStart;
   while (lineStart > 0 && body[lineStart - 1] !== "\n") {
@@ -473,13 +420,9 @@ export function sortPropsBody(
   }
   const indent = body.slice(lineStart, firstKeyStart);
   if (!/^[ \t]*$/.test(indent)) {
-    // Something non-whitespace precedes the first entry on its line —
-    // probably `{` and `Name = …` on the same line. Bail; one-liners
-    // aren't worth reformatting.
     return undefined;
   }
 
-  // Trailing whitespace before the closing `}` — preserve as-is.
   const trailingMatch = /\n([ \t]*)$/.exec(body);
   const trailingIndent = trailingMatch ? trailingMatch[1] : "";
 
@@ -488,8 +431,6 @@ export function sortPropsBody(
   const fallbackOrder = catIndex.get("Other") ?? 999;
 
   const decorated = entries.map((e, originalIdx) => {
-    // Positional entries (inline children, action calls) sort as
-    // Children, keeping their relative order.
     const cat = e.positional
       ? { name: "Children", position: 0 }
       : categorize(e.key, eventNames);
@@ -503,7 +444,6 @@ export function sortPropsBody(
     return a.originalIdx - b.originalIdx;
   });
 
-  // No-op when already sorted.
   if (decorated.every((e, i) => e.originalIdx === i)) {
     return undefined;
   }
@@ -514,17 +454,7 @@ export function sortPropsBody(
   return "\n" + lines.join("\n") + "\n" + trailingIndent;
 }
 
-/**
- * Recursively sort a body together with every nested createElement
- * call's body, splicing the sorted nested bodies into the parent's
- * working copy *before* sorting the parent. Returns the fully sorted
- * body, or `undefined` when nothing in the subtree changed (so the
- * caller can skip emitting an edit).
- *
- * Children are spliced from end-to-start so each splice doesn't shift
- * the offsets of children we haven't visited yet — same trick the rest
- * of the codebase uses for in-place body edits.
- */
+/** Sort children from the end to preserve offsets; return undefined for a no-op. */
 interface SortableCall extends SortTarget {
   propsBraceStart: number;
   propsBraceEnd: number;
@@ -541,9 +471,7 @@ function sortBodyRecursive(
   let body = text.slice(bodyStart, bodyEnd);
   let changed = false;
 
-  // Calls strictly inside this body — both endpoints inside (bodyStart,
-  // bodyEnd) — then narrow to DIRECT children so we don't double-process
-  // grandchildren (they get handled when we recurse into the child).
+  // Recurse through direct children to avoid sorting descendants twice.
   const inside = allCalls.filter(
     (c) =>
       c.propsBraceStart > bodyStart && c.propsBraceEnd < bodyEnd
@@ -586,9 +514,6 @@ function sortBodyRecursive(
   return changed ? body : undefined;
 }
 
-// ============================================================================
-// Code action — manual "Sort props by category"
-// ============================================================================
 export class SortPropsCodeActionProvider
   implements vscode.CodeActionProvider
 {
@@ -605,18 +530,13 @@ export class SortPropsCodeActionProvider
       return undefined;
     }
     const text = document.getText();
-    // Fast reject: nothing to sort in a file without a table. Skips the
-    // full createElement-scan + cursor-walk for huge non-UI files when
-    // the user is just navigating around. (Only `{` is required — a
-    // Fusion/Vide file written entirely in call sugar, `New "Frame" { … }`,
-    // may not contain a single `(`.)
+    // Skip non-table files before parsing; Fusion/Vide sugar may omit parentheses.
     if (text.indexOf("{") === -1) {
       return undefined;
     }
     const cursor = document.offsetAt(range.start);
     const aliases = getAliasPartition();
     const calls = findAllCreateElementCalls(text, aliases);
-    // Smallest call whose props brace contains the cursor.
     let match: typeof calls[number] | undefined;
     for (const c of calls) {
       if (
@@ -669,10 +589,6 @@ export class SortPropsCodeActionProvider
   }
 }
 
-// ============================================================================
-// On-save formatter — runs across every props table in the document
-// when `luix.sortProps.onSave` is true (default false).
-// ============================================================================
 export class SortPropsOnSaveListener implements vscode.Disposable {
   private disposable: vscode.Disposable;
 
@@ -686,9 +602,7 @@ export class SortPropsOnSaveListener implements vscode.Disposable {
     if (!getConfig<boolean>("sortProps.onSave", false)) {
       return;
     }
-    // Skip non-disk saves (git, vscode-userdata, diff views, …). Those
-    // can still report `languageId === "lua"` but we shouldn't reshape
-    // them.
+    // Only rewrite saved file documents.
     if (event.document.uri.scheme !== "file") {
       return;
     }
@@ -719,13 +633,7 @@ export class SortPropsOnSaveListener implements vscode.Disposable {
       DEFAULT_CATEGORY_ORDER
     );
 
-    // Per-call edits used to overlap when an outer createElement
-    // contained inner ones (the canonical UI shape — `Frame` with
-    // children) — VS Code rejects overlapping TextEdits and aborts the
-    // whole save formatter, silently. Fix: only emit one edit per
-    // *outer-most* call; sortBodyRecursive splices the sorted nested
-    // bodies into the outer's body before we sort the outer itself, so
-    // a single non-overlapping edit covers the full tree.
+    // Emit one edit per outer call so nested replacements cannot overlap.
     const isStrictlyInside = (
       inner: { propsBraceStart: number; propsBraceEnd: number },
       outer: { propsBraceStart: number; propsBraceEnd: number }

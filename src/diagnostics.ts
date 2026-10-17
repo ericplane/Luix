@@ -44,27 +44,61 @@ export const DIAGNOSTIC_CODE = {
   CornerRadiusCollapsible: "luix.corner-radius-collapsible",
 } as const;
 
+const REFRESH_DELAY_MS = 200;
+/** Visible documents need only a brief coalescing delay. */
+const SHOWN_DELAY_MS = 30;
+/** Wait for quiet before linting unseen documents. */
+const BACKGROUND_DELAY_MS = 1000;
+const BACKGROUND_GAP_MS = 50;
+/** Maximum time per pass before yielding the event loop. */
+const PASS_SLICE_MS = 8;
+
+const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
 export class DiagnosticsManager implements vscode.Disposable {
   private collection: vscode.DiagnosticCollection;
   private disposables: vscode.Disposable[] = [];
   private debounceTimers = new Map<string, NodeJS.Timeout>();
+  private publishedVersions = new Map<string, number>();
+  /** A newer pass supersedes any older result for the same document. */
+  private passes = new Map<string, number>();
+  /** Run ready passes serially so their time slices do not accumulate in one event-loop turn. */
+  private ready = new Map<string, { document: vscode.TextDocument; background: boolean }>();
+  private working = false;
+  /** Unseen documents wait in arrival order until foreground work is idle. */
+  private background = new Map<string, vscode.TextDocument>();
+  private backgroundTimer: NodeJS.Timeout | undefined;
+  private disposed = false;
 
   constructor(private readonly workspaceIndex: WorkspaceIndex) {
     this.collection = vscode.languages.createDiagnosticCollection("luix");
     this.disposables.push(this.collection);
     this.disposables.push(
-      vscode.workspace.onDidOpenTextDocument((d) => {
-        void this.maybeRefresh(d);
+      vscode.workspace.onDidOpenTextDocument((d) => this.documentChanged(d)),
+      vscode.workspace.onDidChangeTextDocument((e) => this.documentChanged(e.document)),
+      vscode.window.onDidChangeVisibleTextEditors((editors) => {
+        for (const editor of editors) {
+          const doc = editor.document;
+          if (isLuaDocument(doc) && this.publishedVersions.get(doc.uri.toString()) !== doc.version) {
+            this.scheduleRefresh(doc, SHOWN_DELAY_MS);
+          }
+        }
       }),
-      vscode.workspace.onDidChangeTextDocument((e) =>
-        this.scheduleRefresh(e.document)
-      ),
-      vscode.workspace.onDidCloseTextDocument((d) =>
-        this.collection.delete(d.uri)
-      ),
+      vscode.workspace.onDidCloseTextDocument((d) => {
+        const key = d.uri.toString();
+        this.collection.delete(d.uri);
+        const timer = this.debounceTimers.get(key);
+        if (timer) {
+          clearTimeout(timer);
+          this.debounceTimers.delete(key);
+        }
+        this.ready.delete(key);
+        this.background.delete(key);
+        this.publishedVersions.delete(key);
+        this.passes.delete(key);
+      }),
       vscode.workspace.onDidChangeConfiguration((e) => {
         if (
-          // Diagnostic-feature toggles.
           configChangeAffects(e, "warnReservedPropNames") ||
           configChangeAffects(e, "deprecationDiagnostics") ||
           configChangeAffects(e, "autoImport") ||
@@ -72,10 +106,6 @@ export class DiagnosticsManager implements vscode.Disposable {
           configChangeAffects(e, "richText") ||
           configChangeAffects(e, "contrastWarnings") ||
           configChangeAffects(e, "unusedProps") ||
-          // Framework / alias keys — without these, enabling Vide at
-          // runtime wouldn't make `New "Frame" { … }` start linting
-          // until the next keystroke in each open file. Union with the
-          // list `WorkspaceIndex` watches so the two stay aligned.
           configChangeAffects(e, "frameworks") ||
           configChangeAffects(e, "react.aliases") ||
           configChangeAffects(e, "roact.aliases") ||
@@ -94,39 +124,225 @@ export class DiagnosticsManager implements vscode.Disposable {
 
   private refreshAllOpenDocuments(): void {
     for (const doc of vscode.workspace.textDocuments) {
-      void this.maybeRefresh(doc);
+      if (this.isWanted(doc)) {
+        this.scheduleRefresh(doc, 0);
+      } else {
+        this.queueBackground(doc);
+      }
     }
   }
 
-  private scheduleRefresh(document: vscode.TextDocument): void {
-    // Filter at scheduling time so non-Lua keystrokes don't spin up
-    // (and leak) debounce timers in `debounceTimers` forever.
-    if (document.languageId !== "lua" && document.languageId !== "luau") {
+  private documentChanged(document: vscode.TextDocument): void {
+    if (this.isWanted(document)) {
+      this.scheduleRefresh(document, REFRESH_DELAY_MS);
+    } else {
+      this.queueBackground(document);
+    }
+  }
+
+  private queueBackground(document: vscode.TextDocument): void {
+    if (!isLuaDocument(document) || document.isClosed || this.disposed) {
       return;
     }
     const key = document.uri.toString();
+    this.background.delete(key);
+    this.background.set(key, document);
+    this.scheduleBackground(BACKGROUND_DELAY_MS);
+  }
+
+  private scheduleBackground(delay: number): void {
+    if (this.backgroundTimer) {
+      clearTimeout(this.backgroundTimer);
+    }
+    this.backgroundTimer = setTimeout(() => {
+      this.backgroundTimer = undefined;
+      this.lintNextBackground();
+    }, delay);
+  }
+
+  /** Start background work only when no shown document is waiting. */
+  private lintNextBackground(): void {
+    if (this.disposed || this.background.size === 0) {
+      return;
+    }
+    if (this.debounceTimers.size > 0 || this.ready.size > 0 || this.working) {
+      this.scheduleBackground(BACKGROUND_DELAY_MS);
+      return;
+    }
+    const next = this.background.entries().next();
+    if (next.done) {
+      return;
+    }
+    const [key, document] = next.value;
+    this.background.delete(key);
+    this.enqueue(document, true);
+  }
+
+  private enqueue(document: vscode.TextDocument, background = false): void {
+    if (this.disposed) {
+      return;
+    }
+    const key = document.uri.toString();
+    if (!background) {
+      this.background.delete(key);
+    }
+    this.ready.delete(key);
+    this.ready.set(key, { document, background });
+    void this.work();
+  }
+
+  private shownPassWaiting(): boolean {
+    for (const entry of this.ready.values()) {
+      if (!entry.background) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private async work(): Promise<void> {
+    if (this.working) {
+      return;
+    }
+    this.working = true;
+    try {
+      // Let timers settle first so shown documents receive priority.
+      await yieldToEventLoop();
+      for (let next = this.takeReady(); next; next = this.takeReady()) {
+        const { document, background } = next;
+        // Pause background work when a shown document needs a pass.
+        const done = await this.maybeRefresh(document, background ? () => this.shownPassWaiting() : undefined);
+        if (!done && background && !document.isClosed && !this.ready.has(document.uri.toString())) {
+          this.queueBackground(document);
+        }
+        await yieldToEventLoop();
+      }
+    } finally {
+      this.working = false;
+    }
+    if (this.background.size > 0 && !this.backgroundTimer) {
+      this.scheduleBackground(BACKGROUND_GAP_MS);
+    }
+  }
+
+  /** Prefer shown documents, then foreground work, then oldest background work. */
+  private takeReady(): { document: vscode.TextDocument; background: boolean } | undefined {
+    if (this.disposed || this.ready.size === 0) {
+      return undefined;
+    }
+    let key: string | undefined;
+    if (this.ready.size > 1) {
+      const shown = new Set(vscode.window.visibleTextEditors.map((editor) => editor.document.uri.toString()));
+      let firstShown: string | undefined;
+      let firstWanted: string | undefined;
+      for (const [candidate, entry] of this.ready) {
+        if (shown.has(candidate)) {
+          firstShown = candidate;
+          break;
+        }
+        if (!entry.background) {
+          firstWanted ??= candidate;
+        }
+      }
+      key = firstShown ?? firstWanted;
+    }
+    key ??= this.ready.keys().next().value as string;
+    const entry = this.ready.get(key);
+    this.ready.delete(key);
+    return entry;
+  }
+
+  /** Prioritize visible tabs and documents already carrying diagnostics. */
+  private isWanted(document: vscode.TextDocument): boolean {
+    if (!isLuaDocument(document)) {
+      return false;
+    }
+    const key = document.uri.toString();
+    if (this.publishedVersions.has(key)) {
+      return true;
+    }
+    if (vscode.window.visibleTextEditors.some((editor) => editor.document.uri.toString() === key)) {
+      return true;
+    }
+    for (const group of vscode.window.tabGroups?.all ?? []) {
+      for (const tab of group.tabs) {
+        const input = tab.input;
+        if (input instanceof vscode.TabInputText && input.uri.toString() === key) {
+          return true;
+        }
+        if (
+          input instanceof vscode.TabInputTextDiff &&
+          (input.original.toString() === key || input.modified.toString() === key)
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private scheduleRefresh(document: vscode.TextDocument, delay: number): void {
+    // Reject non-Lua documents before allocating debounce timers.
+    if (!isLuaDocument(document) || this.disposed) {
+      return;
+    }
+    const key = document.uri.toString();
+    this.background.delete(key);
     const existing = this.debounceTimers.get(key);
     if (existing) {
       clearTimeout(existing);
     }
     const t = setTimeout(() => {
       this.debounceTimers.delete(key);
-      void this.maybeRefresh(document);
-    }, 200);
+      this.enqueue(document);
+    }, delay);
     this.debounceTimers.set(key, t);
   }
 
-  private async maybeRefresh(document: vscode.TextDocument): Promise<void> {
-    if (document.languageId !== "lua" && document.languageId !== "luau") {
-      return;
+  /** Return false only when yielding to foreground work; stale edits schedule their own replacement pass. */
+  private async maybeRefresh(document: vscode.TextDocument, giveWay?: () => boolean): Promise<boolean> {
+    if (!isLuaDocument(document) || document.isClosed) {
+      return true;
     }
-    const diags = await this.computeDiagnostics(document);
+    const key = document.uri.toString();
+    const pass = (this.passes.get(key) ?? 0) + 1;
+    this.passes.set(key, pass);
+    const version = document.version;
+    const isStale = () =>
+      this.disposed || document.isClosed || document.version !== version ||
+      this.passes.get(key) !== pass;
+    let gaveWay = false;
+    const stop = giveWay
+      ? () => isStale() || (gaveWay = giveWay())
+      : isStale;
+    let diags: vscode.Diagnostic[] | undefined;
+    try {
+      diags = await this.computeDiagnostics(document, stop);
+    } catch {
+      // One failed rule must not stop later passes.
+      return true;
+    }
+    if (!diags || isStale()) {
+      return !gaveWay;
+    }
     this.collection.set(document.uri, diags);
+    this.publishedVersions.set(key, version);
+    return true;
   }
 
+  /** Yield between rule families; return undefined when the pass becomes stale. */
   private async computeDiagnostics(
-    document: vscode.TextDocument
-  ): Promise<vscode.Diagnostic[]> {
+    document: vscode.TextDocument,
+    isStale: () => boolean = () => false
+  ): Promise<vscode.Diagnostic[] | undefined> {
+    let sliceStart = Date.now();
+    const pause = async (): Promise<boolean> => {
+      if (Date.now() - sliceStart >= PASS_SLICE_MS) {
+        await yieldToEventLoop();
+        sliceStart = Date.now();
+      }
+      return isStale();
+    };
     const warnReserved = getConfig<boolean>(
       "warnReservedPropNames",
       false
@@ -140,13 +356,23 @@ export class DiagnosticsManager implements vscode.Disposable {
     const text = document.getText();
     const diagnostics: vscode.Diagnostic[] = [];
 
+    // Prepare shared analysis in stages to keep large files from holding the event loop.
+    applyMask(text, buildCodeMask(text));
+    if (await pause()) {return undefined;}
+    scanDocument(text, getAliasPartition());
+    if (await pause()) {return undefined;}
+    findDocumentCalls(text, this.workspaceIndex);
+    if (await pause()) {return undefined;}
+
     if (warnReserved) {
       diagnostics.push(...computeReservedNameDiagnostics(text));
+      if (await pause()) {return undefined;}
     }
     if (warnDeprecation) {
       diagnostics.push(
         ...computeDeprecationDiagnostics(text, document, this.workspaceIndex)
       );
+      if (await pause()) {return undefined;}
     }
     if (autoImport.enabled) {
       diagnostics.push(
@@ -156,15 +382,19 @@ export class DiagnosticsManager implements vscode.Disposable {
           this.workspaceIndex
         ))
       );
+      if (await pause()) {return undefined;}
     }
     if (getConfig<boolean>("propValidation.enabled", true)) {
       diagnostics.push(...computePropValidationDiagnostics(text, document, this.workspaceIndex));
+      if (await pause()) {return undefined;}
     }
     if (getConfig<boolean>("richText.enabled", true)) {
       diagnostics.push(...computeMissingRichTextDiagnostics(text, document, this.workspaceIndex));
+      if (await pause()) {return undefined;}
     }
     if (getConfig<boolean>("contrastWarnings.enabled", false)) {
       diagnostics.push(...computeContrastDiagnostics(text, document, this.workspaceIndex));
+      if (await pause()) {return undefined;}
     }
     if (getConfig<boolean>("unusedProps.enabled", true)) {
       diagnostics.push(...computeUnusedPropDiagnostics(text, document));
@@ -174,14 +404,25 @@ export class DiagnosticsManager implements vscode.Disposable {
   }
 
   dispose(): void {
+    this.disposed = true;
     for (const t of this.debounceTimers.values()) {
       clearTimeout(t);
     }
     this.debounceTimers.clear();
+    if (this.backgroundTimer) {
+      clearTimeout(this.backgroundTimer);
+      this.backgroundTimer = undefined;
+    }
+    this.background.clear();
+    this.ready.clear();
     for (const d of this.disposables) {
       d.dispose();
     }
   }
+}
+
+function isLuaDocument(document: vscode.TextDocument): boolean {
+  return document.languageId === "lua" || document.languageId === "luau";
 }
 
 async function computeMissingImportDiagnostics(
@@ -239,6 +480,7 @@ async function computeMissingImportDiagnostics(
 function computeReservedNameDiagnostics(text: string): vscode.Diagnostic[] {
   const out: vscode.Diagnostic[] = [];
   const scan = scanDocument(text, getAliasPartition());
+  let lines: string[] | undefined;
 
   for (const info of scan.values()) {
     const base = info.annotations.extendsClass ?? info.detectedBase;
@@ -255,7 +497,7 @@ function computeReservedNameDiagnostics(text: string): vscode.Diagnostic[] {
       continue;
     }
 
-    const lines = text.split("\n");
+    lines ??= text.split("\n");
     for (let i = info.defLineIndex - 1; i >= 0; i--) {
       const line = lines[i];
       const m = /^(\s*)---\s*@prop\s+([A-Za-z_]\w*)/.exec(line);
@@ -296,20 +538,10 @@ function computeDeprecationDiagnostics(
   const out: vscode.Diagnostic[] = [];
   const masked = applyMask(text, buildCodeMask(text));
 
-  // Compute every props-table range *once* up front instead of doing a
-  // backward brace-walk per regex match. The old `findEnclosingPropsCall`
-  // dispatch inside the loop was O(matches × N) per keystroke on big
-  // files; this is O(N + matches·log(C)).
   const propsRanges = collectPropsRanges(findDocumentCalls(text, workspaceIndex));
   const inProps = (offset: number) => containedIn(propsRanges, offset);
 
-  // `Font` is deprecated in favour of `FontFace` — flag ANY assignment
-  // to it (`Font = Enum.Font.X`, `Font = "Gotham"`, `Font = someVar`),
-  // not just the enum-literal form. Scoped to classes that actually
-  // HAVE a `Font` property (the text family) via `isDeprecatedValidProp`
-  // — on other classes `Font` is genuinely unknown and the prop
-  // validator handles it. The quick-fix only offers the auto-convert for
-  // the `Enum.Font.X` form (see `DeprecationCodeActionProvider`).
+  // Deprecate all Font assignments on text classes; only enum literals support automatic conversion.
   for (const call of findDocumentCalls(text, workspaceIndex)) {
     if (
       !(call.isStringLiteralName || call.isDirectInstanceCall) ||
@@ -345,7 +577,6 @@ function computeDeprecationDiagnostics(
     }
   }
 
-  // `TextColor = ...` (missing the trailing `3`) inside a props table.
   const typoRe = /(?<![A-Za-z0-9_])TextColor(?!\d)\s*=/g;
   let t: RegExpExecArray | null;
   while ((t = typoRe.exec(masked)) !== null) {
@@ -371,13 +602,7 @@ function computeDeprecationDiagnostics(
   return out;
 }
 
-/**
- * Sorted intervals (by `start`) of every props-table body in the
- * document — one entry per createElement-style call that has a props
- * brace. Built once per diagnostic recompute and queried via
- * `containedIn` for each diagnostic regex match. Replaces a per-match
- * `findEnclosingPropsCall` walk that was O(matches × document).
- */
+/** Props-table intervals sorted by start offset. */
 interface PropsRange {
   start: number;
   end: number;
@@ -400,12 +625,6 @@ function collectPropsRanges(
   return out;
 }
 
-/**
- * Binary-search containment check — returns true iff `offset` is
- * inside at least one of the (sorted-by-start) ranges. Used by the
- * diagnostic regex loops above; runs in O(log N) per query versus the
- * old O(N) brace walk.
- */
 function containedIn(ranges: PropsRange[], offset: number): boolean {
   let lo = 0;
   let hi = ranges.length - 1;
@@ -420,10 +639,7 @@ function containedIn(ranges: PropsRange[], offset: number): boolean {
       return true;
     }
   }
-  // Nested calls mean ranges can overlap — if the binary search landed
-  // in a sibling, walk back through any earlier range that still
-  // contains the offset. In practice this loops at most O(nesting
-  // depth) ≈ 5-10.
+  // Nested calls overlap, so an earlier range may still contain the offset.
   for (let i = Math.min(lo, ranges.length - 1); i >= 0; i--) {
     const r = ranges[i];
     if (r.start <= offset && offset <= r.end) {return true;}
@@ -431,10 +647,6 @@ function containedIn(ranges: PropsRange[], offset: number): boolean {
   }
   return false;
 }
-
-// ============================================================================
-// Prop validation — unknown / duplicate / wrong-enum / overridden-by-component
-// ============================================================================
 
 export function computePropValidationDiagnostics(
   text: string,
@@ -464,7 +676,6 @@ export function computePropValidationDiagnostics(
       continue;
     }
 
-    // ---- Duplicate keys ----
     const seen = new Map<string, number>();
     for (const entry of entries) {
       const prev = seen.get(entry.key);
@@ -484,10 +695,7 @@ export function computePropValidationDiagnostics(
       }
     }
 
-    // ---- UICorner: CornerRadius vs individual corner radii ----
-    // `CornerRadius` sets all four corners and overrides the individual
-    // `BottomLeftRadius` / … properties, so setting both is a mistake —
-    // the individual ones silently do nothing. Flag each dead one.
+    // CornerRadius overrides all individual corner radii.
     if ((call.isStringLiteralName || call.isDirectInstanceCall) && call.className === "UICorner") {
       const overridden = new Set(
         cornerRadiusConflicts(entries.map((e) => e.key))
@@ -509,11 +717,6 @@ export function computePropValidationDiagnostics(
           out.push(d);
         }
       } else {
-        // No conflict — if all four individual radii are equal (and
-        // there's no CornerRadius), suggest collapsing them into one
-        // `CornerRadius`, the way the AnchorPoint hint nudges a fix. The
-        // quick-fix (in DeprecationCodeActionProvider) reads the stashed
-        // value and replaces this range.
         const plan = planUICornerRefactor(
           entries.map((e) => ({
             key: e.key,
@@ -543,15 +746,9 @@ export function computePropValidationDiagnostics(
       }
     }
 
-    // ---- Unknown / wrong-enum (Roblox host class only) ----
     if ((call.isStringLiteralName || call.isDirectInstanceCall) && defaultPropsMap[call.className]) {
       const known = new Set(flattenClassProps(call.className));
-      // Frameworks that take events as plain table keys (Vide:
-      // `Activated = function() … end`) put event names in the same
-      // props table. Completion already merges them (see
-      // `completion.ts`); mirror that here so they aren't flagged
-      // "Unknown property" (issue #4). React/Roact/Fusion spell events
-      // as computed keys, which the entry scanner never yields.
+      // Vide event names are valid plain props; computed event keys are excluded by the scanner.
       const framework = call.isDirectInstanceCall ? FRAMEWORKS.vide
         : call.alias ? findFrameworkForAlias(call.alias) : undefined;
       if (framework?.eventsAsProps) {
@@ -559,18 +756,13 @@ export function computePropValidationDiagnostics(
           known.add(event);
         }
       }
-      // Fusion / Vide mount by setting `Parent` in the same table
-      // (`New "ScreenGui" { Parent = playerGui }`). `Parent` is
-      // deliberately absent from `classHierarchy` (React/Roact users
-      // shouldn't be offered it), so accept it here per framework.
+      // Parent is accepted per framework rather than through the shared class hierarchy.
       if (framework?.parentAsProp) {
         known.add("Parent");
       }
       for (const entry of entries) {
         if (known.has(entry.key)) {
-          // Check enum type, if we know one. Use class-aware lookup so
-          // props with class-specific types (e.g. Frame.Style vs
-          // GuiButton.Style) get the right expected enum.
+          // Prop types can differ by class, such as Frame.Style and GuiButton.Style.
           const expected = getPropType(call.className, entry.key);
           if (expected && expected.startsWith("Enum.")) {
             const valueText = propsBody
@@ -592,15 +784,10 @@ export function computePropValidationDiagnostics(
           }
           continue;
         }
-        // Unknown — but skip framework-special keys.
         if (isFrameworkSpecialKey(entry.key)) {
           continue;
         }
-        // Skip deprecated-but-valid props (e.g. `Font` on text classes).
-        // They're real properties kept out of the suggestion list to
-        // nudge `FontFace`, but the code is valid — flagging them
-        // "Unknown property" is a false positive (issue #2). The
-        // separate deprecation diagnostic handles the migration hint.
+        // Deprecated properties remain valid; the deprecation rule handles their migration hints.
         if (isDeprecatedValidProp(call.className, entry.key)) {
           continue;
         }
@@ -610,10 +797,7 @@ export function computePropValidationDiagnostics(
         let msg = suggestion
           ? `Unknown property \`${entry.key}\` on \`${call.className}\`. Did you mean \`${suggestion}\`?`
           : `Unknown property \`${entry.key}\` on \`${call.className}\`.`;
-        // `Parent` is a real property; it's flagged here only because
-        // React/Roact don't take it as a prop. Say so rather than
-        // leaving the user to wonder why a property they can see in
-        // the Roblox docs is "unknown".
+        // Parent is real, but React/Roact mount through roots or portals.
         if (entry.key === "Parent" && framework && !framework.parentAsProp) {
           msg = `Unknown property \`Parent\` on \`${call.className}\`. ${
             framework.id === "roact" ? "Roact" : "React"
@@ -630,7 +814,6 @@ export function computePropValidationDiagnostics(
       }
     }
 
-    // ---- Numeric-range warnings ----
     for (const entry of entries) {
       const range = NUMERIC_RANGES[entry.key];
       if (!range) {continue;}
@@ -653,7 +836,6 @@ export function computePropValidationDiagnostics(
       }
     }
 
-    // ---- Missing AnchorPoint (Position uses scale 0.5 or 1) ----
     {
       const posEntry = entries.find((e) => e.key === "Position");
       const apEntry = entries.find((e) => e.key === "AnchorPoint");
@@ -672,8 +854,7 @@ export function computePropValidationDiagnostics(
           );
           d.code = DIAGNOSTIC_CODE.MissingAnchorPoint;
           d.source = "luix";
-          // Stash the suggested AnchorPoint values on the diagnostic so
-          // the quick-fix doesn't have to re-parse the Position value.
+          // Carry the suggested values to the quick-fix without reparsing.
           (d as vscode.Diagnostic & { _luixData?: unknown })._luixData = {
             anchorX: detected.x,
             anchorY: detected.y,
@@ -683,7 +864,6 @@ export function computePropValidationDiagnostics(
       }
     }
 
-    // ---- Overridden-by-component ----
     if (!call.isStringLiteralName && !call.isDirectInstanceCall) {
       const component = components.get(
         call.className.split(".").pop() ?? call.className
@@ -712,14 +892,7 @@ export function computePropValidationDiagnostics(
   return out;
 }
 
-/**
- * Inspect a Position RHS expression and return the scale pair if either
- * channel is `0.5` or `1` — those land the element's top-left at the
- * center / far edge, which is almost never what the author meant
- * without a matching AnchorPoint. Returns undefined for
- * `UDim2.fromOffset(...)` (no scale at all) and for `(0, 0)` scales
- * (already aligns with the default AnchorPoint).
- */
+/** Return scale channels at 0.5 or 1, where a matching AnchorPoint is usually needed. */
 function detectExtremeScale(
   value: string
 ): { x: number; y: number } | undefined {
@@ -750,12 +923,7 @@ function formatPair(p: { x: number; y: number }): string {
   return `${fmt(p.x)}, ${fmt(p.y)}`;
 }
 
-/**
- * Per-prop sensible numeric bounds. Anything outside warns. The ranges
- * are conservative — most are exact Roblox limits, a few (Rotation,
- * ZIndex) are "almost certainly a typo" thresholds rather than hard
- * caps.
- */
+/** Mostly Roblox limits; Rotation and ZIndex bounds are conservative typo thresholds. */
 const NUMERIC_RANGES: Record<string, { min: number; max: number }> = {
   BackgroundTransparency: { min: 0, max: 1 },
   TextTransparency: { min: 0, max: 1 },
@@ -775,15 +943,7 @@ const NUMERIC_RANGES: Record<string, { min: number; max: number }> = {
   LayoutOrder: { min: -1_000_000, max: 1_000_000 },
 };
 
-// ============================================================================
-// Color contrast warnings (WCAG)
-// ============================================================================
-//
-// Off by default. When enabled, scan each Text element's `TextColor3`
-// against the nearest ancestor's `BackgroundColor3` and warn if the
-// WCAG-AA contrast ratio is below 4.5:1 (the spec's threshold for
-// "normal text"). Both colors must be literal Color3 expressions —
-// reactive Fusion `Value`/`Computed` and Vide sources are skipped.
+// WCAG AA contrast threshold for normal text.
 
 const WCAG_AA_THRESHOLD = 4.5;
 
@@ -797,8 +957,6 @@ export function computeContrastDiagnostics(
   if (calls.length === 0) {return out;}
   const tree = buildCallTree(calls);
 
-  // Walk the tree, carrying the nearest ancestor `BackgroundColor3`
-  // down to each Text* element.
   const visit = (
     node: CallTreeNode,
     inheritedBg: { r: number; g: number; b: number } | undefined
@@ -806,8 +964,7 @@ export function computeContrastDiagnostics(
     const host = node.call.isStringLiteralName || node.call.isDirectInstanceCall;
     const ownBg = readColor3Prop(node.call, text, "BackgroundColor3");
     const transparency = readTransparency(node.call, text, "BackgroundTransparency");
-    // Custom components and runtime opacity values hide the actual background.
-    // A fully transparent element carries the visible ancestor color through.
+    // Custom components and runtime opacity obscure the background; transparent hosts inherit it.
     const bgForChildren = !host ? undefined
       : transparency === 1 ? inheritedBg
         : compositeColor(ownBg, inheritedBg, transparency);
@@ -941,22 +1098,12 @@ function contrastRatio(
   return (lighter + 0.05) / (darker + 0.05);
 }
 
-/**
- * Keys that aren't real Roblox properties but appear in framework
- * idioms — `[Children]`, `[React.Event.X]`, `[React.Change.X]`, etc.
- * These show up as positional `[expr] = …` entries in the props table
- * (already filtered out by `extractPropEntries`), but identifier-shaped
- * keys like `Children` (Fusion's bare-name form) need an explicit pass.
- */
+/** Computed keys are filtered by the scanner; bare framework keys still need an exemption. */
 function isFrameworkSpecialKey(key: string): boolean {
   return key === "Children" || key === "key" || key === "ref";
 }
 
-/**
- * Levenshtein distance with an early exit. Returns the prop name that
- * differs from `input` by at most `max` edits, or undefined if no
- * candidate is close enough.
- */
+/** Find the nearest prop name within max edits, or return undefined. */
 function closestMatch(
   input: string,
   candidates: Set<string>
@@ -1010,15 +1157,6 @@ function levenshtein(a: string, b: string, limit: number): number {
   return prev[n];
 }
 
-// ============================================================================
-// Missing-RichText warning
-// ============================================================================
-//
-// If a props table sets `Text = "<...rich tags...>"` but the same table
-// doesn't enable `RichText = true`, Roblox renders the tags as literal
-// characters. We catch the obvious cases here so it stops biting people
-// on first paste-from-docs.
-
 const RICH_TEXT_TAG_PATTERN =
   /<\s*\/?\s*(b|i|u|s|sc|smallcaps|uppercase|sub|sup|comment|br|font|stroke|mark)\b/i;
 
@@ -1045,18 +1183,13 @@ export function computeMissingRichTextDiagnostics(
     );
 
     let textEntry: { keyStart: number; keyEnd: number } | undefined;
-    // Suppress the warning whenever `RichText` appears at all — it
-    // might be `true`, a Fusion `Value`, a Vide source, or a `Computed`
-    // expression. We can't statically tell what those resolve to, and a
-    // false positive is worse than a missed catch here.
+    // RichText may be reactive, so any explicit value suppresses this warning.
     let hasRichTextKey = false;
     for (const entry of entries) {
       if (entry.key === "Text") {
         const value = propsBody
           .slice(entry.valueStart, entry.valueEnd)
           .trim();
-        // Only flag string-literal Text values; if Text is a variable
-        // or function call we can't tell what's inside, so stay silent.
         const isStringLiteral =
           (value.startsWith('"') && value.endsWith('"')) ||
           (value.startsWith("'") && value.endsWith("'")) ||
@@ -1085,19 +1218,7 @@ export function computeMissingRichTextDiagnostics(
   return out;
 }
 
-// ============================================================================
-// Unused-prop diagnostic
-//
-// For each component defined in the document, gather its declared props
-// (from the parameter's type annotation or the `@luix-props` comment),
-// then scan the body for `props.<Name>` / `props["<Name>"]` accesses. Any
-// declared prop that's never read is flagged as Unnecessary (greyed-out
-// like an unused-import in TS).
-//
-// Skipped when the component forwards `props` wholesale (e.g.
-// `e(Base, props)`, `for k, v in props do`) since we can't tell which
-// props the downstream code reads.
-// ============================================================================
+// Skip unused-prop warnings when the entire props table is forwarded.
 function computeUnusedPropDiagnostics(
   text: string,
   document: vscode.TextDocument
@@ -1139,7 +1260,6 @@ function computeUnusedPropDiagnostics(
 
     const used = collectPropAccesses(bodyMasked, bodyOriginal, paramName);
 
-    // Locate each declared prop's position in the type annotation, if any.
     const typeAnnotation =
       component.paramTypeStart !== undefined &&
       component.paramTypeEnd !== undefined
@@ -1151,8 +1271,6 @@ function computeUnusedPropDiagnostics(
       if (used.has(prop)) {
         continue;
       }
-      // Try to find the prop's declaration in the type annotation so
-      // the squiggle/grey-out lands on the field name itself.
       let range: vscode.Range | undefined;
       if (typeAnnotation) {
         const re = new RegExp(
@@ -1168,7 +1286,6 @@ function computeUnusedPropDiagnostics(
         }
       }
       if (!range) {
-        // Fall back to the function definition line.
         const line = document.lineAt(component.defLineIndex);
         range = line.range;
       }
@@ -1188,12 +1305,7 @@ function computeUnusedPropDiagnostics(
   return out;
 }
 
-/**
- * Returns `true` if the component body uses `paramName` in a way that
- * prevents us from statically determining which props are read — e.g.
- * passing the table itself as an argument, iterating it, or indexing
- * with a non-literal key.
- */
+/** Detect forwarding or dynamic indexing that prevents proving which props are read. */
 function forwardsPropsWholesale(
   bodyMasked: string,
   bodyOriginal: string,
@@ -1204,12 +1316,10 @@ function forwardsPropsWholesale(
   const len = bodyMasked.length;
   let m: RegExpExecArray | null;
   while ((m = re.exec(bodyMasked)) !== null) {
-    // Walk forward without slicing (slicing in a loop turns this into
-    // O(N^2) on large bodies).
+    // Avoid repeated slicing, which makes large-body scans quadratic.
     let i = m.index + paramName.length;
     while (i < len) {
       const ch = bodyMasked.charCodeAt(i);
-      // Skip ASCII whitespace inline.
       if (ch === 32 || ch === 9 || ch === 10 || ch === 13) {
         i++;
         continue;
@@ -1221,9 +1331,7 @@ function forwardsPropsWholesale(
       continue;
     }
     if (c === "[") {
-      // Allow only static-string bracket access (handled later in
-      // `collectPropAccesses`). Anything else (computed keys, numeric
-      // indices) is wholesale forwarding.
+      // Only static string keys can be tracked; other indexing counts as wholesale forwarding.
       let j = i + 1;
       while (j < len) {
         const ch = bodyOriginal.charCodeAt(j);
@@ -1244,11 +1352,6 @@ function forwardsPropsWholesale(
   return false;
 }
 
-/**
- * Collect every prop name read off of `paramName`:
- *   - `paramName.Foo`
- *   - `paramName["Foo"]` / `paramName['Foo']` / `paramName[\`Foo\`]`
- */
 function collectPropAccesses(
   bodyMasked: string,
   bodyOriginal: string,
@@ -1266,8 +1369,7 @@ function collectPropAccesses(
     used.add(m[1]);
   }
 
-  // Bracket access with a static string key. The masked body has the
-  // string interior blanked, so read from the original text instead.
+  // Read string keys from the original text because masking removes their contents.
   const bracketRe = new RegExp(
     `(?<![A-Za-z0-9_])${pn}\\s*\\[\\s*(["'\`])([^"'\`\\n]+)\\1\\s*\\]`,
     "g"

@@ -7,18 +7,6 @@ import {
 } from "./activeFramework";
 import { FrameworkId, getEnabledFrameworks } from "./frameworks";
 
-// ============================================================================
-// Status-bar item — "Luix: <framework>" with click-to-pick
-// ============================================================================
-//
-// Always-visible (in Lua / Luau files) indicator of which framework
-// Luix considers active for the current document, and a one-click
-// picker to override.
-//
-// Right-aligned at priority 100 so it sits near other language
-// indicators rather than getting buried in the left status bar with
-// errors and git info.
-
 const FRAMEWORK_LABELS: Record<FrameworkId, string> = {
   react: "React",
   roact: "Roact",
@@ -43,9 +31,7 @@ export class ActiveFrameworkStatusBar implements vscode.Disposable {
   private item: vscode.StatusBarItem;
   private disposables: vscode.Disposable[] = [];
   private refreshTimer: NodeJS.Timeout | undefined;
-  // Set in `dispose()` so post-await callers (the async workspace-
-  // fallback refresh in extension.ts, debounced refresh timers) skip
-  // touching the StatusBarItem after VS Code has disposed it.
+  // Guard async refreshes after disposal.
   private disposed = false;
 
   constructor() {
@@ -56,9 +42,6 @@ export class ActiveFrameworkStatusBar implements vscode.Disposable {
     this.item.command = PICK_COMMAND;
     this.disposables.push(this.item);
 
-    // Refresh whenever the user moves between files or the active
-    // file's content changes (debounced — typing fires
-    // onDidChangeTextDocument hundreds of times).
     this.disposables.push(
       vscode.window.onDidChangeActiveTextEditor(() => this.refresh()),
       vscode.workspace.onDidChangeTextDocument((e) => {
@@ -68,9 +51,6 @@ export class ActiveFrameworkStatusBar implements vscode.Disposable {
       }),
       vscode.workspace.onDidChangeConfiguration((e) => {
         if (e.affectsConfiguration("luix")) {
-          // Override changed — bust the per-document cache so every
-          // subsequent detection picks up the new override, then
-          // refresh the label.
           resetDocumentDetectionCache();
           this.refresh();
         }
@@ -80,7 +60,6 @@ export class ActiveFrameworkStatusBar implements vscode.Disposable {
     this.refresh();
   }
 
-  /** Public re-render — useful after a setWorkspaceFallback() call. */
   refresh(): void {
     if (this.disposed) {return;}
     const editor = vscode.window.activeTextEditor;
@@ -89,14 +68,6 @@ export class ActiveFrameworkStatusBar implements vscode.Disposable {
       return;
     }
     const detection = detectFrameworkForDocument(editor.document);
-    // Three visual states — distinct so a user can tell "Luix found
-    // nothing" apart from "Luix is in auto mode and found React".
-    //   - effective set                                 → "Luix: React" with namespace icon
-    //   - effective undefined, override is "auto"       → "Luix: —" with circle-slash icon
-    //                                                     (UI signals are off, no snippets fire)
-    // Previously both cases rendered as "Luix: Auto" with no visual
-    // distinction — confusing when snippets silently stopped working
-    // in a brand-new empty file.
     const fwName = detection.effective
       ? FRAMEWORK_LABELS[detection.effective]
       : "—";
@@ -106,9 +77,6 @@ export class ActiveFrameworkStatusBar implements vscode.Disposable {
       `**Luix active framework: ${fwName}**`,
       `*(${SOURCE_LABELS[detection.source]})*`,
     ];
-    // Only show "auto-detection would pick X" when the override is
-    // actually overriding something different — otherwise it's a
-    // redundant restatement of the active framework.
     if (
       detection.source === "override" &&
       detection.detected &&
@@ -119,9 +87,7 @@ export class ActiveFrameworkStatusBar implements vscode.Disposable {
         `Auto-detection would pick **${FRAMEWORK_LABELS[detection.detected]}**.`
       );
     }
-    // Warn when the user's override names a framework that isn't in
-    // `luix.frameworks` — readOverride() ignores those, but the
-    // setting itself still has the value, so we have to tell them.
+    // Report disabled overrides even though detection ignores them.
     const requested = readActiveFrameworkSetting();
     if (
       requested &&
@@ -158,24 +124,13 @@ export class ActiveFrameworkStatusBar implements vscode.Disposable {
     this.disposables = [];
   }
 
-  /** True after dispose() — callers chained off async work check this
-   *  before calling refresh() to avoid touching a disposed item. */
   isDisposed(): boolean {
     return this.disposed;
   }
 }
 
-/**
- * Command: prompt the user to pick a framework override, then write
- * it to `luix.activeFramework` at workspace scope. Falls back to
- * global scope when no workspace is open (with an explicit notice so
- * the user understands the scope they just bound).
- */
 export async function pickActiveFrameworkCommand(): Promise<void> {
   type Pick = vscode.QuickPickItem & { value: ActiveFrameworkChoice };
-  // Current selection + the auto-detected framework for the active
-  // editor, so each option's description shows what it'll do
-  // *relative to now* — and the current value is marked.
   const current = vscode.workspace
     .getConfiguration("luix")
     .get<ActiveFrameworkChoice>("activeFramework", "auto");
@@ -257,9 +212,7 @@ export async function pickActiveFrameworkCommand(): Promise<void> {
     return;
   }
 
-  // Loud notification when writing to Global scope — otherwise a user
-  // investigating one standalone .luau file who picks Roact has
-  // silently set Roact globally for every other project they open.
+  // Make the global scope explicit when no workspace is open.
   if (!hasWorkspace) {
     void vscode.window.showInformationMessage(
       `Luix: active framework set globally to ${
@@ -276,9 +229,7 @@ export async function pickActiveFrameworkCommand(): Promise<void> {
     });
   }
 
-  // Warn when the chosen framework isn't in `luix.frameworks` — the
-  // override would be ignored downstream (readOverride() filters), so
-  // the user would otherwise see no behaviour change at all.
+  // A disabled framework would make this override ineffective.
   if (
     choice.value !== "auto" &&
     !enabledIds.has(choice.value as FrameworkId)

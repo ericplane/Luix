@@ -7,11 +7,7 @@ import {
 } from "./config";
 import { DIAGNOSTIC_CODE } from "./diagnostics";
 import { WorkspaceIndex } from "./workspaceIndex";
-import { analyzeLuaBindings } from "./editSyntax";
-
-// ============================================================================
-// Auto-import code action (opt-in)
-// ============================================================================
+import { documentLuaBindings } from "./fusionSnippets";
 
 export class AutoImportCodeActionProvider
   implements vscode.CodeActionProvider
@@ -170,18 +166,7 @@ function findImportInsertionLine(text: string): number {
   return 0;
 }
 
-// ============================================================================
-// Deprecation quick fixes — Font → FontFace, TextColor → TextColor3
-// ============================================================================
-
-/**
- * Extract the `Enum.Font.X` family name from a `Font = …` snippet, or
- * `undefined` when the value isn't an enum literal (a string like
- * `"Gotham"`, a variable, …). The `Font` deprecation warning fires for
- * every value form, but only the enum-literal form can be auto-converted
- * to `FontFace = Font.fromName(...)` — other forms return `undefined`
- * here so no (value-discarding) fix is offered. Pure — unit-tested.
- */
+/** Only Enum.Font literals can be converted without discarding the value. */
 export function extractDeprecatedFontEnum(snippet: string): string | undefined {
   const m = /Font\s*=\s*Enum\.Font\.([A-Za-z_]\w*)/.exec(snippet);
   return m ? m[1] : undefined;
@@ -232,11 +217,6 @@ export class DeprecationCodeActionProvider
     return actions;
   }
 
-  /**
-   * Insert `AnchorPoint = Vector2.new(x, y),` right above the flagged
-   * Position key, matching its indentation. Coordinates come from the
-   * diagnostic's stashed payload to avoid re-parsing.
-   */
   private missingAnchorPointFix(
     document: vscode.TextDocument,
     diag: vscode.Diagnostic
@@ -270,12 +250,6 @@ export class DeprecationCodeActionProvider
     return action;
   }
 
-  /**
-   * Collapse four equal individual corner radii into a single
-   * `CornerRadius`. The diagnostic's range already spans the four
-   * entries and its `_luixData.value` carries the shared value, so the
-   * fix is a one-line replace.
-   */
   private collapseCornerRadiusFix(
     document: vscode.TextDocument,
     diag: vscode.Diagnostic
@@ -301,11 +275,6 @@ export class DeprecationCodeActionProvider
     return action;
   }
 
-  /**
-   * Insert `RichText = true,` right before the `Text` key, picking up
-   * whatever indentation the existing line already uses so the result
-   * formats cleanly.
-   */
   private missingRichTextFix(
     document: vscode.TextDocument,
     diag: vscode.Diagnostic
@@ -328,11 +297,7 @@ export class DeprecationCodeActionProvider
     return action;
   }
 
-  /**
-   * "Did you mean `Position`?" → replaces the unknown key with the
-   * suggested one. The suggestion is parsed back out of the diagnostic
-   * message so we don't have to recompute Levenshtein here.
-   */
+  /** Reuse the diagnostic's suggested property name. */
   private unknownPropFix(
     document: vscode.TextDocument,
     diag: vscode.Diagnostic
@@ -357,12 +322,6 @@ export class DeprecationCodeActionProvider
     document: vscode.TextDocument,
     diag: vscode.Diagnostic
   ): vscode.CodeAction | undefined {
-    // Only auto-convert the `Enum.Font.X` form, where we can map the
-    // enum to the right `Font.fromName(family, weight)`. For any other
-    // value (`Font = "Gotham"`, a variable, …) we can't build the
-    // replacement reliably — and silently substituting a default would
-    // discard the user's value — so offer no fix. The deprecation
-    // warning still stands.
     const enumName = extractDeprecatedFontEnum(document.getText(diag.range));
     if (!enumName) {
       return undefined;
@@ -395,10 +354,6 @@ export class DeprecationCodeActionProvider
     return action;
   }
 }
-
-// ============================================================================
-// Convert Color3 between fromRGB / fromHex / new / fromHSV
-// ============================================================================
 
 import {
   applyMask,
@@ -475,9 +430,7 @@ export class Color3ConvertCodeActionProvider
       if (originalText === form.text) {
         continue;
       }
-      // Skip forms that match the *kind* (so we don't offer `fromRGB`
-      // when the literal already uses fromRGB but with different
-      // whitespace).
+      // Do not offer the current constructor with different whitespace.
       if (originalText.includes(`Color3.${form.id}`)) {
         continue;
       }
@@ -517,16 +470,7 @@ function rgbToHsv(
   return { h, s, v: max };
 }
 
-// ============================================================================
-// Color3 → luix.palette extractor
-// ============================================================================
-//
-// Cursor on a Color3 literal → *Save to `luix.palette`* code action.
-// Prompts for a token name and writes the literal (in its existing
-// form) to the user's `luix.palette` setting. The token then surfaces
-// in the `Color3.` completion list everywhere — no rewrite of the
-// existing literal itself, since Lua has no runtime `palette` table
-// for `palette.primary` references to resolve through.
+// Palette tokens insert full expressions; no runtime palette table exists.
 
 export class Color3PaletteExtractorProvider
   implements vscode.CodeActionProvider
@@ -559,10 +503,6 @@ export class Color3PaletteExtractorProvider
   }
 }
 
-// ============================================================================
-// Convert UDim2 between new / fromOffset / fromScale
-// ============================================================================
-
 export class UDim2ConvertCodeActionProvider
   implements vscode.CodeActionProvider
 {
@@ -576,8 +516,7 @@ export class UDim2ConvertCodeActionProvider
   ): vscode.ProviderResult<vscode.CodeAction[]> {
     const text = document.getText();
     const cursor = document.offsetAt(range.start);
-    // Find UDim2 calls on the cursor's line so we don't scan the
-    // entire document for every code-action request.
+    // Limit UDim2 scans to the cursor's line.
     const lineStart = text.lastIndexOf("\n", cursor - 1) + 1;
     const lineEnd = text.indexOf("\n", cursor);
     const slice = text.slice(lineStart, lineEnd === -1 ? text.length : lineEnd);
@@ -673,17 +612,13 @@ function fmt(n: number): string {
   return Number.isInteger(n) ? n.toString() : n.toString();
 }
 
-// ============================================================================
-// Wrap-in code actions — Frame / ScrollingFrame / Container w/ UIListLayout
-// ============================================================================
-//
-// Pick an element at the cursor and replace it with a wrapper of one of
-// three flavours, keeping the original as the wrapper's only child.
-// Framework-aware — emits parens-form (`e(...)`) or curried-form
-// (`New "..." {...}`, `create "..." {...}`) based on whichever factory
-// the inner element already uses.
-
 type WrapKind = "Frame" | "ScrollingFrame" | "ListContainer";
+
+class WrapCodeAction extends vscode.CodeAction {
+  constructor(title: string, readonly buildEdit: () => vscode.WorkspaceEdit) {
+    super(title, vscode.CodeActionKind.RefactorRewrite);
+  }
+}
 
 export class WrapInCodeActionProvider
   implements vscode.CodeActionProvider
@@ -691,6 +626,14 @@ export class WrapInCodeActionProvider
   static readonly providedCodeActionKinds = [
     vscode.CodeActionKind.RefactorRewrite,
   ];
+
+  /** Resolve edits lazily to avoid parsing Fusion bindings on every cursor move. */
+  resolveCodeAction(action: vscode.CodeAction): vscode.CodeAction {
+    if (action instanceof WrapCodeAction && !action.edit) {
+      action.edit = action.buildEdit();
+    }
+    return action;
+  }
 
   provideCodeActions(
     document: vscode.TextDocument,
@@ -702,19 +645,7 @@ export class WrapInCodeActionProvider
     const aliases = getAliasPartition();
     const calls = findAllCreateElementCalls(text, aliases);
 
-    // Two cases to handle:
-    //
-    //   (a) Cursor / selection within a SINGLE element — wrap that one.
-    //       Strategy: smallest call whose range contains the selection.
-    //
-    //   (b) Selection spans MULTIPLE sibling elements — wrap them as a
-    //       group. Otherwise we'd wrap their common parent, which is
-    //       what the user just complained about.
-    //
-    // Detect (b) by collecting calls *fully inside* the selection, then
-    // keeping only the top-level ones (no other in-selection call
-    // contains them). If at least one such top-level exists, wrap them.
-    // Otherwise fall back to (a).
+    // Wrap selected siblings together; otherwise choose the smallest enclosing call.
     const inSelection = calls.filter(
       (c) => c.aliasStart >= selStart && c.fullEnd <= selEnd
     );
@@ -753,17 +684,11 @@ export class WrapInCodeActionProvider
     const first = targets[0];
     const last = targets[targets.length - 1];
 
-    // Framework detection uses the first target's alias — siblings in
-    // the same children list always share an alias anyway.
     const aliasText = first.alias ?? "";
     const spec = findFrameworkForAlias(aliasText);
     const curried = spec?.callShape === "curried";
-    // The wrapper this action emits has to re-state any receiver the
-    // wrapped call used, or a Fusion 0.3 `scope:New` becomes a bare
-    // `New` with no scope to construct into.
     const aliasName = (first.receiver ?? "") + aliasText;
-    // Preserve both constructor stages, including explicit Fusion scope
-    // arguments and optional parentheses around the props table.
+    // Preserve explicit scope arguments and both constructor stages.
     const constructor = curried && first.propsBraceStart !== undefined && first.propsBraceEnd !== undefined
       ? {
         open: (className: string) => text.slice(first.aliasStart, first.classNameStart) +
@@ -772,9 +697,13 @@ export class WrapInCodeActionProvider
         close: text.slice(first.propsBraceEnd + 1, first.fullEnd),
       }
       : { open: (className: string) => `${aliasName} "${className}" {`, close: "" };
-    const childrenKey = spec?.id === "fusion"
-      ? childrenKeyForWrapper(text, first.aliasStart, spec.childrenKey)
-      : spec?.childrenKey;
+    // Resolve the Children key once for the selected action.
+    let childrenKey: { value: string | undefined } | undefined;
+    const childrenKeyValue = () => (childrenKey ??= {
+      value: spec?.id === "fusion"
+        ? childrenKeyForWrapper(text, first.aliasStart, spec.childrenKey)
+        : spec?.childrenKey,
+    }).value;
 
     const innerText = text.slice(first.aliasStart, last.fullEnd);
     const replaceRange = new vscode.Range(
@@ -787,59 +716,64 @@ export class WrapInCodeActionProvider
 
     const actions: vscode.CodeAction[] = [];
     for (const kind of ["Frame", "ScrollingFrame", "ListContainer"] as WrapKind[]) {
-      const wrapped = renderWrapper(
-        kind,
-        aliasName,
-        curried,
-        childrenKey,
-        innerText,
-        baseIndent,
-        stepIndent,
-        constructor,
-        text.includes("\r\n") ? "\r\n" : "\n"
-      );
-      const action = new vscode.CodeAction(
-        wrapTitle(kind),
-        vscode.CodeActionKind.RefactorRewrite
-      );
-      action.edit = new vscode.WorkspaceEdit();
-      action.edit.replace(document.uri, replaceRange, wrapped);
-      actions.push(action);
+      actions.push(new WrapCodeAction(wrapTitle(kind), () => {
+        const wrapped = renderWrapper(
+          kind,
+          aliasName,
+          curried,
+          childrenKeyValue(),
+          innerText,
+          baseIndent,
+          stepIndent,
+          constructor,
+          text.includes("\r\n") ? "\r\n" : "\n"
+        );
+        const edit = new vscode.WorkspaceEdit();
+        edit.replace(document.uri, replaceRange, wrapped);
+        return edit;
+      }));
     }
     return actions;
   }
 }
 
-/** Reuse a visible Children alias or a qualified key already used in this
- * scope. Do not invent a new scope or assume an unrelated function's alias. */
+/** Reuse a Children key visible in this scope. */
 function childrenKeyForWrapper(text: string, offset: number, fallback?: string): string | undefined {
-  try {
-    const parsed = analyzeLuaBindings(text);
-    const visible = parsed.bindings.filter(b => b.activeFrom <= offset && b.scope.start <= offset && b.scope.end >= offset)
-      .sort((a, b) => b.scope.start - a.scope.start || b.declaration.start - a.declaration.start);
-    const nearest = new Map<string, typeof visible[number]>();
-    for (const binding of visible) {
-      if (!nearest.has(binding.name)) {nearest.set(binding.name, binding);}
+  // Keep the configured key when lexical analysis is unavailable.
+  const parsed = documentLuaBindings(text);
+  if (!parsed) {
+    return fallback;
+  }
+  const visible = parsed.bindings.filter(b => b.activeFrom <= offset && b.scope.start <= offset && b.scope.end >= offset)
+    .sort((a, b) => b.scope.start - a.scope.start || b.declaration.start - a.declaration.start);
+  const nearest = new Map<string, typeof visible[number]>();
+  for (const binding of visible) {
+    if (!nearest.has(binding.name)) {nearest.set(binding.name, binding);}
+  }
+  for (const binding of nearest.values()) {
+    if (/^\s*=\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\.Children(?=\s*(?:[;\r\n]|$))/.test(text.slice(binding.declaration.end))) {
+      return binding.name;
     }
-    for (const binding of nearest.values()) {
-      if (/^\s*=\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\.Children(?=\s*(?:[;\r\n]|$))/.test(text.slice(binding.declaration.end))) {
-        return binding.name;
+  }
+  const tokens = parsed.tokens;
+  let referenceAt: Map<number, (typeof parsed.references)[number]> | undefined;
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i].value !== "[" || tokens[i + 1]?.kind !== "word") {continue;}
+    let j = i + 2;
+    while (tokens[j]?.value === "." && tokens[j + 1]?.kind === "word") {j += 2;}
+    if (tokens[j]?.value !== "]" || tokens[j + 1]?.value !== "=" || tokens[j - 1]?.value !== "Children") {continue;}
+    const base = tokens[i + 1];
+    if (!referenceAt) {
+      referenceAt = new Map();
+      for (const reference of parsed.references) {
+        if (!referenceAt.has(reference.token.start)) {
+          referenceAt.set(reference.token.start, reference);
+        }
       }
     }
-    const tokens = parsed.tokens;
-    for (let i = 0; i < tokens.length; i++) {
-      if (tokens[i].value !== "[" || tokens[i + 1]?.kind !== "word") {continue;}
-      let j = i + 2;
-      while (tokens[j]?.value === "." && tokens[j + 1]?.kind === "word") {j += 2;}
-      if (tokens[j]?.value !== "]" || tokens[j + 1]?.value !== "=" || tokens[j - 1]?.value !== "Children") {continue;}
-      const base = tokens[i + 1];
-      const reference = parsed.references.find(r => r.token.start === base.start);
-      if (reference?.binding !== nearest.get(base.value)) {continue;}
-      return text.slice(base.start, tokens[j - 1].end);
-    }
-  } catch {
-    // The constructor can still be preserved in files with unsupported type
-    // syntax; keep the configured key instead of guessing lexical ownership.
+    const reference = referenceAt.get(base.start);
+    if (reference?.binding !== nearest.get(base.value)) {continue;}
+    return text.slice(base.start, tokens[j - 1].end);
   }
   return fallback;
 }
@@ -897,14 +831,13 @@ function renderWrapper(
         childIndent + `}${constructor.close},`
       );
     }
-    // Preserve every byte of the selected call, including multiline strings.
+    // Do not reindent multiline string contents.
     lines.push(childIndent + inner.trimStart() + ",");
     if (childrenKey) {
       lines.push(innerIndent + `},`);
     }
     lines.push(baseIndent + `}${constructor.close}`);
   } else {
-    // Parens form (e / React.createElement / Roact.createElement).
     lines.push(`${alias}("${wrapperClass}", {`);
     for (const p of baseProps) {
       lines.push(innerIndent + p);

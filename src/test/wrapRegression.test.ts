@@ -10,10 +10,13 @@ async function wraps(text: string): Promise<Map<string, string>> {
   const at = text.indexOf("TextLabel") + 2;
   assert.ok(at >= 2);
   const position = document.positionAt(at);
-  const actions = await new WrapInCodeActionProvider().provideCodeActions(document, new vscode.Range(position, position));
+  const provider = new WrapInCodeActionProvider();
+  const actions = await provider.provideCodeActions(document, new vscode.Range(position, position));
   assert.ok(actions && actions.length === 3);
+  // Resolve the action to build its edit.
+  assert.ok(actions.every(action => action.edit === undefined));
   return new Map(actions.map(action => {
-    const edits = action.edit?.get(document.uri);
+    const edits = provider.resolveCodeAction(action).edit?.get(document.uri);
     assert.ok(edits && edits.length === 1);
     return [action.title, applyTextChanges(text, edits.map(edit => ({
       start: document.offsetAt(edit.range.start), end: document.offsetAt(edit.range.end), text: edit.newText,

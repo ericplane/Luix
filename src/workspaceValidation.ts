@@ -1,22 +1,7 @@
 import * as vscode from "vscode";
 import { configChangeAffects, getConfig } from "./configCompat";
 
-// ============================================================================
-// Workspace-wide validation aggregator
-// ============================================================================
-//
-// Off by default. When enabled, periodically walks every Lua/Luau file
-// in the workspace and tallies the diagnostics VS Code has recorded
-// for them (Luix's own diagnostics + anything else that publishes to
-// the editor). Surfaces an `N warnings · M errors across X files`
-// summary the sidebar can show.
-//
-// Cheap because we only LOOK at existing diagnostics; we don't run our
-// computation against unopened files. VS Code lazily produces
-// diagnostics for opened-but-since-closed documents and keeps them
-// around per URI. For documents that have never been opened in the
-// session, their count stays at zero (an honest understatement until
-// the user touches them).
+// Aggregate published diagnostics only; unopened files may have none.
 
 export interface ValidationSummary {
   warnings: number;
@@ -56,9 +41,6 @@ export class WorkspaceValidation implements vscode.Disposable {
 
   private scheduleRefresh(): void {
     if (this.refreshTimer) {clearTimeout(this.refreshTimer);}
-    // Aggressively debounced — diagnostic events fire constantly while
-    // the user types and the totals don't change meaningfully per
-    // keystroke.
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = undefined;
       this.refresh();
@@ -81,8 +63,6 @@ export class WorkspaceValidation implements vscode.Disposable {
     let fileCount = 0;
     for (const [uri, diags] of vscode.languages.getDiagnostics()) {
       if (!vscode.workspace.getWorkspaceFolder(uri)) {continue;}
-      // Only count Lua/Luau files. The languageId isn't directly
-      // available on the URI alone, so we filter by extension.
       const fsPath = uri.fsPath;
       if (!fsPath.endsWith(".lua") && !fsPath.endsWith(".luau")) {
         continue;

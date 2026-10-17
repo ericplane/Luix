@@ -7,13 +7,6 @@ import { getAliasPartition } from "./frameworks";
 import { getConfig } from "./configCompat";
 import { findMatchingParen } from "./textUtils";
 
-// ============================================================================
-// Visual hover previews — TweenInfo easing curves, UIPadding box,
-// UICorner radius, UIStroke thickness. Each renders a small SVG as a
-// data URI inside the markdown hover, so the user sees what the value
-// actually looks like without leaving the editor.
-// ============================================================================
-
 export class UIHoverPreviewsProvider implements vscode.HoverProvider {
   provideHover(
     document: vscode.TextDocument,
@@ -25,13 +18,11 @@ export class UIHoverPreviewsProvider implements vscode.HoverProvider {
     const text = document.getText();
     const offset = document.offsetAt(position);
 
-    // 1) TweenInfo.new(...) anywhere under the cursor.
     const tween = tryTweenInfoHover(text, offset, document);
     if (tween) {
       return tween;
     }
 
-    // 2) Cursor on the className of e("UIPadding"|"UICorner"|"UIStroke", …).
     const elem = tryElementPreviewHover(text, offset, document);
     if (elem) {
       return elem;
@@ -40,9 +31,6 @@ export class UIHoverPreviewsProvider implements vscode.HoverProvider {
   }
 }
 
-// ---------------------------------------------------------------------------
-// TweenInfo
-// ---------------------------------------------------------------------------
 const TWEEN_INFO_RE = /\bTweenInfo\.new\s*\(/g;
 
 function tryTweenInfoHover(
@@ -50,13 +38,9 @@ function tryTweenInfoHover(
   offset: number,
   document: vscode.TextDocument
 ): vscode.Hover | undefined {
-  // Fast reject: skip the regex scan entirely for documents that don't
-  // mention TweenInfo at all (the common case in pure-UI files).
   if (!text.includes("TweenInfo.new")) {
     return undefined;
   }
-  // Scan backwards & forwards for the nearest TweenInfo.new(...) call
-  // whose range contains the cursor.
   TWEEN_INFO_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = TWEEN_INFO_RE.exec(text)) !== null) {
@@ -94,7 +78,6 @@ interface ParsedTweenInfo {
 
 function parseTweenInfoArgs(argsText: string): ParsedTweenInfo {
   // TweenInfo.new(time, style?, direction?, repeatCount?, reverses?, delayTime?)
-  // Split at top-level commas — easy here since args are simple values.
   const args = splitTopLevelCommas(argsText).map((s) => s.trim());
   const duration = Number(args[0]);
   const styleMatch = args[1] && /Enum\.EasingStyle\.(\w+)/.exec(args[1]);
@@ -154,35 +137,28 @@ function renderTweenCurveSvg(style: string, direction: string): string {
   const base = EASINGS[style] || EASINGS.Quad;
   const fn = applyDirection(base, direction);
 
-  // Sample the curve.
   const STEPS = 60;
   const pts: string[] = [];
   for (let i = 0; i <= STEPS; i++) {
     const t = i / STEPS;
-    // Roblox curves can exceed [0..1] (Back / Elastic overshoot). Clamp
-    // VISUALLY to [-0.25 .. 1.25] so we still see the overshoot.
+    // Leave room for Back and Elastic overshoot.
     const v = fn(t);
     const x = PAD_L + t * plotW;
     const y = PAD_T + (1 - (v + 0.25) / 1.5) * plotH;
     pts.push(`${x.toFixed(2)},${y.toFixed(2)}`);
   }
 
-  // Grid lines + reference [0..1] band
   const yAt0 = PAD_T + (1 - (0 + 0.25) / 1.5) * plotH;
   const yAt1 = PAD_T + (1 - (1 + 0.25) / 1.5) * plotH;
 
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">` +
     `<rect width="${W}" height="${H}" rx="4" fill="rgba(127,127,127,0.08)"/>` +
-    // Reference horizontal bars at value=0 and value=1
     `<line x1="${PAD_L}" y1="${yAt0}" x2="${W - PAD_R}" y2="${yAt0}" stroke="rgba(255,255,255,0.18)" stroke-width="0.5" stroke-dasharray="2 2"/>` +
     `<line x1="${PAD_L}" y1="${yAt1}" x2="${W - PAD_R}" y2="${yAt1}" stroke="rgba(255,255,255,0.18)" stroke-width="0.5" stroke-dasharray="2 2"/>` +
-    // Axes
     `<line x1="${PAD_L}" y1="${PAD_T}" x2="${PAD_L}" y2="${H - PAD_B}" stroke="rgba(255,255,255,0.25)" stroke-width="0.7"/>` +
     `<line x1="${PAD_L}" y1="${H - PAD_B}" x2="${W - PAD_R}" y2="${H - PAD_B}" stroke="rgba(255,255,255,0.25)" stroke-width="0.7"/>` +
-    // Curve
     `<polyline points="${pts.join(" ")}" fill="none" stroke="#7C5CFF" stroke-width="1.7" stroke-linejoin="round"/>` +
-    // Labels
     `<text x="3" y="${yAt1 + 3}" font-family="sans-serif" font-size="8" fill="rgba(255,255,255,0.5)">1</text>` +
     `<text x="3" y="${yAt0 + 3}" font-family="sans-serif" font-size="8" fill="rgba(255,255,255,0.5)">0</text>` +
     `<text x="${PAD_L}" y="${H - 3}" font-family="sans-serif" font-size="8" fill="rgba(255,255,255,0.5)">t=0</text>` +
@@ -241,21 +217,14 @@ function applyDirection(fn: EasingFn, dir: string): EasingFn {
     return (t) =>
       t < 0.5 ? fn(2 * t) / 2 : 1 - fn(2 - 2 * t) / 2;
   }
-  return fn; // In (or default)
+  return fn;
 }
 
-// ---------------------------------------------------------------------------
-// Element previews — UIPadding, UICorner, UIStroke
-// ---------------------------------------------------------------------------
 function tryElementPreviewHover(
   text: string,
   offset: number,
   document: vscode.TextDocument
 ): vscode.Hover | undefined {
-  // Fast reject: only UIPadding / UICorner / UIStroke get a preview.
-  // Hover fires every time the cursor settles for ~300ms, so a full
-  // createElement scan on a 10k-line file with none of these wastes a
-  // measurable amount of time on every hover.
   if (
     text.indexOf("UIPadding") === -1 &&
     text.indexOf("UICorner") === -1 &&
@@ -266,7 +235,6 @@ function tryElementPreviewHover(
   }
   const aliases = getAliasPartition();
   const calls = findAllCreateElementCalls(text, aliases);
-  // Find the call whose CLASS NAME the cursor is over.
   const call = calls.find(
     (c) =>
       c.isStringLiteralName &&
@@ -336,7 +304,7 @@ function parseUDimOffset(value: string | undefined): number {
   if (!m) {
     return 0;
   }
-  // Treat scale = 0, offset only — for visualization purposes use offset.
+  // The preview uses pixel offsets only.
   return Number(m[2]);
 }
 
@@ -378,8 +346,7 @@ function renderUIPaddingMarkdown(
 
   const W = 200;
   const H = 140;
-  // Scale padding values to fit visually. Cap visible padding at 35% of
-  // each side so the inner box doesn't collapse.
+  // Cap padding so the inner box remains visible.
   const maxScale = (px: number, side: number) =>
     px <= 0 ? 0 : Math.min(0.35, px / 80) * side;
   const tPx = maxScale(top, H);
@@ -425,17 +392,10 @@ export interface CornerRadii {
   tr: number;
   br: number;
   bl: number;
-  /** True when the radii came from a uniform `CornerRadius` (which
-   *  overrides the individual props at runtime). */
   fromCornerRadius: boolean;
 }
 
-/**
- * Resolve the four effective corner radii (offset px) from a UICorner's
- * props. `CornerRadius` — when present — sets all four and overrides the
- * individual props (matching Roblox). Otherwise each corner reads its
- * own `*Radius` prop (missing → 0). Pure — unit-tested.
- */
+// CornerRadius overrides all individual corner radii.
 export function cornerRadiiFromProps(props: Map<string, string>): CornerRadii {
   const cornerRadius = props.get("CornerRadius");
   if (cornerRadius) {
@@ -451,12 +411,7 @@ export function cornerRadiiFromProps(props: Map<string, string>): CornerRadii {
   };
 }
 
-/**
- * SVG path for a rectangle with independent corner radii. A `<rect>`
- * only supports a single `rx`/`ry`, so per-corner rounding needs a path
- * with an arc at each rounded corner (and a sharp line where the radius
- * is 0). Drawn clockwise from the top edge. Pure — unit-tested.
- */
+// Independent corner radii require an SVG path rather than a rect.
 export function roundedRectPath(
   x: number,
   y: number,
@@ -490,8 +445,7 @@ function renderUICornerMarkdown(
   const y = 10;
   const w = W - 20;
   const h = H - 20;
-  // Cap each visual radius so the box keeps a recognisable shape (and
-  // can't exceed half the side, which would distort the path).
+  // Keep radii within half the preview side.
   const maxR = Math.min(40, Math.min(w, h) / 2);
   const clamp = (n: number) => Math.max(0, Math.min(maxR, n));
 
@@ -518,7 +472,6 @@ function renderUICornerMarkdown(
   lines.push(`![](${uri})`);
   lines.push("");
   if (radii.fromCornerRadius) {
-    // Surface a scale component in the label when CornerRadius uses one.
     const m = /UDim\.new\s*\(\s*(-?\d+(?:\.\d+)?)\s*,/.exec(
       props.get("CornerRadius") ?? ""
     );
@@ -548,7 +501,6 @@ function renderUIStrokeMarkdown(
 
   const W = 200;
   const H = 110;
-  // Visual stroke — cap at 12 px so it doesn't dominate.
   const t = Math.min(12, Math.max(0, thickness));
 
   const svg =
@@ -568,9 +520,7 @@ function renderUIStrokeMarkdown(
   return md;
 }
 
-/** Pull the offset (pixel) components out of a `UDim2` value —
- *  `UDim2.fromOffset(x, y)` or `UDim2.new(sx, ox, sy, oy)`. Scale-only
- *  forms read as 0 (we visualise pixels). */
+// Read pixel offsets only; scale-only values preview as zero.
 function parseUDim2Offset(value: string | undefined): { x: number; y: number } {
   if (!value) {
     return { x: 0, y: 0 };
@@ -602,14 +552,11 @@ function renderUIShadowMarkdown(
 
   const W = 200;
   const H = 140;
-  // The element casting the shadow — centred with generous margins so
-  // the shadow has room to render.
   const ex = 60;
   const ey = 42;
   const ew = 80;
   const eh = 56;
-  // Clamp the visual magnitudes so a large blur/offset/spread doesn't
-  // spill out of the preview box.
+  // Clamp magnitudes to keep the shadow within the preview.
   const cap = (n: number, max: number) =>
     Math.max(-max, Math.min(max, n));
   const ox = cap(offset.x, 24);
@@ -621,11 +568,8 @@ function renderUIShadowMarkdown(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">` +
     `<defs><filter id="luixshadow" x="-60%" y="-60%" width="220%" height="220%">` +
     `<feGaussianBlur stdDeviation="${(bl / 2).toFixed(2)}"/></filter></defs>` +
-    // Background panel so the shadow reads against something.
     `<rect x="0" y="0" width="${W}" height="${H}" fill="#1E1E26"/>` +
-    // The shadow: element rect, expanded by spread, translated by offset, blurred.
     `<rect x="${ex - sp + ox}" y="${ey - sp + oy}" width="${ew + 2 * sp}" height="${eh + 2 * sp}" rx="8" fill="${color}" fill-opacity="${shadowOpacity.toFixed(2)}" filter="url(#luixshadow)"/>` +
-    // The element on top.
     `<rect x="${ex}" y="${ey}" width="${ew}" height="${eh}" rx="8" fill="#7C5CFF" stroke="#FFFFFF" stroke-width="1"/>` +
     `</svg>`;
   const uri = `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
@@ -642,12 +586,6 @@ function renderUIShadowMarkdown(
   md.supportHtml = false;
   return md;
 }
-
-// ---------------------------------------------------------------------------
-// Tiny helpers
-// ---------------------------------------------------------------------------
-// `findMatchingParen` lives in `./textUtils` — same implementation
-// formerly duplicated here.
 
 function splitTopLevelCommas(s: string): string[] {
   const out: string[] = [];

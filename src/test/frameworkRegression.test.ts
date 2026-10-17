@@ -4,6 +4,7 @@ import {
   _internal,
   detectFrameworkForDocument,
   getWorkspaceFallback,
+  inferWorkspaceFramework,
   resetDocumentDetectionCache,
   setWorkspaceFallback,
 } from "../activeFramework";
@@ -147,5 +148,52 @@ suite("Fusion scaffold compatibility", () => {
     assert.strictEqual(fusionSnippetBody("value", snippet("value"), legacy, legacy.length), snippet("value"));
     const namedScope = 'local function Test(scope)\n local old = New "Frame" {}\n local marker = true\nend';
     assert.strictEqual(fusionSnippetBody("nFrame", snippet("nFrame"), namedScope, namedScope.indexOf("local marker")), snippet("nFrame"));
+  });
+});
+
+suite("Workspace framework sample", () => {
+  const react = 'local React = require(Packages.React)\nreturn React.createElement("Frame", {})';
+
+  test("reads sampled files through the index and reuses unchanged ones", async () => {
+    let reads = 0;
+    let stamp = 1;
+    const uri = vscode.Uri.file("/luix-sample/App.luau");
+    const source = {
+      frameworkSample: () => [uri],
+      readText: async () => { reads++; return react; },
+      entryStamp: () => stamp,
+    };
+    assert.strictEqual(await inferWorkspaceFramework(source), "react");
+    assert.strictEqual(await inferWorkspaceFramework(source), "react");
+    assert.strictEqual(reads, 1, "an unchanged file is not read again on the next settle");
+    stamp = 2;
+    assert.strictEqual(await inferWorkspaceFramework(source), "react");
+    assert.strictEqual(reads, 2, "a changed file is read again");
+  });
+
+  test("a superseded run stops reading and reports nothing", async () => {
+    let reads = 0;
+    const uris = [vscode.Uri.file("/luix-sample/A.luau"), vscode.Uri.file("/luix-sample/B.luau")];
+    let cancelled = false;
+    const source = {
+      frameworkSample: () => uris,
+      readText: async () => { reads++; cancelled = true; return react; },
+      entryStamp: () => 1,
+    };
+    assert.strictEqual(await inferWorkspaceFramework(source, () => cancelled), undefined);
+    assert.strictEqual(reads, 1);
+  });
+
+  test("ties keep the established priority order", async () => {
+    const texts = new Map([
+      ["/luix-sample/tie/Fusion.luau", 'local Fusion = require(Packages.Fusion)'],
+      ["/luix-sample/tie/React.luau", react],
+    ]);
+    const source = {
+      frameworkSample: () => [...texts.keys()].map((p) => vscode.Uri.file(p)),
+      readText: async (uri: vscode.Uri) => texts.get(uri.path),
+      entryStamp: () => 7,
+    };
+    assert.strictEqual(await inferWorkspaceFramework(source), "react");
   });
 });

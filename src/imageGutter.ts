@@ -8,34 +8,12 @@ import {
 
 const FIRST_DOWNLOAD_NOTIFIED_KEY = "luix.imageGutter.firstDownloadNotified";
 
-// ============================================================================
-// Image-asset gutter previews
-// ============================================================================
-//
-// For every `"rbxassetid://NNNN"` reference in a Lua/Luau file, show
-// the asset's thumbnail as a tiny icon in the gutter next to the line
-// — same idea as the popular `vscode-gutter-preview` extension for
-// `.png` asset paths, adapted to Roblox CDN assets.
-//
-// VS Code's `gutterIconPath` only accepts local file URIs, so we
-// download each thumbnail PNG to the extension's global storage and
-// keep it there forever. Repeated openings of the same file are
-// instant after the first.
-//
-// One decoration type per unique asset ID (a single
-// `TextEditorDecorationType` carries exactly one `gutterIconPath`).
-// Types are cached so we don't rebuild them on every refresh — only the
-// per-editor `setDecorations` call needs to run.
-
 export class ImageGutterDecorator implements vscode.Disposable {
   private typesByAsset = new Map<string, vscode.TextEditorDecorationType>();
   private pendingAssets = new Map<string, number>();
   private generation = 0;
   private disposables: vscode.Disposable[] = [];
-  // One pending timer per editor — a single shared timer would let a
-  // change in editor A cancel the pending refresh of editor B (common
-  // in split-view), so the second editor never gets its gutter icons
-  // until further changes.
+  // Debounce editors independently so split views cannot cancel each other.
   private refreshTimers = new WeakMap<vscode.TextEditor, NodeJS.Timeout>();
   private disposed = false;
 
@@ -67,7 +45,6 @@ export class ImageGutterDecorator implements vscode.Disposable {
         }
       })
     );
-    // Kick off any editors already open at activation.
     for (const editor of vscode.window.visibleTextEditors) {
       this.refreshSoon(editor);
     }
@@ -81,9 +58,6 @@ export class ImageGutterDecorator implements vscode.Disposable {
     if (existing) {
       clearTimeout(existing);
     }
-    // Debounce per editor — typing fires onDidChangeTextDocument
-    // hundreds of times, and each refresh touches the network on first
-    // sight of a new asset.
     this.refreshTimers.set(
       editor,
       setTimeout(() => {
@@ -106,8 +80,6 @@ export class ImageGutterDecorator implements vscode.Disposable {
     }
     const enabled = getConfig<boolean>("imageGutter.enabled", true);
 
-    // Always call `setDecorations` for every known type so disabling the
-    // feature also clears existing gutter icons.
     if (!enabled) {
       for (const type of this.typesByAsset.values()) {
         editor.setDecorations(type, []);
@@ -118,13 +90,11 @@ export class ImageGutterDecorator implements vscode.Disposable {
     const text = editor.document.getText();
     const refs = findAssetReferences(text);
 
-    // Group ranges by assetId.
     const rangesByAsset = new Map<string, vscode.Range[]>();
     const seenLines = new Set<string>();
     for (const ref of refs) {
       const pos = editor.document.positionAt(ref.offset);
-      // One icon per line — multiple references on the same line would
-      // stack into the same gutter slot.
+      // Multiple references on one line share a gutter slot.
       const lineKey = `${ref.assetId}@${pos.line}`;
       if (seenLines.has(lineKey)) {
         continue;
@@ -136,9 +106,6 @@ export class ImageGutterDecorator implements vscode.Disposable {
       rangesByAsset.set(ref.assetId, arr);
     }
 
-    // Resolve decoration types for every asset present in the file,
-    // downloading thumbnails as needed. Skip assets already in flight
-    // so a flurry of edits doesn't fire duplicate downloads.
     for (const assetId of rangesByAsset.keys()) {
       if (this.typesByAsset.has(assetId)) {
         continue;
@@ -161,26 +128,14 @@ export class ImageGutterDecorator implements vscode.Disposable {
           if (!dataUri || !isCurrent()) {
             return;
           }
-          // First successful download in this install — disclose where
-          // the files are landing.
           void this.disclosureOnce();
-          // Pass the data URI to `gutterIconPath` rather than the file
-          // URI. Some VS Code builds enforce CSP on `file://` images in
-          // the editor renderer and silently block them with a
-          // `blocked:csp` error; data URIs sidestep that because they're
-          // inlined. The disk cache is still useful — we re-read it on
-          // the next session.
+          // Data URIs avoid renderer CSP blocking file URIs; disk files remain cached.
           const type = vscode.window.createTextEditorDecorationType({
             gutterIconPath: dataUri,
             gutterIconSize: "contain",
           });
           this.typesByAsset.set(assetId, type);
-          // NOTE: decoration types are owned exclusively by `typesByAsset`
-          // so `clearAllDecorations()` can dispose + drop them without
-          // `dispose()` later double-disposing the same types via
-          // `this.disposables`. The dispose method below handles them.
-          // After the thumbnail lands, re-apply for any visible editor that
-          // currently shows the same asset.
+          // typesByAsset owns these decorations; do not also add them to disposables.
           for (const ed of vscode.window.visibleTextEditors) {
             if (!isLuaDoc(ed.document)) {continue;}
             this.applyTypeIfPresent(ed, assetId, type);
@@ -193,8 +148,7 @@ export class ImageGutterDecorator implements vscode.Disposable {
       })().catch(() => {});
     }
 
-    // Apply / clear all known types. A type whose asset isn't present
-    // in the current file gets an empty range list, clearing its icons.
+    // Empty ranges clear icons for assets no longer in the document.
     for (const [assetId, type] of this.typesByAsset) {
       editor.setDecorations(type, rangesByAsset.get(assetId) ?? []);
     }
@@ -222,7 +176,6 @@ export class ImageGutterDecorator implements vscode.Disposable {
     editor.setDecorations(type, ranges);
   }
 
-  /** Reset the once-per-install disclosure so the next download fires it again. */
   resetDisclosure(): void {
     void this.context.globalState.update(
       FIRST_DOWNLOAD_NOTIFIED_KEY,
@@ -230,8 +183,6 @@ export class ImageGutterDecorator implements vscode.Disposable {
     );
   }
 
-  /** Clear all gutter decorations and forget our asset → type map.
-   *  Called after a cache purge so stale icons disappear immediately. */
   clearAllDecorations(): void {
     this.generation++;
     this.pendingAssets.clear();
@@ -244,8 +195,6 @@ export class ImageGutterDecorator implements vscode.Disposable {
       type.dispose();
     }
     this.typesByAsset.clear();
-    // Re-decorate (any thumbnails that just got re-downloaded will
-    // re-populate the type map on the next refresh).
     for (const editor of vscode.window.visibleTextEditors) {
       this.refreshSoon(editor);
     }
@@ -280,8 +229,7 @@ export class ImageGutterDecorator implements vscode.Disposable {
   }
 
   dispose(): void {
-    // WeakMap can't be iterated, so we can't clear pending timers
-    // directly. The `disposed` flag short-circuits them when they fire.
+    // WeakMap timers cannot be iterated; disposed guards their callbacks.
     this.disposed = true;
     this.generation++;
     this.pendingAssets.clear();
@@ -289,10 +237,6 @@ export class ImageGutterDecorator implements vscode.Disposable {
       d.dispose();
     }
     this.disposables = [];
-    // Decoration types are owned by `typesByAsset` exclusively (not
-    // mirrored into `disposables`) so this is the only place they get
-    // disposed. `clearAllDecorations()` empties the map, so anything
-    // still here is live and needs disposing.
     for (const type of this.typesByAsset.values()) {
       type.dispose();
     }
@@ -308,11 +252,6 @@ function shortenPath(p: string): string {
   return p;
 }
 
-/**
- * Read a PNG file from disk and return its `data:image/png;base64,…`
- * URI. Used in place of a `file://` URI for `gutterIconPath` so VS
- * Code's renderer CSP can't block it.
- */
 async function readAsDataUri(
   fileUri: vscode.Uri
 ): Promise<vscode.Uri | undefined> {

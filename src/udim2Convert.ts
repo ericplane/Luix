@@ -6,46 +6,10 @@ import {
 } from "./parser";
 import { getAliasPartition } from "./frameworks";
 
-// ============================================================================
-// UDim2 fromScale ↔ fromOffset conversion
-// ============================================================================
-//
-// When the cursor sits on a `UDim2.fromScale(sx, sy)` or
-// `UDim2.fromOffset(ox, oy)` literal that lives inside an element's
-// `Size = …` prop, offer a refactor action that flips the form by
-// walking up the parent element chain in source order until we hit a
-// concrete pixel size, then multiplying / dividing through the
-// accumulated scales.
-//
-// Example (cursor on the innermost `fromScale`):
-//
-//   e("Frame", { Size = UDim2.fromOffset(800, 600) }, {
-//     e("Frame", { Size = UDim2.fromScale(0.5, 0.5) }, {
-//       e("Frame", { Size = UDim2.fromScale(1, 0.15) })  ← cursor
-//     })
-//   })
-//
-//   Parent chain pixel size: 800 × 600 × 0.5 × 0.5 = 400 × 300.
-//   Converted: UDim2.fromOffset(400, 45).
-//
-// Limitations:
-//
-//   - We only resolve when every link in the chain is a pure literal
-//     (`UDim2.fromScale(…)`, `UDim2.fromOffset(…)`, or the pure-axis
-//     forms of `UDim2.new(…)`). A mixed-axis `UDim2.new(0.5, 10, …)`
-//     or a non-literal `Size = props.something` breaks the chain and
-//     the action stays hidden — better than emitting a wrong value.
-//   - We don't follow `UIAspectRatioConstraint`, `UISizeConstraint`,
-//     `UIPadding`, or `AutomaticSize`. Layout primitives can warp
-//     effective sizes in ways we can't deduce statically.
-//   - Calls without a literal `Size` prop on every ancestor (or
-//     calls at the top of a component with no parent in source) are
-//     skipped — there's no anchor to derive a pixel size from.
+// Resolve sizes from literal ancestor dimensions; layout constraints are not evaluated.
 
 interface UDim2Value {
-  /** Pure scale and offset components for each axis. UDim2.fromScale
-   *  has the offsets at 0; UDim2.fromOffset has the scales at 0;
-   *  UDim2.new can mix. */
+  /** Per-axis scale and offset components. */
   sx: number;
   ox: number;
   sy: number;
@@ -54,11 +18,9 @@ interface UDim2Value {
 
 interface UDim2Literal {
   value: UDim2Value;
-  /** The constructor form the user typed. */
   form: "fromScale" | "fromOffset" | "new";
-  /** Document offset of `U` in `UDim2.…`. */
   start: number;
-  /** Document offset just past the closing `)`. */
+  /** Exclusive end offset. */
   end: number;
 }
 
@@ -84,11 +46,7 @@ function parseUDim2Args(
   }
 }
 
-/**
- * Returns the UDim2 literal at the cursor offset, or undefined when
- * the cursor isn't on one. Uses a fresh regex per call so multiple
- * code-action invocations don't share lastIndex state.
- */
+/** Use a fresh regex to avoid sharing lastIndex across code actions. */
 function findUDim2LiteralAt(
   text: string,
   offset: number
@@ -106,8 +64,6 @@ function findUDim2LiteralAt(
   return undefined;
 }
 
-/** Smallest createElement call whose `[aliasStart, fullEnd]` range
- *  contains `offset`. */
 function findEnclosingCall(
   calls: readonly CreateElementCall[],
   offset: number
@@ -126,7 +82,6 @@ function findEnclosingCall(
   return best;
 }
 
-/** Smallest other call whose body strictly contains `child`'s body. */
 function findParentCall(
   calls: readonly CreateElementCall[],
   child: CreateElementCall
@@ -146,9 +101,7 @@ function findParentCall(
   return best;
 }
 
-/** Extract the `Size` prop's value as a UDim2 literal, if it's a
- *  recognised form. Non-literal values (`Size = props.x`) return
- *  undefined and break the resolution chain. */
+/** Non-literal Size values stop ancestor resolution. */
 function getSizeOf(
   call: CreateElementCall,
   text: string
@@ -172,8 +125,6 @@ function getSizeOf(
       call.propsBraceStart + 1 + entry.valueEnd
     )
     .trim();
-  // 1) Direct literal — `UDim2.fromScale(...)` / `UDim2.fromOffset(...)` /
-  //    `UDim2.new(...)`.
   const direct = /^UDim2\.(fromScale|fromOffset|new)\s*\(([^()]*)\)/.exec(
     valueText
   );
@@ -183,29 +134,11 @@ function getSizeOf(
       direct[1] as "fromScale" | "fromOffset" | "new"
     );
   }
-  // 2) Reactive binding — `<expr>:map(function(s) return
-  //    UDim2.fromOffset(460 * s, 360 * s) end)`. Pulls the leading
-  //    numeric coefficient out of each axis. This matches the
-  //    canonical Vide / Charm / Ripple "scale-by-binding" idiom and
-  //    keeps the conversion meaningful when the parent's Size is
-  //    animated rather than a static literal.
+  // Recognize map bindings with a simple numeric scale coefficient.
   return parseMappedFromOffset(valueText);
 }
 
-/**
- * Detect `<expr>:map(function(<args>) return UDim2.fromOffset(<X>,
- * <Y>) end)` and pull the numeric coefficient out of each axis. Each
- * axis expression has to be one of these strict shapes for us to
- * trust the value (otherwise we'd be guessing):
- *
- *   - `<NUM>`                    e.g. `460`
- *   - `<NUM> * <IDENT>`          e.g. `460 * s`
- *   - `<IDENT> * <NUM>`          e.g. `s * 460`
- *
- * Anything more elaborate (`460 + bonus`, `clamp(s, …) * 460`, …)
- * gets `undefined` so the caller skips that ancestor rather than
- * picking a number that might be wrong.
- */
+/** Accept constants or one coefficient multiplied by a binding; reject other expressions. */
 function parseMappedFromOffset(valueText: string): UDim2Value | undefined {
   const m =
     /:\s*map\s*\(\s*function\s*\([^)]*\)\s*return\s+UDim2\.fromOffset\s*\(([^,]+),\s*([^)]+)\)\s*end\s*\)/.exec(
@@ -228,10 +161,7 @@ function extractAxisCoefficient(expr: string): number | undefined {
   return undefined;
 }
 
-/** Walk the parent chain starting from `call` and resolve to a pure
- *  pixel size (ignoring any layout primitives). Returns undefined if
- *  any ancestor mixes scale + offset on the same axis, has no literal
- *  Size, or the chain reaches a top-level element with no parent. */
+/** Resolve pure pixel sizes through ancestors; skip mixed axes or missing dimensions. */
 function computePixelSize(
   call: CreateElementCall,
   calls: readonly CreateElementCall[],
@@ -240,33 +170,25 @@ function computePixelSize(
   let cumSx = 1;
   let cumSy = 1;
   let current: CreateElementCall | undefined = call;
-  // Soft cap on chain depth — UI trees rarely exceed 20-30 levels;
-  // 64 is far above that and guards against pathological inputs.
+  // Bound ancestor walks for pathological input.
   for (let depth = 0; depth < 64 && current; depth++) {
     const size = getSizeOf(current, text);
     if (!size) {return undefined;}
-    // Pure offset → we have a concrete pixel size to anchor on.
     if (size.sx === 0 && size.sy === 0) {
       return { x: cumSx * size.ox, y: cumSy * size.oy };
     }
-    // Pure scale → propagate up.
     if (size.ox === 0 && size.oy === 0) {
       cumSx *= size.sx;
       cumSy *= size.sy;
       current = findParentCall(calls, current);
       continue;
     }
-    // Mixed (UDim2.new with both scale + offset on the same axis) —
-    // can't resolve without knowing the actual pixel size of the
-    // surrounding container, which we don't have access to statically.
+    // Mixed scale and offset need runtime parent dimensions.
     return undefined;
   }
   return undefined;
 }
 
-/** Pretty-print a number for the replacement text: rounded to 3
- *  decimals, trailing zeros trimmed, integer-valued numbers printed
- *  without a decimal point. */
 function fmt(n: number): string {
   const rounded = Math.round(n * 1000) / 1000;
   return Number.isInteger(rounded)
@@ -290,8 +212,6 @@ export class UDim2ResolveCodeActionProvider
 
     const literal = findUDim2LiteralAt(text, cursorOffset);
     if (!literal) {return [];}
-    // Only fire on the two pure forms — `UDim2.new(…)` already has
-    // both axes encoded so there's nothing to convert.
     if (literal.form !== "fromScale" && literal.form !== "fromOffset") {
       return [];
     }
@@ -301,20 +221,13 @@ export class UDim2ResolveCodeActionProvider
     const enclosing = findEnclosingCall(calls, cursorOffset);
     if (!enclosing) {return [];}
 
-    // Verify the literal is the value of *this* call's `Size` prop —
-    // not a UDim2 used elsewhere (Position, CanvasSize, etc.). The
-    // conversion is only meaningful relative to the parent's Size, so
-    // applying it to e.g. Position would produce a wrong number.
+    // Only Size values can be converted using parent dimensions.
     if (!isLiteralTheSizeOf(literal, enclosing, text)) {return [];}
 
     const parent = findParentCall(calls, enclosing);
     if (!parent) {return [];}
 
-    // Strict — if the parent chain doesn't resolve to a concrete
-    // pixel size, hide the action entirely rather than emit an
-    // arbitrary fallback number. The user prefers "no action" over
-    // "wrong value" (a wrong conversion silently breaks UI more
-    // visibly than a missing lightbulb).
+    // Hide the action when parent dimensions are unknown.
     const parentPixels = computePixelSize(parent, calls, text);
     if (!parentPixels) {return [];}
     if (parentPixels.x <= 0 || parentPixels.y <= 0) {return [];}
@@ -338,7 +251,6 @@ export class UDim2ResolveCodeActionProvider
       return [action];
     }
 
-    // fromOffset → fromScale
     const sx = literal.value.ox / parentPixels.x;
     const sy = literal.value.oy / parentPixels.y;
     const replacement = `UDim2.fromScale(${fmt(sx)}, ${fmt(sy)})`;
@@ -353,7 +265,6 @@ export class UDim2ResolveCodeActionProvider
   }
 }
 
-/** True iff the given literal is the value of the call's `Size` prop. */
 function isLiteralTheSizeOf(
   literal: UDim2Literal,
   call: CreateElementCall,
@@ -377,34 +288,7 @@ function isLiteralTheSizeOf(
   return literal.start >= valStart && literal.end <= valEnd;
 }
 
-// ============================================================================
-// "Calculate Size from children" — the second action
-// ============================================================================
-//
-// Sibling to the chain-walking action above: when the cursor is on
-// an element whose own `Size` is `UDim2.fromScale(…)` *and* every
-// child element has a literal pixel `Size`, this offers to replace
-// the parent's Size with the offset value implied by the children.
-//
-// Layout rules it understands:
-//
-//   - `UIListLayout` with FillDirection = Horizontal / Vertical and
-//     a `Padding = UDim.new(0, N)` spacing. Sums children along the
-//     fill axis, takes the max across, factors in (n-1) gaps.
-//   - `UIPadding` with `Padding{Top,Bottom,Left,Right} = UDim.new(0,
-//     N)` margins. Adds them after the children sum.
-//   - No layout primitive → assumes children are independently
-//     positioned and uses `max(child.size)` on both axes.
-//
-// What it deliberately skips (to keep results honest):
-//
-//   - Children whose Size isn't a literal pixel (mixed scale, a
-//     variable, a `:map(...)` binding without a clean coefficient).
-//   - Layouts other than UIListLayout / UIPadding (UIGridLayout,
-//     UIPageLayout, custom Vide layouts, …).
-//   - `Padding` keys whose value isn't `UDim.new(0, N)` (scale-based
-//     padding doesn't have a meaningful pixel value without the
-//     parent size, and that's what we're trying to compute).
+// Infer parent size from pixel-sized children, UIListLayout and pixel padding only.
 
 interface ChildPixelSize {
   width: number;
@@ -423,9 +307,6 @@ interface UIListLayoutValues {
   padding: number;
 }
 
-/** Return the direct-child element calls of `parent` (the calls
- *  whose body sits strictly inside parent's body, with no other call
- *  between them). */
 function directChildCalls(
   parent: CreateElementCall,
   calls: readonly CreateElementCall[]
@@ -436,9 +317,6 @@ function directChildCalls(
       c.aliasStart > parent.aliasStart &&
       c.fullEnd < parent.fullEnd
   );
-  // A call is a *direct* child iff no other inside-call strictly
-  // contains it. O(N²) on `inside` which is fine — children counts
-  // rarely exceed a few dozen.
   return inside.filter(
     (c) =>
       !inside.some(
@@ -450,11 +328,7 @@ function directChildCalls(
   );
 }
 
-/** Pixel width / height of a child whose Size is a pure
- *  `UDim2.fromOffset(W, H)` literal (or the equivalent `UDim2.new(0,
- *  W, 0, H)`). Returns undefined for anything else — including
- *  mixed-axis or scale-bearing values, since their pixel size
- *  depends on a parent dimension we don't yet have. */
+/** Reject child sizes that depend on the parent's dimensions. */
 function pixelSizeOfChild(
   child: CreateElementCall,
   text: string
@@ -465,9 +339,7 @@ function pixelSizeOfChild(
   return { width: size.ox, height: size.oy };
 }
 
-/** Extract a literal `UDim.new(0, N)` value from a prop entry's
- *  text, returning N. Anything else (scale > 0, non-literal) is
- *  treated as zero. */
+/** Only literal offset padding contributes pixels. */
 function readUDimOffsetEntry(
   call: CreateElementCall,
   text: string,
@@ -539,9 +411,7 @@ function readUIListLayout(
   return { direction, padding };
 }
 
-/** Compute the parent's implied pixel size from its children.
- *  Returns undefined when any contentful child has a Size we can't
- *  reduce to pure pixels (so we never lie). */
+/** Skip the estimate if any content child has an unresolved size. */
 function computeSizeFromChildren(
   parent: CreateElementCall,
   calls: readonly CreateElementCall[],
@@ -567,7 +437,7 @@ function computeSizeFromChildren(
       layout = readUIListLayout(child, text);
       continue;
     }
-    // Constraints / decorators that don't take up content space — skip.
+    // Decorators and constraints do not occupy content space.
     if (
       child.className === "UICorner" ||
       child.className === "UIStroke" ||
@@ -580,7 +450,6 @@ function computeSizeFromChildren(
     ) {
       continue;
     }
-    // Anything else needs a literal pixel Size.
     const px = pixelSizeOfChild(child, text);
     if (!px) {return undefined;}
     contentful.push(px);
@@ -601,8 +470,7 @@ function computeSizeFromChildren(
       Math.max(0, contentful.length - 1) * layout.padding;
     width = contentful.reduce((m, c) => Math.max(m, c.width), 0);
   } else {
-    // No layout primitive — assume free-positioned children and use
-    // the bounding box.
+    // Without a layout, use the children's bounding box.
     width = contentful.reduce((m, c) => Math.max(m, c.width), 0);
     height = contentful.reduce((m, c) => Math.max(m, c.height), 0);
   }
@@ -627,9 +495,6 @@ export class UDim2FromChildrenCodeActionProvider
     const text = document.getText();
     const cursorOffset = document.offsetAt(range.start);
 
-    // The cursor has to be on a UDim2 literal that IS the call's Size
-    // prop. Mirrors the other action's gating exactly — the lightbulb
-    // shows next to the literal you're trying to replace.
     const literal = findUDim2LiteralAt(text, cursorOffset);
     if (!literal) {return [];}
     if (literal.form !== "fromScale" && literal.form !== "fromOffset") {

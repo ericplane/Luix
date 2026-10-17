@@ -2,7 +2,7 @@
   "name": "luix-roblox",
   "displayName": "Luix Roblox",
   "description": "All-in-one Roblox UI authoring helper for React-Luau, Fusion, Vide, and Roact — prop completions, hover docs, inlay hints, color preview, deprecation diagnostics, and more.",
-  "version": "1.5.4",
+  "version": "1.5.5",
   "publisher": "ericplane",
   "icon": "assets/icon.png",
   "author": {
@@ -421,7 +421,7 @@
             "type": "string"
           },
           "default": [],
-          "markdownDescription": "Extra directory names to skip when indexing components. Luix already excludes `Packages`, `DevPackages`, `ServerPackages`, `_Index`, `node_modules`, `out`, and `dist` by default — list anything else here. Match is by directory **name**, anywhere in the file path (so `\"Tests\"` skips every `Tests/` folder in the workspace)."
+          "markdownDescription": "Extra directory names to skip when indexing components. Luix already excludes `Packages`, `DevPackages`, `ServerPackages`, `_Index`, `node_modules`, `out`, `dist`, tool folders inside the workspace (`.git`, `.claude`, `.cache`, `.history`, `.vscode`, …) and files over 2 MB by default — list anything else here. Match is by directory **name**, anywhere in the file path (so `\"Tests\"` skips every `Tests/` folder in the workspace)."
         },
         "luix.componentsRoot": {
           "type": "string",

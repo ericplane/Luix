@@ -62,8 +62,7 @@ suite("Process task integration", () => {
             if (event.execution.task.name === task.name) { processId = event.processId; }
           }),
           vscode.tasks.onDidEndTaskProcess((event) => {
-            // Match by the public task name too: if VS Code drops the custom
-            // runId, assert that explicitly instead of merely timing out.
+            // Match the name too so a missing runId fails explicitly.
             if (event.execution.task.name === task.name) { processEvent = event; finish(); }
           }),
           vscode.tasks.onDidEndTask((event) => {
@@ -91,7 +90,7 @@ suite("Process task integration", () => {
       subscriptions.forEach((subscription) => subscription.dispose());
       if (execution && vscode.tasks.taskExecutions.includes(execution)) { execution.terminate(); }
       terminal?.dispose();
-      // Only remove this test's own mkdtemp child, never a workspace root.
+      // Delete only this test's temporary directory.
       assert.strictEqual(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
       assert.ok(path.basename(directory).startsWith("luix-task-integration-"));
       await fs.rm(directory, { recursive: true, force: true });

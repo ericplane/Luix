@@ -1,9 +1,7 @@
 import { PropEntry } from "./parser";
 import { applyTextChanges, luaTokens } from "./editSyntax";
 
-/** Rewrite existing literal fields and append new ones in a single replacement.
- * Separator decisions use the resulting body, so additions never duplicate a
- * missing comma or put it inside a trailing comment. */
+/** Choose separators after rewriting the body; keep additions outside trailing comments. */
 export function rewriteLiteralProps(
   body: string,
   entries: PropEntry[],

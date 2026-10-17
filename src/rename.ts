@@ -1,12 +1,16 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { WorkspaceIndex } from "./workspaceIndex";
+import { WorkspaceIndex, decodeFileText, positionsInText } from "./workspaceIndex";
 import { analyzeLuaBindings, LuaBinding, LuaBindings, LUA_KEYWORDS } from "./editSyntax";
 
 export interface RenameChange { start: number; end: number; text: string }
 
-/** Rename one proven lexical binding, including return/export values and
- * require aliases. Property names, strings and unrelated scopes stay intact. */
+export interface RenameSource {
+  readonly uri: vscode.Uri;
+  getText(): string;
+}
+
+/** Rename only references bound to the selected local. */
 export function planBindingRename(text: string, offset: number, newName: string): RenameChange[] {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(newName) || LUA_KEYWORDS.has(newName)) {
     throw new Error("Choose a Lua identifier that is not a reserved keyword.");
@@ -18,8 +22,7 @@ export function planBindingRename(text: string, offset: number, newName: string)
   }
   const binding = selected.binding;
   if (binding.name === newName) {return [];}
-  // Declared type names occupy a separate namespace. A lexical rename cannot
-  // prove their use sites and must not turn a value rename into a type rename.
+  // Value renames must not alter the separate type namespace.
   if (parsed.tokens.some((t, i) => t.value === "type" &&
       [binding.name, newName].includes(parsed.tokens[i + 1]?.value))) {
     throw new Error("This name is also a type alias; use the language server's rename.");
@@ -46,14 +49,13 @@ function directExport(parsed: LuaBindings): LuaBinding | undefined {
   return ref?.scope === parsed.root ? ref.binding : undefined;
 }
 
-/** Conventional relative module paths only. Aliased/Rojo-remapped paths remain
- * independent local bindings; guessing a module by its basename is unsafe. */
-function requiredFile(
-  document: vscode.TextDocument,
+/** Resolve relative module paths only; basenames cannot prove ownership. */
+function requiredFile<T extends RenameSource>(
+  document: RenameSource,
   parsed: LuaBindings,
   binding: LuaBinding,
-  files: vscode.TextDocument[]
-): vscode.TextDocument | undefined {
+  files: T[]
+): T | undefined {
   const index = parsed.tokens.findIndex(t => t.start === binding.declaration.start);
   const tokens = parsed.tokens.slice(index + 1);
   if (tokens[0]?.value !== "=" || tokens[1]?.value !== "require" || tokens[2]?.value !== "(") {return undefined;}
@@ -82,10 +84,10 @@ function requiredFile(
   return matches[0];
 }
 
-export function planComponentRenameDocuments(
-  document: vscode.TextDocument, offset: number, newName: string,
-  documents: vscode.TextDocument[]
-): Map<vscode.TextDocument, RenameChange[]> {
+export function planComponentRenameDocuments<T extends RenameSource>(
+  document: T, offset: number, newName: string,
+  documents: T[]
+): Map<T, RenameChange[]> {
   const selected = selectedBinding(document.getText(), offset);
   const oldName = selected.binding.name;
   let owner = document;
@@ -93,17 +95,15 @@ export function planComponentRenameDocuments(
   const imported = requiredFile(document, selected.parsed, selected.binding, documents);
   if (imported) {
     const exportBinding = directExport(analyzeLuaBindings(imported.getText()));
-    // A differently named import is an intentional alias; renaming it need
-    // not change the exporting module's own function name.
+    // Renaming an import alias need not rename its exported function.
     if (exportBinding?.name === oldName) { owner = imported; ownerBinding = exportBinding; }
   }
   const ownerParsed = owner === document ? selected.parsed : analyzeLuaBindings(owner.getText());
   const ownerExportsBinding = directExport(ownerParsed)?.declaration.start === ownerBinding.declaration.start;
-  const targets = new Map<vscode.TextDocument, number>([[document, offset], [owner, ownerBinding.declaration.start]]);
+  const targets = new Map<T, number>([[document, offset], [owner, ownerBinding.declaration.start]]);
   if (ownerExportsBinding) {
     for (const candidate of documents) {
       if (targets.has(candidate)) {continue;}
-      // Unrelated same-name components are deliberately never renamed.
       if (!candidate.getText().includes(oldName)) {continue;}
       const parsed = analyzeLuaBindings(candidate.getText());
       const imports = parsed.bindings.filter(b => b.name === oldName && b.scope === parsed.root);
@@ -142,17 +142,13 @@ export class ComponentRenameProvider implements vscode.RenameProvider {
     const selected = selectedBinding(document.getText(), offset);
     const oldName = selected.binding.name;
     if (oldName === newName) {return undefined;}
-    // Validate before loading the workspace or constructing any edits.
     planBindingRename(document.getText(), offset, newName);
-    const documents: vscode.TextDocument[] = [document];
     const uris = await vscode.workspace.findFiles(
       "**/*.{lua,luau}", "**/{Packages,DevPackages,ServerPackages,_Index,node_modules}/**"
     );
-    for (const uri of uris) {
-      if (token.isCancellationRequested) {return undefined;}
-      if (uri.toString() === document.uri.toString()) {continue;}
-      documents.push(await vscode.workspace.openTextDocument(uri));
-    }
+    const others = await readRenameFiles(uris, document.uri.toString(), token);
+    if (!others) {return undefined;}
+    const documents: RenameFile[] = [document, ...others];
     const changesByDocument = planComponentRenameDocuments(document, offset, newName, documents);
     const edit = new vscode.WorkspaceEdit();
     for (const [target, changes] of changesByDocument) {
@@ -163,4 +159,43 @@ export class ComponentRenameProvider implements vscode.RenameProvider {
     }
     return edit;
   }
+}
+
+type RenameFile = RenameSource & { positionAt(offset: number): vscode.Position };
+
+const MAX_PARALLEL_RENAME_READS = 8;
+
+/** Read unopened files from disk to avoid extension-wide document-open events. */
+async function readRenameFiles(
+  uris: vscode.Uri[], skip: string, token: vscode.CancellationToken
+): Promise<RenameFile[] | undefined> {
+  const open = new Map<string, vscode.TextDocument>();
+  for (const doc of vscode.workspace.textDocuments) {
+    if (!doc.isClosed) {open.set(doc.uri.toString(), doc);}
+  }
+  const files: Array<RenameFile | undefined> = new Array(uris.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < uris.length && !token.isCancellationRequested) {
+      const i = next++;
+      const uri = uris[i];
+      const key = uri.toString();
+      if (key === skip) {continue;}
+      const doc = open.get(key);
+      if (doc) {
+        files[i] = doc;
+        continue;
+      }
+      try {
+        const text = decodeFileText(await vscode.workspace.fs.readFile(uri));
+        let positions: ((offset: number) => vscode.Position) | undefined;
+        files[i] = { uri, getText: () => text, positionAt: (offset) => (positions ??= positionsInText(text))(offset) };
+      } catch {
+        // Skip files that were deleted or became unreadable.
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(MAX_PARALLEL_RENAME_READS, uris.length) }, worker));
+  if (token.isCancellationRequested) {return undefined;}
+  return files.filter((file): file is RenameFile => file !== undefined);
 }
